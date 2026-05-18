@@ -1,10 +1,10 @@
 from datetime import datetime, timedelta, timezone
 from typing import Union
 import jwt
+import os
 from pwdlib import PasswordHash
 from fastapi.security import OAuth2PasswordBearer
-
-SECRET_KEY = "0324c2c61d4a9555d11ad4c060d937cb40069110bf2d60f4c08d0d1a56693e5e"
+SECRET_KEY = os.environ["SECRET_KEY"]
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 

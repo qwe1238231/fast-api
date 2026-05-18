@@ -1,10 +1,7 @@
 from fastapi import FastAPI, HTTPException,Depends,status,Request
-from typing import List,Annotated
-from database import engine, Base
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.future import select
-from sqlalchemy import or_
+from typing import  Annotated
 from fastapi.responses import RedirectResponse
 from jwt.exceptions import InvalidTokenError
 from fastapi.security import OAuth2PasswordRequestForm
@@ -75,35 +72,3 @@ async def read_users_me(current_user:Annotated[models.User,Depends(get_current_u
 async def read_root():
     return RedirectResponse(url="/docs")
 
-@app.post("/books",response_model=schemas.BookResponse,status_code=status.HTTP_201_CREATED)
-async def create_book_api(book:schemas.BookCreate,db:AsyncSession=Depends(database.get_db),current_user:models.User=Depends(get_current_user)):
-    return await crud.create_book(db=db,book=book,user_id=current_user.id)
-
-@app.get("/books",response_model=List[schemas.BookResponse])
-async def read_books(
-    skip:int=0,
-    limit:int=10,
-    q:str|None=None,
-    db:AsyncSession=Depends(database.get_db)):
-    query=select(models.Book)
-    if q:
-        query=query.where(
-            or_(
-                models.Book.title.ilike(f"%{q}%"),
-                models.Book.author.ilike(f"%{q}%")
-            )
-        )
-    query=query.offset(skip).limit(limit)
-    result = await db.execute(query)
-    return result.scalars().all()
-   
-    
-    
-@app.put("/books/{book_id}",response_model=schemas.BookResponse)
-async def update_books_api(book_id:int,book_update:schemas.BookCreate,db:AsyncSession=Depends(database.get_db),current_user:models.User=Depends(get_current_user)):
-    return await crud.update_books(db=db,book_id=book_id,book_update=book_update,user_id=current_user.id)
-
-@app.delete("/books/{book_id}",status_code=status.HTTP_204_NO_CONTENT)
-async def delete_book_api(book_id:int,db:AsyncSession=Depends(database.get_db),current_user:models.User=Depends(get_current_user)):
-    await crud.delete_book(db=db,book_id=book_id,user_id=current_user.id)
-    return  

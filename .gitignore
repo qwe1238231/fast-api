@@ -1,0 +1,103 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+downloads/
+sdist/
+wheels/
+*.manifest
+*.spec
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ===== 虛擬環境 =====
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ===== 環境變數與設定（含敏感資訊）=====
+.env
+.env.*
+!.env.example
+*.local
+
+# ===== FastAPI / Alembic =====
+# Alembic 自動生成的版本檔保留在 versions/，不要忽略整個 alembic/
+# 若有 instance/ 目錄存放本地資料庫
+instance/
+
+# ===== 測試與覆蓋率 =====
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ===== 型別檢查 / Linter 快取 =====
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ===== 資料庫 / 備份檔 =====
+*.sqlite3
+*.sqlite
+*.db
+# *.sql        # 如不想 commit SQL 備份，取消註解
+# *.dump
+
+# ===== Log / 暫存 =====
+*.log
+logs/
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# ===== Docker =====
+# 通常 docker-compose.override.yml 是個人本機覆寫設定，建議忽略
+docker-compose.override.yml
+.docker/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ===== IDE / Editor =====
+.vscode/
+!.vscode/settings.json.example
+.idea/
+*.iml
+*.sublime-project
+*.sublime-workspace
+
+# ===== macOS =====
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ===== Windows =====
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ===== Node（若前端有用到）=====
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

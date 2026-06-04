@@ -52,7 +52,10 @@ jobs:
       
       - name: Build ticket_secrets Rust crate
         working-directory: ticket_secrets
-        run: maturin develop
+        run: maturin build --release --out target/wheels
+
+      - name: Install ticket_secrets wheel
+        run: pip install ticket_secrets/target/wheels/*.whl
       
       - name: Run alembic migrations
         env:

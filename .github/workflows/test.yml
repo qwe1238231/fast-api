@@ -1,0 +1,77 @@
+name: tests
+on:
+  push:
+    branches: [main, feat/*]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: justinhu
+          POSTGRES_DB: testdb
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U justinhu -d testdb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install maturin
+      
+      - name: Build ticket_secrets Rust crate
+        working-directory: ticket_secrets
+        run: maturin build --release --out target/wheels
+
+      - name: Install ticket_secrets wheel
+        run: pip install ticket_secrets/target/wheels/*.whl
+      
+      - name: Run alembic migrations
+        env:
+          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
+          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
+          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
+          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
+          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
+        run: alembic upgrade head
+
+      - name: Run pytest
+        env:
+          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
+          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
+          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
+          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
+          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
+          REDIS_URL: redis://localhost:6379/0
+        run: pytest test/ -v

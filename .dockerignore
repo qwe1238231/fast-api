@@ -1,0 +1,42 @@
+# Version control
+.git
+.github
+.gitignore
+
+# Python build / dev artifacts
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.ipynb_checkpoints
+*.egg-info
+
+# Rust build artifacts (multi-GB)
+ticket_secrets/target
+
+# Secrets — NEVER bake into image
+.env
+.env.*
+cookies.txt
+*.pem
+*.key
+
+# Project debris
+*.bak
+testdb_backup.sql
+README.md
+*.md
+test.py
+
+# Non-runtime concerns
+loadtest
+monitoring
+nginx
+docker-compose*.yml
+Dockerfile
+.dockerignore
+
+# Test code (CI runs from source, image doesn't need)
+test

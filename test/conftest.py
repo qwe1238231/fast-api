@@ -1,4 +1,9 @@
 """Pytest fixtures shared across all tests."""
+import os
+os.environ.setdefault(
+    "DATABASE_URL",
+    "postgresql+asyncpg://justinhu@localhost:5432/testdb_test",
+)
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
@@ -6,7 +11,28 @@ from httpx import AsyncClient, ASGITransport
 from app.main import app
 from app.core.config import get_settings
 from app.core.redis import create_redis_client
+from app.db.base import Base
+from app.db.session import engine
 
+from sqlalchemy import text
+
+
+@pytest_asyncio.fixture(scope="session", autouse=True)
+async def _setup_schema():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)   # 從 ORM model 直接建表
+    yield
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clean_tables():
+    yield   # 先讓測試跑
+    async with engine.begin() as conn:
+        table_names = ", ".join(Base.metadata.tables)
+        await conn.execute(
+            text(f"TRUNCATE {table_names} RESTART IDENTITY CASCADE")
+        )
 
 @pytest.fixture(scope="session")
 def anyio_backend():

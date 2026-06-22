@@ -4,11 +4,14 @@ from uuid import UUID
 from fastapi import APIRouter, Header, status
 
 from app.api.deps import CurrentUser, DbSession, Redis
-from app.models.order import Order
+from app.models.order import Order, OrderStatus
 from app.schemas.order import OrderCreate, OrderResponse
 from app.services.orders import create_order_with_inventory, cancel_order as cancel_order_service, mark_confirmed, mark_paid
-from app.core.exceptions import OrderNotFound
+from app.core.exceptions import OrderNotFound, InvalidOrderTransition
 from app.crud.order import get_order_by_id, list_orders_for_user
+from app.schemas.payment import PaymentIntentResponse
+from app.services.stripe_client import create_payment_intent
+
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -87,3 +90,38 @@ async def cancel_order(
     
     await cancel_order_service(db, redis, order)
     await db.commit()
+
+@router.post("/{order_id}/payment-intent", response_model=PaymentIntentResponse)
+async def create_order_payment_intent(
+        order_id: int,
+        current_user: CurrentUser,
+        db: DbSession,
+) -> PaymentIntentResponse:
+    """Create a Stripe PaymentIntent for the given order.
+    
+    Returns client_secret for the frontend to complete payment.
+    """
+    order = await get_order_by_id(db, order_id)
+    if order is None or order.user_id != current_user.id:
+        raise OrderNotFound(order_id=order_id)
+    
+    if order.status != OrderStatus.PENDING:
+        raise InvalidOrderTransition(
+            order_id=order_id,
+            from_status=order.status.value,
+            to_status="paying",
+        )
+    
+    intent = create_payment_intent(
+        amount=order.total_price_cents,
+        currency="usd",
+        order_id=order.id,
+    )
+
+    order.payment_provider_id = intent["id"]
+    await db.commit()
+    
+    return PaymentIntentResponse(
+        payment_intent_id=intent["id"],
+        client_secret=intent["client_secret"],
+    )

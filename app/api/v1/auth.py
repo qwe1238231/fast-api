@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status ,Request, Response
 from fastapi.security import OAuth2PasswordRequestForm
 
-from app.api.deps import DbSession, limiter, CurrentUser
+from app.api.deps import DbSession, limiter, CurrentUser, Redis
 from app.core.config import get_settings
 
 from app.core.security import (
@@ -13,7 +13,7 @@ from app.core.security import (
 )
 from app.crud.user import get_user_by_username
 from app.schemas.token import Token
-
+from app.services.audit import emit_event
 import secrets
 from datetime import timedelta, datetime, timezone
 from app.crud.refresh_token import (
@@ -74,12 +74,13 @@ def clear_auth_cookies(
 
 
 @router.post("/token",response_model=Token)
-@limiter.limit("5/minute")
+@limiter.limit(get_settings().LOGIN_RATE_LIMIT)
 async def login_for_access_token(
     request: Request,
     response: Response,
     form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
     db: DbSession,
+    redis: Redis,
 ) -> Token:
     user = await get_user_by_username(db, username=form_data.username)
     if user is None:
@@ -90,6 +91,16 @@ async def login_for_access_token(
             form_data.password, user.hashed_password
         )
     if user is None or not password_valid or not user.is_active:
+        await emit_event(
+            redis,
+            event_type="auth.login_failure",
+            actor_ip=request.client.host if request.client else None,
+            payload={
+        "username_attempted": form_data.username[:64],
+        "reason": "invalid_credentials_or_inactive",
+        },
+            success=False,
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -122,6 +133,15 @@ async def login_for_access_token(
         csrf_token=csrf_token,
         lifetime_seconds=int(sliding.total_seconds()),
         secure=not settings.DEBUG,
+    )
+    await emit_event(
+        redis,
+        event_type="auth.login_success",
+        actor_user_id=user.id,
+        actor_ip=request.client.host if request.client else None,
+        payload={
+            "user_agent": request.headers.get("user-agent", "")[:256],
+        },
     )
     return Token(
         access_token=create_access_token(subject=user.username),
@@ -237,3 +257,4 @@ async def logout_all(
 
     settings = get_settings()
     clear_auth_cookies(response, secure=not settings.DEBUG)
+

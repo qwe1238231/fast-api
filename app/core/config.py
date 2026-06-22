@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     PII_LOOKUP_KEY_BASE64:str
     STRIPE_SECRET_KEY: str
     STRIPE_WEBHOOK_SECRET: str=""
+    LOGIN_RATE_LIMIT: str = "5/minute"
+    AUDIT_LOG_RETENTION_DAYS: int = 90
+
     model_config = SettingsConfigDict(env_file=".env",extra="ignore")
 
     @field_validator("PII_KEK_BASE64", "PII_LOOKUP_KEY_BASE64")

@@ -19,6 +19,7 @@ from app.core.redis import create_redis_client
 from app.db.base import Base
 from app.db.session import engine
 from app.db.session import AsyncSessionLocal
+from app.api.deps import limiter
 
 from sqlalchemy import text
 
@@ -54,7 +55,7 @@ async def client():
     try:
         async with AsyncClient(
             transport=ASGITransport(app=app),
-            base_url="http://test",
+            base_url="https://test",
         ) as ac:
             yield ac
     finally:
@@ -79,3 +80,9 @@ async def redis():
         yield r
     finally:
         await r.aclose()
+
+@pytest.fixture(autouse=True)
+def _disable_rate_limit():
+    limiter.enabled = False
+    yield
+    limiter.enabled = True

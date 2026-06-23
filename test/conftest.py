@@ -89,3 +89,24 @@ def _disable_rate_limit():
     limiter.enabled = False
     yield
     limiter.enabled = True
+
+@pytest_asyncio.fixture
+async def published_event(db, redis):
+    from datetime import datetime, timedelta, timezone
+    from app.models.event import Event, EventStatus
+    from app.services.inventory import set_initial_stock
+
+    now = datetime.now(timezone.utc)
+    event = Event(
+        name="Test Concert", venue="Test Arena",
+        starts_at=now + timedelta(days=30),
+        ends_at=now + timedelta(days=30, hours=3),
+        sale_starts_at=now - timedelta(days=1),   # 已開賣
+        sale_ends_at=now + timedelta(days=1),      # 未結束
+        total_seats=5, price_cents=1500,
+        status=EventStatus.PUBLISHED,
+    )
+    db.add(event)
+    await db.commit()                              # commit 後端點的 session 才看得到
+    await set_initial_stock(redis, event_id=event.id, total_seats=event.total_seats)
+    return event

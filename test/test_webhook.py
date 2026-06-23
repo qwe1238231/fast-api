@@ -54,3 +54,28 @@ async def test_webhook_rejects_bad_signature(client, monkeypatch):
         headers={"Stripe-Signature": "bad"},
     )
     assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_webhook_ignores_event_without_order_id(client, monkeypatch):
+    # 事件合法,但 metadata 沒有 order_id → 應該安靜略過,不報錯
+    def fake(payload, sig_header, secret):
+        return {"type": "payment_intent.succeeded", "data": {"object": {"metadata": {}}}}
+    monkeypatch.setattr("stripe.Webhook.construct_event", fake)
+
+    r = await client.post("/v1/webhooks/stripe", content=b"{}", headers={"Stripe-Signature": "x"})
+    assert r.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_webhook_ignores_unknown_order(client, monkeypatch):
+    # order_id 指向不存在的訂單 → 安靜略過
+    def fake(payload, sig_header, secret):
+        return {
+            "type": "payment_intent.succeeded",
+            "data": {"object": {"metadata": {"order_id": "999999"}}},
+        }
+    monkeypatch.setattr("stripe.Webhook.construct_event", fake)
+
+    r = await client.post("/v1/webhooks/stripe", content=b"{}", headers={"Stripe-Signature": "x"})
+    assert r.status_code == 204

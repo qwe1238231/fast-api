@@ -1,0 +1,35 @@
+from datetime import datetime
+from typing import Annotated
+
+from pydantic import BaseModel, Field, ConfigDict
+from app.models.event import EventStatus
+
+
+class EventCreate(BaseModel):
+    """Request body for POST /v1/events."""
+    name: str
+    venue: str
+    starts_at: datetime
+    ends_at: datetime
+    sale_starts_at: datetime
+    sale_ends_at: datetime
+    price_cents: int = Field(ge=0)
+    total_seats: int = Field(ge=1)
+
+class EventResponse(BaseModel):
+    """Event representation sent back to client."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    venue: str
+    starts_at: datetime
+    ends_at: datetime
+    sale_starts_at: datetime
+    sale_ends_at: datetime
+    price_cents: int
+    total_seats: int
+    status: EventStatus
+    created_at: datetime
+    updated_at: datetime

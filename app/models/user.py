@@ -22,6 +22,11 @@ class User(Base):
         server_default=expression.true(),
         nullable=False,
     )
+    is_admin: Mapped[bool] = mapped_column(
+        default=False,
+        server_default=expression.false(),
+        nullable=False,
+    )
 
     def __repr__(self) -> str:
         return f"<User(id={self.id}, username={self.username})>"

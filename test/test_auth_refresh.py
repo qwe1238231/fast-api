@@ -61,3 +61,27 @@ async def test_reusing_old_token_revokes_whole_family(client):
 
     # family 已撤銷 → 連「合法的」B 現在也作廢
     assert (await replay(token_b)).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_logout_ends_session(client):
+    await register_and_login(client)
+    csrf = client.cookies.get("csrf_token")
+
+    r = await client.post("/v1/auth/logout", headers={"X-CSRF-Token": csrf})
+    assert r.status_code == 204
+
+    # 登出後 refresh 失敗(cookie 已清 + token 已撤銷)
+    r2 = await client.post("/v1/auth/refresh", headers={"X-CSRF-Token": csrf})
+    assert r2.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_logout_all(client):
+    r = await register_and_login(client)
+    token = r.json()["access_token"]
+
+    rr = await client.post(
+        "/v1/auth/logout-all", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert rr.status_code == 204

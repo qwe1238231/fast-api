@@ -9,6 +9,9 @@ os.environ.setdefault(
     "redis://localhost:6380/15",   # db 15,跟開發的 db 0 完全隔開
 )
 
+os.environ.setdefault("REFRESH_TOKEN_REUSE_GRACE_SECONDS", "0")
+
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport

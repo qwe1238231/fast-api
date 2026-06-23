@@ -4,6 +4,11 @@ os.environ.setdefault(
     "DATABASE_URL",
     "postgresql+asyncpg://justinhu@localhost:5432/testdb_test",
 )
+os.environ.setdefault(
+    "REDIS_URL",
+    "redis://localhost:6380/15",   # db 15,跟開發的 db 0 完全隔開
+)
+
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
@@ -13,6 +18,7 @@ from app.core.config import get_settings
 from app.core.redis import create_redis_client
 from app.db.base import Base
 from app.db.session import engine
+from app.db.session import AsyncSessionLocal
 
 from sqlalchemy import text
 
@@ -53,3 +59,23 @@ async def client():
             yield ac
     finally:
         await app.state.redis.aclose()
+
+@pytest_asyncio.fixture(autouse=True)
+async def _clean_redis():
+    yield
+    r = create_redis_client(get_settings().REDIS_URL)
+    await r.flushdb()      # 只清 db 15
+    await r.aclose()
+
+@pytest_asyncio.fixture
+async def db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+@pytest_asyncio.fixture
+async def redis():
+    r = create_redis_client(get_settings().REDIS_URL)
+    try:
+        yield r
+    finally:
+        await r.aclose()

@@ -74,4 +74,4 @@ jobs:
           PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
           PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
           REDIS_URL: redis://localhost:6379/0
-        run: pytest test/ -v
+        run: pytest test/ -v --cov-fail-under=60

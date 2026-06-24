@@ -3,10 +3,14 @@
 Single source of truth for "how many seats remain". DB stores `events.total_seats`
 as configuration; this module manages live decrement during sale.
 """
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import  select, func
+
 from redis.asyncio import Redis
 
-from app.core.exceptions import InsufficientInventory
-
+from app.core.exceptions import InsufficientInventory ,EventNotFound
+from app.models.event import Event
+from app.models.order import Order, OrderStatus 
 
 def _key(event_id: int) -> str:
     """Key for an event's available seat counter."""
@@ -55,3 +59,26 @@ async def release(
 ) -> None:
     """Return `quantity` seats to inventory (order expired/cancelled)."""
     await redis.incrby(_key(event_id), quantity)
+
+async def reconcile_inventory(
+        db: AsyncSession,
+        redis: Redis,
+        *,
+        event_id: int,
+) -> int:
+    """從 Postgres 重算真實剩餘,覆蓋寫回 Redis。Redis 遺失後的權威重建。"""
+    total_seats = await db.scalar(
+        select(Event.total_seats).where(Event.id == event_id)
+    )
+    if total_seats is None:
+        raise EventNotFound(event_id=event_id)
+    
+    held = (OrderStatus.PENDING, OrderStatus.PAID, OrderStatus.CONFIRMED)
+    sold = await db.scalar(
+        select(func.coalesce(func.sum(Order.quantity), 0))
+        .where(Order.event_id == event_id, Order.status.in_(held))
+    )
+
+    remaining = total_seats - sold
+    await redis.set(_key(event_id), remaining)
+    return remaining

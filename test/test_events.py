@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 import pytest
 
 from app.core.security import get_password_hash
@@ -58,3 +60,30 @@ async def test_publish_non_draft_is_rejected(client, db):
     # 再發佈一次 → 已不是 draft → 400
     again = await client.post(f"/v1/events/{event_id}/publish", headers=headers)
     assert again.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_reconcile_rebuilds_inventory_after_redis_loss(client, db, redis):
+    headers = await _make_admin_and_login(client, db)
+    event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
+    await client.post(f"/v1/events/{event_id}/publish", headers=headers)        # 庫存 100
+
+    # 下 3 筆共 30 張 → Redis 剩 70、DB 有 30 的 pending 訂單
+    for _ in range(3):
+        r = await client.post(
+            "/v1/orders/",
+            json={"event_id": event_id, "quantity": 10},
+            headers={**headers, "Idempotency-Key": str(uuid4())},
+        )
+        assert r.status_code == 201
+    assert await get_available(redis, event_id=event_id) == 70
+
+    # 模擬 Redis 遺失那個 key
+    await redis.delete(f"event:{event_id}:available")
+    assert await get_available(redis, event_id=event_id) == 0
+
+    # reconcile 從 Postgres 重建:100 - 30 = 70
+    rr = await client.post(f"/v1/events/{event_id}/reconcile-inventory", headers=headers)
+    assert rr.status_code == 200
+    assert rr.json()["available"] == 70
+    assert await get_available(redis, event_id=event_id) == 70

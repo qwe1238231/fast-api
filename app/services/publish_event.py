@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import EventError
 from app.models.event import Event, EventStatus
 from app.services.inventory import set_initial_stock
-
+from app.services.event_cache import invalidate_event_meta
 
 async def publish_event(
         db: AsyncSession,
@@ -19,4 +19,5 @@ async def publish_event(
     event.status = EventStatus.PUBLISHED
     await db.flush()
     await set_initial_stock(redis, event_id=event.id, total_seats=event.total_seats)
+    await invalidate_event_meta(redis, event_id=event.id)
     return event

@@ -104,3 +104,28 @@ async def test_detect_inventory_drift(client, db, redis):
     await redis.set(f"event:{event_id}:available", 42)
     drifts = await detect_inventory_drift({"redis_client": redis})
     assert drifts == [{"event_id": event_id, "expected": 100, "actual": 42}]
+
+
+@pytest.mark.asyncio
+async def test_get_event_meta_caches(db, redis, published_event):
+    from app.services.event_cache import get_event_meta
+
+    key = f"event:{published_event.id}:meta"
+    assert await redis.get(key) is None                       # 一開始沒快取
+    meta = await get_event_meta(redis, db, event_id=published_event.id)
+    assert meta.status.value == "published"
+    assert await redis.get(key) is not None                   # 讀過 → 快取了(下次不打 DB)
+
+
+@pytest.mark.asyncio
+async def test_publish_invalidates_event_cache(client, db, redis):
+    from app.services.event_cache import get_event_meta
+
+    headers = await _make_admin_and_login(client, db)
+    event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
+
+    await get_event_meta(redis, db, event_id=event_id)        # 草稿狀態被快取
+    assert await redis.get(f"event:{event_id}:meta") is not None
+
+    await client.post(f"/v1/events/{event_id}/publish", headers=headers)
+    assert await redis.get(f"event:{event_id}:meta") is None  # 發佈清掉了快取

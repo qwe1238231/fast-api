@@ -17,7 +17,7 @@ from app.services.inventory import release, reserve
 from app.models.event import Event, EventStatus
 from app.crud.order import create_order, get_order_by_id
 from app.services.idempotency import get_claimed_order_id, try_claim
-
+from app.services.event_cache import get_event_meta
 
 _ALLOWED_TRANSITIONS : dict[OrderStatus, set[OrderStatus]] = {
     OrderStatus.PENDING:{
@@ -99,7 +99,7 @@ async def create_order_with_inventory(
         existing = await get_order_by_id(db, existing_id)
         if existing is not None:
             return existing
-    event = await db.get(Event, event_id)
+    event = await get_event_meta(redis, db, event_id=event_id)
     if event is None:
         raise EventNotFound(event_id=event_id)
     if event.status == EventStatus.CANCELLED:

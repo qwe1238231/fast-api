@@ -87,3 +87,20 @@ async def test_reconcile_rebuilds_inventory_after_redis_loss(client, db, redis):
     assert rr.status_code == 200
     assert rr.json()["available"] == 70
     assert await get_available(redis, event_id=event_id) == 70
+
+
+@pytest.mark.asyncio
+async def test_detect_inventory_drift(client, db, redis):
+    from app.worker import detect_inventory_drift
+
+    headers = await _make_admin_and_login(client, db)
+    event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
+    await client.post(f"/v1/events/{event_id}/publish", headers=headers)        # 庫存 100,無訂單
+
+    # 一致 → 沒有 drift
+    assert await detect_inventory_drift({"redis_client": redis}) == []
+
+    # 故意把 Redis 設成錯的值 → 應被抓到
+    await redis.set(f"event:{event_id}:available", 42)
+    drifts = await detect_inventory_drift({"redis_client": redis})
+    assert drifts == [{"event_id": event_id, "expected": 100, "actual": 42}]

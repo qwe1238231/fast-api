@@ -17,7 +17,8 @@ from app.services.orders import expire_order
 from app.crud.refresh_token import purge_expired
 from app.models.audit_log import AuditLog
 from app.services.audit import AUDIT_STREAM_KEY
-
+from app.models.event import Event, EventStatus
+from app.services.inventory import compute_expected_available, get_available
 
 PENDING_TIMEOUT_MINUTES = 10
 AUDIT_CONSUMER_GROUP = "audit-writer"
@@ -150,6 +151,23 @@ async def consume_audit_events(ctx: dict) -> None:
 
     if entry_ids:
         await redis.xack(AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP, *entry_ids)
+
+async def detect_inventory_drift(ctx: dict) -> list[dict]:
+    """比對每個 published event 的 Redis 庫存 vs Postgres 應有值,不一致就記錄。"""
+    redis = ctx["redis_client"]
+    drifts: list[dict] = []
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Event.id).where(Event.status == EventStatus.PUBLISHED)
+        )
+        for event_id in result.scalars().all():
+            expected = await compute_expected_available(db, event_id=event_id)
+            actual = await get_available(redis, event_id=event_id)
+            if expected != actual:
+                drifts.append({"event_id":event_id, "expected": expected, "actual":actual})
+                print(f"INVENTORY DRIFT event={event_id} redis={actual} expected={expected}")
+
+    return drifts
         
 class WorkerSettings:
     """ARQ worker config. Launch: `arq app.worker.WorkerSettings`"""
@@ -164,4 +182,7 @@ class WorkerSettings:
         cron(purge_expired_refresh_tokens, hour={3}, minute={0}),
         cron(consume_audit_events, minute={i for i in range(60)}),
         cron(purge_old_audit_logs, hour={2}, minute={30}),
+        cron(detect_inventory_drift, minute=set(range(0, 60, 5))),
+
     ]
+

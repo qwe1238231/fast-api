@@ -82,3 +82,33 @@ async def reconcile_inventory(
     remaining = total_seats - sold
     await redis.set(_key(event_id), remaining)
     return remaining
+
+async def compute_expected_available(
+        db: AsyncSession,
+        *,
+        event_id: int,
+) -> int:
+    """從 Postgres 算出『應有的剩餘庫存』—— 不碰 Redis,純讀。"""
+    total_seats = await db.scalar(
+        select(Event.total_seats).where(Event.id == event_id)
+    )
+    if total_seats is None:
+        raise EventNotFound(event_id=event_id)
+    
+    held = (OrderStatus.PENDING, OrderStatus.PAID, OrderStatus.CONFIRMED)
+    sold = await db.scalar(
+        select(func.coalesce(func.sum(Order.quantity), 0))
+        .where(Order.event_id == event_id, Order.status.in_(held))
+    )
+    return total_seats - sold
+
+async def reconcile_inventory(
+        db: AsyncSession,
+        redis: Redis,
+        *,
+        event_id: int,
+) -> int:
+    """從 Postgres 重算真實剩餘,覆蓋寫回 Redis。"""
+    remaining = await compute_expected_available(db, event_id=event_id)
+    await redis.set(_key(event_id), remaining)
+    return remaining

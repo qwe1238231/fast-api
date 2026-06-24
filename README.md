@@ -226,6 +226,15 @@ API(emit_event)──XADD──▶ Redis Stream "audit:events"(~1ms,近即時)
 | POST | `/orders/{id}/cancel` | 取消(釋放庫存) |
 | POST | `/orders/{id}/payment-intent` | 建立 Stripe PaymentIntent,回 client_secret |
 
+### Events（活動管理）
+| Method | Path | 權限 | 說明 |
+|---|---|---|---|
+| POST | `/events/` | admin | 建立活動(草稿) |
+| POST | `/events/{id}/publish` | admin | 草稿 → 開賣,**自動把庫存灌進 Redis** |
+| POST | `/events/{id}/reconcile-inventory` | admin | 從 Postgres 重算、覆寫 Redis 庫存(Redis 遺失後的恢復) |
+| GET | `/events/` | 公開 | 列出已開賣的活動 |
+| GET | `/events/{id}` | 公開 | 單一活動 |
+
 ### Buyer Info / Webhooks
 | Method | Path | 說明 |
 |---|---|---|
@@ -327,25 +336,30 @@ docker compose logs -f worker      # 看到 arq 啟動 = worker 活著
 
 開瀏覽器到 <http://localhost:8000/docs> 看互動式 API 文件。
 
-### 步驟 6 — Seed 一個活動 + 庫存
+### 步驟 6 — 造一個 admin、建活動並發佈
 
-> ⚠️ **已知限制**:目前**沒有建立活動的 API 端點**,庫存初始化(`set_initial_stock`)也尚未接上自動流程。要試用搶票,需手動 seed。
-
-建一筆已開賣的活動(售票窗要涵蓋現在時間):
+建立活動需要 admin 權限。先用 bootstrap 腳本造一個 admin:
 
 ```bash
-docker compose exec db psql -U justinhu -d testdb -c \
-  "INSERT INTO events (name, venue, starts_at, ends_at, sale_starts_at, sale_ends_at, total_seats, price_cents, status)
-   VALUES ('Demo Concert', 'Taipei Arena',
-           '2026-12-01 19:00+00', '2026-12-01 22:00+00',
-           '2026-01-01 00:00+00', '2026-12-01 18:00+00',
-           50000, 1500, 'published');"
+docker compose exec api python -m app.scripts.create_admin admin adminpass
 ```
 
-把庫存計數器設成跟 `total_seats` 一致(假設活動 id = 1):
+登入拿 admin 的 access token,然後**建活動 → 發佈**(發佈會自動把庫存灌進 Redis,不用再手動 seed):
 
 ```bash
-docker compose exec redis redis-cli SET event:1:available 50000
+TOKEN=$(curl -s -X POST localhost:8000/v1/auth/token \
+  -d 'username=admin&password=adminpass' | jq -r .access_token)
+
+# 建活動(草稿),記下回傳的 id
+curl -X POST localhost:8000/v1/events/ \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"Demo Concert","venue":"Taipei Arena",
+       "starts_at":"2026-12-01T19:00:00+00:00","ends_at":"2026-12-01T22:00:00+00:00",
+       "sale_starts_at":"2026-01-01T00:00:00+00:00","sale_ends_at":"2026-12-01T18:00:00+00:00",
+       "total_seats":50000,"price_cents":1500}'
+
+# 發佈(假設 id=1)→ 自動 seed 庫存到 Redis
+curl -X POST localhost:8000/v1/events/1/publish -H "Authorization: Bearer $TOKEN"
 ```
 
 ### 步驟 7 — 跑一遍完整流程

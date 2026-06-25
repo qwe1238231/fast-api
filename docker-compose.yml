@@ -67,6 +67,24 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  order-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fastapi-ticket:dev
+    command: python -m app.order_consumer
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://justinhu@db:5432/testdb
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:latest
     ports:

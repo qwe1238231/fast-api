@@ -2,6 +2,7 @@
 
 Run: arq app.worker.WorkerSettings
 """
+import asyncio
 import json
 from datetime import timedelta, timezone, datetime
 from uuid import UUID
@@ -29,6 +30,7 @@ AUDIT_CONSUMER_GROUP = "audit-writer"
 AUDIT_CONSUMER_NAME = "worker"
 ORDER_CONSUMER_GROUP = "order-writer"
 ORDER_CONSUMER_NAME = "worker"
+ORDER_LOOP_CONSUMER_NAME = "stream-consumer"   # the dedicated long-lived consumer process
 ORDER_DEAD_LETTER_KEY = "orders:stream:dead"
 RECLAIM_IDLE_MS = 60_000   # only reclaim entries a (crashed?) consumer has held this long
 MAX_DELIVERIES = 5         # give up (dead-letter) after this many delivery attempts
@@ -100,24 +102,21 @@ async def purge_old_audit_logs(ctx: dict) -> None:
             await db.rollback()
             print(f"Failed to purge audit logs: {exc}")
 
+async def ensure_consumer_group(redis, stream_key: str, group: str) -> None:
+    """Create a consumer group (and the stream) if it doesn't already exist."""
+    try:
+        await redis.xgroup_create(stream_key, group, id="0", mkstream=True)
+    except Exception as exc:
+        if "BUSYGROUP" not in str(exc):
+            raise
+
+
 async def startup(ctx: dict) -> None:
     """Open Redis client for inventory operations."""
     settings = get_settings()
     ctx["redis_client"] = create_redis_client(settings.REDIS_URL)
-    for stream_key, group in (
-        (AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP),
-        (ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP),
-    ):
-        try:
-            await ctx["redis_client"].xgroup_create(
-                stream_key,
-                group,
-                id="0",
-                mkstream=True,
-            )
-        except Exception as exc:
-            if "BUSYGROUP" not in str(exc):
-                raise
+    await ensure_consumer_group(ctx["redis_client"], AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP)
+    await ensure_consumer_group(ctx["redis_client"], ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP)
 
 async def shutdown(ctx: dict) -> None:
     """Close Redis client."""
@@ -191,25 +190,24 @@ async def _persist_intent(fields: dict) -> str:
             return "duplicate" if existing is not None else "failed"
 
 
-async def consume_order_intents(ctx: dict) -> None:
-    """Read new order intents from the stream and persist each as a PENDING order.
+async def _consume_batch(redis, *, consumer: str = ORDER_CONSUMER_NAME, block: int | None = None) -> int:
+    """Drain one batch of new order intents. Returns how many entries were read.
 
-    One DB transaction per entry. At-least-once: commit before ack. A genuine
-    integrity failure (bad FK, etc.) is left un-acked so reclaim retries it.
+    One DB transaction per entry; commit before ack. A genuine integrity failure
+    (bad FK) is left un-acked so reclaim retries / dead-letters it.
     """
-    redis = ctx["redis_client"]
-
     result = await redis.xreadgroup(
         groupname=ORDER_CONSUMER_GROUP,
-        consumername=ORDER_CONSUMER_NAME,
+        consumername=consumer,
         streams={ORDER_STREAM_KEY: ">"},
         count=500,
-        block=None,
+        block=block,
     )
     if not result:
-        return
+        return 0
 
-    for entry_id, fields in result[0][1]:
+    entries = result[0][1]
+    for entry_id, fields in entries:
         try:
             outcome = await _persist_intent(fields)
             if outcome in ("ok", "duplicate"):
@@ -217,6 +215,27 @@ async def consume_order_intents(ctx: dict) -> None:
             # 'failed' -> leave un-acked for reclaim_stale_order_intents
         except Exception as exc:
             print(f"Failed to persist order intent {entry_id}: {exc}")
+    return len(entries)
+
+
+async def consume_order_intents(ctx: dict) -> None:
+    """One non-blocking drain pass (used by tests and as a fallback)."""
+    await _consume_batch(ctx["redis_client"], block=None)
+
+
+async def run_order_consumer_loop(redis, *, block_ms: int = 2000, stop_event=None) -> None:
+    """Long-lived consumer: block-wait on the stream and drain continuously.
+
+    Run as a dedicated process (app/order_consumer.py) for near-real-time persist
+    latency instead of the 1-minute cron. block_ms lets it sleep efficiently
+    between bursts; stop_event allows graceful shutdown.
+    """
+    while stop_event is None or not stop_event.is_set():
+        try:
+            await _consume_batch(redis, consumer=ORDER_LOOP_CONSUMER_NAME, block=block_ms)
+        except Exception as exc:
+            print(f"order consumer loop error: {exc}")
+            await asyncio.sleep(1)   # avoid hot-spinning on a persistent error
 
 
 async def _dead_letter_intent(redis, entry_id: str, fields: dict) -> None:
@@ -303,7 +322,8 @@ class WorkerSettings:
         cron(expire_pending_orders, minute={i for i in range(60)}),
         cron(purge_expired_refresh_tokens, hour={3}, minute={0}),
         cron(consume_audit_events, minute={i for i in range(60)}),
-        cron(consume_order_intents, minute={i for i in range(60)}),
+        # order intents are drained by the dedicated app.order_consumer process
+        # (near-real-time); the ARQ worker only runs the reclaim safety net.
         cron(reclaim_stale_order_intents, minute={i for i in range(60)}),
         cron(purge_old_audit_logs, hour={2}, minute={30}),
         cron(detect_inventory_drift, minute=set(range(0, 60, 5))),

@@ -1,4 +1,5 @@
-"""Tests for consume_order_intents — the worker that drains the order stream."""
+"""Tests for the order-stream consumer (one-shot drain + the long-lived loop)."""
+import asyncio
 from uuid import uuid4
 
 import pytest
@@ -8,7 +9,11 @@ from app.core.security import get_password_hash
 from app.models.user import User
 from app.models.order import Order, OrderStatus
 from app.services.inventory import reserve_and_enqueue, ORDER_STREAM_KEY
-from app.worker import consume_order_intents, ORDER_CONSUMER_GROUP
+from app.worker import (
+    consume_order_intents,
+    run_order_consumer_loop,
+    ORDER_CONSUMER_GROUP,
+)
 
 
 async def _make_user(db, username="buyer"):
@@ -71,3 +76,26 @@ async def test_consumer_idempotent_on_duplicate(db, redis, published_event):
 
     summary = await redis.xpending(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP)
     assert summary["pending"] == 0                          # both entries acked
+
+
+@pytest.mark.asyncio
+async def test_consumer_loop_drains_then_stops(db, redis, published_event):
+    """The long-lived loop persists enqueued intents and exits on stop_event."""
+    user = await _make_user(db)
+    key = str(uuid4())
+    await reserve_and_enqueue(
+        redis, event_id=published_event.id, user_id=user.id,
+        quantity=1, total_price_cents=1500, idempotency_key=key,
+    )
+    await redis.xgroup_create(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, id="0", mkstream=True)
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(run_order_consumer_loop(redis, block_ms=50, stop_event=stop))
+    await asyncio.sleep(0.3)        # let it drain the entry
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)   # exits promptly on stop
+
+    order = (
+        await db.execute(select(Order).where(Order.idempotency_key == key))
+    ).scalar_one()
+    assert order.status == OrderStatus.PENDING

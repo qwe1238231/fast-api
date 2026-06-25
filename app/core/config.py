@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     LOGIN_RATE_LIMIT: str = "5/minute"
     AUDIT_LOG_RETENTION_DAYS: int = 90
 
+    # Async order-offload tuning
+    ORDER_CONSUMER_BLOCK_MS: int = 2000        # how long the consumer loop blocks per read
+    ORDER_RECLAIM_IDLE_MS: int = 60_000        # only reclaim entries idle at least this long
+    ORDER_MAX_DELIVERIES: int = 5              # dead-letter after this many delivery attempts
+    ORDER_BACKLOG_WARN: int = 1000             # log a warning when backlog exceeds this
+
     model_config = SettingsConfigDict(env_file=".env",extra="ignore")
 
     @field_validator("PII_KEK_BASE64", "PII_LOOKUP_KEY_BASE64")

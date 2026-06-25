@@ -28,14 +28,18 @@ from app.services.inventory import (
 )
 from app.services.idempotency import mark_claim_failed
 
+_settings = get_settings()
+
 PENDING_TIMEOUT_MINUTES = 10
 AUDIT_CONSUMER_GROUP = "audit-writer"
 AUDIT_CONSUMER_NAME = "worker"
 ORDER_CONSUMER_GROUP = "order-writer"
 ORDER_CONSUMER_NAME = "worker"
 ORDER_LOOP_CONSUMER_NAME = "stream-consumer"   # the dedicated long-lived consumer process
-RECLAIM_IDLE_MS = 60_000   # only reclaim entries a (crashed?) consumer has held this long
-MAX_DELIVERIES = 5         # give up (dead-letter) after this many delivery attempts
+RECLAIM_IDLE_MS = _settings.ORDER_RECLAIM_IDLE_MS      # only reclaim entries idle at least this long
+MAX_DELIVERIES = _settings.ORDER_MAX_DELIVERIES        # dead-letter after this many delivery attempts
+CONSUMER_BLOCK_MS = _settings.ORDER_CONSUMER_BLOCK_MS  # how long the loop blocks per read
+BACKLOG_WARN = _settings.ORDER_BACKLOG_WARN            # log a warning above this backlog
 
 
 async def expire_pending_orders(ctx: dict) -> None:
@@ -236,7 +240,7 @@ async def consume_order_intents(ctx: dict) -> None:
     await _consume_batch(ctx["redis_client"], block=None)
 
 
-async def run_order_consumer_loop(redis, *, block_ms: int = 2000, stop_event=None) -> None:
+async def run_order_consumer_loop(redis, *, block_ms: int = CONSUMER_BLOCK_MS, stop_event=None) -> None:
     """Long-lived consumer: block-wait on the stream and drain continuously.
 
     Run as a dedicated process (app/order_consumer.py) for near-real-time persist
@@ -321,7 +325,7 @@ async def report_queue_depth(ctx: dict) -> dict:
     stats = await collect_queue_stats(ctx["redis_client"])
     if stats["dead_letter"] > 0:
         print(f"ALERT order dead-letter depth={stats['dead_letter']} — orders failing permanently")
-    if stats["backlog"] > 1000:
+    if stats["backlog"] > BACKLOG_WARN:
         print(f"WARN order backlog={stats['backlog']} — consumers may be falling behind")
     return stats
 

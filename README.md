@@ -122,9 +122,13 @@ async def reserve(redis, *, event_id, quantity):
 - 逾時(預設 10 分鐘未付款):由背景 worker 轉 `EXPIRED` 並**釋放庫存**回 Redis。
 - `CANCELLED` / `EXPIRED` 都會把票還回庫存計數。
 
-### 3. 冪等性
+### 3. 下單非同步化 + 冪等性
 
-搶票請求帶 `Idempotency-Key` header(UUID)。Redis 記錄 `key → order_id` 的 claim(`SET NX`),client 重試不會重複建單;DB 對 `orders.idempotency_key` 的 **UNIQUE 約束**作為 Redis 萬一失誤時的最後防線。
+搶票主路徑**不在請求內寫 DB**:一個原子 Lua script 一口氣完成「去重 + 扣庫存 + 入列 + 寫 claim」,然後立刻回 **202 Accepted**;真正的 `orders` INSERT 由背景 worker 從 Redis Stream(`orders:stream`)消費後寫入。這把搶票時最慢的同步 DB 寫入移出請求路徑。
+
+- **冪等**:請求帶 `Idempotency-Key` header(UUID)。claim(`idempotency:{key}`)在原子 script 內依此 key 去重,client 重試不會重複扣庫存或重複建單;DB 對 `orders.idempotency_key` 的 **UNIQUE 約束**讓 worker 端「重抄無害」(`ON CONFLICT` 等效)。
+- **查詢**:client 拿 `Idempotency-Key` 輪詢 `GET /orders/by-key/{key}` → `processing`(漆帳中)/ `ready`(附訂單)/ `failed`(放棄並已退票)。
+- **可靠性**:worker 崩潰、未 ack 的訊息由 reclaim(`XPENDING` + `XCLAIM`)重領;反覆失敗的毒訊息超過上限後進死信 stream、**退回庫存**、claim 標 `FAILED`。
 
 ### 4. 認證 — JWT + Refresh Token 輪替
 
@@ -219,7 +223,8 @@ API(emit_event)──XADD──▶ Redis Stream "audit:events"(~1ms,近即時)
 ### Orders（搶票核心）
 | Method | Path | 說明 |
 |---|---|---|
-| POST | `/orders/` | **下單搶票**(需 `Idempotency-Key` header;售完回 409) |
+| POST | `/orders/` | **下單搶票**(需 `Idempotency-Key` header;回 **202** 已受理、售完回 409) |
+| GET | `/orders/by-key/{key}` | 用 `Idempotency-Key` 查狀態(processing / ready / failed） |
 | GET | `/orders/me` | 我的訂單列表 |
 | GET | `/orders/{id}` | 單筆訂單(非本人回 404) |
 | POST | `/orders/{id}/pay` | 模擬付款(PENDING→PAID→CONFIRMED) |
@@ -382,7 +387,8 @@ curl -X POST localhost:8000/v1/orders/ \
   -d '{"event_id":1,"quantity":1}'
 ```
 
-成功回 `201` + 訂單資料;售完回 `409`。
+成功回 **`202`** + `idempotency_key`(已受理、處理中);售完回 `409`。
+之後用 `GET /v1/orders/by-key/{idempotency_key}` 輪詢結果(`processing` / `ready` / `failed`)。
 
 ### (選用)本機非容器跑法
 

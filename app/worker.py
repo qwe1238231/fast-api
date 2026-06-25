@@ -190,6 +190,17 @@ async def _persist_intent(fields: dict) -> str:
             return "duplicate" if existing is not None else "failed"
 
 
+async def _ack_and_remove(redis, entry_id: str) -> None:
+    """Ack the entry, then delete it from the stream so it doesn't accumulate.
+
+    XACK only clears the pending list; the entry itself lingers in the stream
+    forever unless removed. Deleting once it's safely persisted keeps
+    orders:stream bounded to roughly the un-processed backlog.
+    """
+    await redis.xack(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, entry_id)
+    await redis.xdel(ORDER_STREAM_KEY, entry_id)
+
+
 async def _consume_batch(redis, *, consumer: str = ORDER_CONSUMER_NAME, block: int | None = None) -> int:
     """Drain one batch of new order intents. Returns how many entries were read.
 
@@ -211,7 +222,7 @@ async def _consume_batch(redis, *, consumer: str = ORDER_CONSUMER_NAME, block: i
         try:
             outcome = await _persist_intent(fields)
             if outcome in ("ok", "duplicate"):
-                await redis.xack(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, entry_id)
+                await _ack_and_remove(redis, entry_id)
             # 'failed' -> leave un-acked for reclaim_stale_order_intents
         except Exception as exc:
             print(f"Failed to persist order intent {entry_id}: {exc}")
@@ -282,13 +293,13 @@ async def reclaim_stale_order_intents(
 
         if times_delivered >= max_deliveries:
             await _dead_letter_intent(redis, entry_id, fields)
-            await redis.xack(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, entry_id)
+            await _ack_and_remove(redis, entry_id)
             continue
 
         try:
             outcome = await _persist_intent(fields)
             if outcome in ("ok", "duplicate"):
-                await redis.xack(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, entry_id)
+                await _ack_and_remove(redis, entry_id)
             # 'failed' -> leave; a later reclaim retries until max_deliveries, then dead-letters
         except Exception as exc:
             print(f"Reclaim failed for order intent {entry_id}: {exc}")

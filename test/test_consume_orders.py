@@ -79,6 +79,23 @@ async def test_consumer_idempotent_on_duplicate(db, redis, published_event):
 
 
 @pytest.mark.asyncio
+async def test_consumed_entries_removed_from_stream(db, redis, published_event):
+    """Acked intents are deleted so orders:stream stays bounded, not ever-growing."""
+    user = await _make_user(db)
+    for _ in range(3):
+        await reserve_and_enqueue(
+            redis, event_id=published_event.id, user_id=user.id,
+            quantity=1, total_price_cents=1500, idempotency_key=str(uuid4()),
+        )
+    await redis.xgroup_create(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, id="0", mkstream=True)
+    assert await redis.xlen(ORDER_STREAM_KEY) == 3
+
+    await consume_order_intents({"redis_client": redis})
+
+    assert await redis.xlen(ORDER_STREAM_KEY) == 0     # consumed -> removed
+
+
+@pytest.mark.asyncio
 async def test_consumer_loop_drains_then_stops(db, redis, published_event):
     """The long-lived loop persists enqueued intents and exits on stop_event."""
     user = await _make_user(db)

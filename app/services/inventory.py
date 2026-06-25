@@ -17,6 +17,7 @@ from app.models.order import Order, OrderStatus
 from app.services.idempotency import _key as _claim_key
 
 ORDER_STREAM_KEY="orders:stream"
+ORDER_DEAD_LETTER_KEY="orders:stream:dead"
 
 def _key(event_id: int) -> str:
     """Key for an event's available seat counter."""

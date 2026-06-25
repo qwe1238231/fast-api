@@ -22,7 +22,10 @@ from app.crud.refresh_token import purge_expired
 from app.models.audit_log import AuditLog
 from app.services.audit import AUDIT_STREAM_KEY
 from app.models.event import Event, EventStatus
-from app.services.inventory import compute_expected_available, get_available, release, ORDER_STREAM_KEY
+from app.services.inventory import (
+    compute_expected_available, get_available, release,
+    ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY,
+)
 from app.services.idempotency import mark_claim_failed
 
 PENDING_TIMEOUT_MINUTES = 10
@@ -31,7 +34,6 @@ AUDIT_CONSUMER_NAME = "worker"
 ORDER_CONSUMER_GROUP = "order-writer"
 ORDER_CONSUMER_NAME = "worker"
 ORDER_LOOP_CONSUMER_NAME = "stream-consumer"   # the dedicated long-lived consumer process
-ORDER_DEAD_LETTER_KEY = "orders:stream:dead"
 RECLAIM_IDLE_MS = 60_000   # only reclaim entries a (crashed?) consumer has held this long
 MAX_DELIVERIES = 5         # give up (dead-letter) after this many delivery attempts
 
@@ -304,6 +306,26 @@ async def reclaim_stale_order_intents(
         except Exception as exc:
             print(f"Reclaim failed for order intent {entry_id}: {exc}")
 
+async def collect_queue_stats(redis) -> dict:
+    """Current order-queue depths. backlog = unprocessed intents still in the
+    stream; dead_letter = intents given up on (should stay 0)."""
+    return {
+        "backlog": await redis.xlen(ORDER_STREAM_KEY),
+        "dead_letter": await redis.xlen(ORDER_DEAD_LETTER_KEY),
+    }
+
+
+async def report_queue_depth(ctx: dict) -> dict:
+    """Cron: log a smoke-alarm when the dead-letter stream is non-empty or the
+    backlog is climbing. (Grafana reads the same depths via the API /metrics.)"""
+    stats = await collect_queue_stats(ctx["redis_client"])
+    if stats["dead_letter"] > 0:
+        print(f"ALERT order dead-letter depth={stats['dead_letter']} — orders failing permanently")
+    if stats["backlog"] > 1000:
+        print(f"WARN order backlog={stats['backlog']} — consumers may be falling behind")
+    return stats
+
+
 async def detect_inventory_drift(ctx: dict) -> list[dict]:
     """比對每個 published event 的 Redis 庫存 vs Postgres 應有值,不一致就記錄。"""
     redis = ctx["redis_client"]
@@ -336,6 +358,7 @@ class WorkerSettings:
         # order intents are drained by the dedicated app.order_consumer process
         # (near-real-time); the ARQ worker only runs the reclaim safety net.
         cron(reclaim_stale_order_intents, minute={i for i in range(60)}),
+        cron(report_queue_depth, minute={i for i in range(60)}),
         cron(purge_old_audit_logs, hour={2}, minute={30}),
         cron(detect_inventory_drift, minute=set(range(0, 60, 5))),
 

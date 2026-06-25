@@ -12,6 +12,8 @@ from app.api.v1.router import api_router
 from app.api.exception_handlers import register_exception_handlers
 
 from prometheus_fastapi_instrumentator import Instrumentator
+from prometheus_client import REGISTRY
+from app.core.queue_metrics import QueueDepthCollector
 
 
 @asynccontextmanager
@@ -31,6 +33,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 register_exception_handlers(app)
 Instrumentator().instrument(app).expose(app)
+REGISTRY.register(QueueDepthCollector())   # order_stream_backlog / order_dead_letter_depth on /metrics
 app.include_router(api_router, prefix="/v1")
 
 @app.get("/", include_in_schema=False)

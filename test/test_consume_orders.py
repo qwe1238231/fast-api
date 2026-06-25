@@ -96,6 +96,40 @@ async def test_consumed_entries_removed_from_stream(db, redis, published_event):
 
 
 @pytest.mark.asyncio
+async def test_queue_stats_reports_backlog_and_dead_letter(db, redis, published_event):
+    from app.worker import collect_queue_stats
+    from app.services.inventory import ORDER_DEAD_LETTER_KEY
+
+    user = await _make_user(db)
+    for _ in range(2):
+        await reserve_and_enqueue(
+            redis, event_id=published_event.id, user_id=user.id,
+            quantity=1, total_price_cents=1500, idempotency_key=str(uuid4()),
+        )
+    await redis.xadd(ORDER_DEAD_LETTER_KEY, {"marker": "1"})
+
+    stats = await collect_queue_stats(redis)
+    assert stats["backlog"] == 2          # 2 unprocessed intents in the stream
+    assert stats["dead_letter"] == 1
+
+
+@pytest.mark.asyncio
+async def test_queue_depth_collector_exposes_gauges(db, redis, published_event):
+    """The Prometheus collector (sync, used on /metrics) reports the same depths."""
+    from app.core.queue_metrics import QueueDepthCollector
+
+    user = await _make_user(db)
+    await reserve_and_enqueue(
+        redis, event_id=published_event.id, user_id=user.id,
+        quantity=1, total_price_cents=1500, idempotency_key=str(uuid4()),
+    )
+
+    samples = {m.name: m.samples[0].value for m in QueueDepthCollector().collect()}
+    assert samples["order_stream_backlog"] == 1
+    assert samples["order_dead_letter_depth"] == 0
+
+
+@pytest.mark.asyncio
 async def test_consumer_loop_drains_then_stops(db, redis, published_event):
     """The long-lived loop persists enqueued intents and exits on stop_event."""
     user = await _make_user(db)

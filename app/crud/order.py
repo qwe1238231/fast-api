@@ -37,6 +37,15 @@ async def get_order_by_id(
     return await db.get(Order, order_id)
 
 
+async def get_order_by_idempotency_key(
+        db: AsyncSession,
+        idempotency_key: UUID,
+) -> Order | None:
+    """Look up an order by its idempotency_key (UNIQUE, indexed)."""
+    stmt = select(Order).where(Order.idempotency_key == idempotency_key)
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
 async def list_orders_for_user(
         db: AsyncSession,
         user_id: int,

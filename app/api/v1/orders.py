@@ -1,14 +1,15 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Header, status
+from fastapi import APIRouter, Header, status, HTTPException
 
 from app.api.deps import CurrentUser, DbSession, Redis
 from app.models.order import Order, OrderStatus
-from app.schemas.order import OrderCreate, OrderResponse
-from app.services.orders import create_order_with_inventory, cancel_order as cancel_order_service, mark_confirmed, mark_paid
+from app.schemas.order import OrderCreate, OrderResponse, OrderAcceptedResponse, OrderStatusResponse, OrderPollState
+from app.services.orders import submit_order, cancel_order as cancel_order_service, mark_confirmed, mark_paid
+from app.services.idempotency import get_claim_state, CLAIM_PENDING, CLAIM_FAILED
 from app.core.exceptions import OrderNotFound, InvalidOrderTransition
-from app.crud.order import get_order_by_id, list_orders_for_user
+from app.crud.order import get_order_by_id, get_order_by_idempotency_key, list_orders_for_user
 from app.schemas.payment import PaymentIntentResponse
 from app.services.stripe_client import create_payment_intent
 
@@ -18,8 +19,8 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 
 @router.post(
     "/",
-    response_model=OrderResponse,
-    status_code=status.HTTP_201_CREATED,
+    response_model=OrderAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 async def create_endpoint(
     order_in: OrderCreate,
@@ -27,9 +28,13 @@ async def create_endpoint(
     current_user: CurrentUser,
     db: DbSession,
     redis: Redis,
-) -> Order:
-    """Create a new pending order."""
-    order = await create_order_with_inventory(
+) -> OrderAcceptedResponse:
+    """Accept an order intent: validate, reserve a seat, enqueue for the worker.
+
+    Returns 202 immediately — the order row is written asynchronously by the
+    worker. The client polls order status with the Idempotency-Key.
+    """
+    await submit_order(
         db,
         redis,
         user_id=current_user.id,
@@ -37,8 +42,7 @@ async def create_endpoint(
         quantity=order_in.quantity,
         idempotency_key=idempotency_key,
     )
-    await db.commit()
-    return order
+    return OrderAcceptedResponse(idempotency_key=idempotency_key)
 
 @router.get("/me", response_model=list[OrderResponse])
 async def list_my_orders(
@@ -47,6 +51,33 @@ async def list_my_orders(
 ) -> list[Order]:
     """List orders belonging to the authenticated user, newest first."""
     return await list_orders_for_user(db, current_user.id)
+
+@router.get("/by-key/{idempotency_key}", response_model=OrderStatusResponse)
+async def get_order_status(
+    idempotency_key: UUID,
+    current_user: CurrentUser,
+    db: DbSession,
+    redis: Redis,
+) -> OrderStatusResponse:
+    """Poll an order's status by the Idempotency-Key used to create it.
+
+    Persisted (and owned) -> the order. Still in the queue -> processing.
+    Otherwise 404 (also when the key belongs to another user — don't leak).
+    """
+    order = await get_order_by_idempotency_key(db, idempotency_key)
+    if order is not None and order.user_id == current_user.id:
+        return OrderStatusResponse(
+            state=OrderPollState.READY,
+            order=OrderResponse.model_validate(order),
+        )
+    if order is None:
+        claim = await get_claim_state(redis, idempotency_key=str(idempotency_key))
+        if claim == CLAIM_PENDING:
+            return OrderStatusResponse(state=OrderPollState.PROCESSING)
+        if claim == CLAIM_FAILED:
+            return OrderStatusResponse(state=OrderPollState.FAILED)
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No order for this key")
+
 
 @router.get("/{order_id}", response_model=OrderResponse)
 async def get_order(

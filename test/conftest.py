@@ -110,3 +110,26 @@ async def published_event(db, redis):
     await db.commit()                              # commit 後端點的 session 才看得到
     await set_initial_stock(redis, event_id=event.id, total_seats=event.total_seats)
     return event
+
+
+@pytest_asyncio.fixture
+async def drain_orders(redis):
+    """Run the order-stream consumer once, like the worker would.
+
+    The group is normally created in worker startup(); we create it here
+    (idempotently) so tests can drain the stream after posting orders.
+    """
+    from app.worker import consume_order_intents, ORDER_CONSUMER_GROUP
+    from app.services.inventory import ORDER_STREAM_KEY
+
+    async def _drain():
+        try:
+            await redis.xgroup_create(
+                ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, id="0", mkstream=True
+            )
+        except Exception as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+        await consume_order_intents({"redis_client": redis})
+
+    return _drain

@@ -3,22 +3,25 @@ import stripe
 from uuid import uuid4
 
 
-async def _create_pending_order(client, event_id):
-    """註冊 + 登入 + 下單,回 (order_id, token)。"""
+async def _create_pending_order(client, drain, event_id):
+    """註冊 + 登入 + 下單(202)+ 跑 worker 漆帳,回 (order_id, token)。"""
     await client.post("/v1/users/", json={"username": "alice", "password": "secret123"})
     r = await client.post("/v1/auth/token", data={"username": "alice", "password": "secret123"})
     token = r.json()["access_token"]
-    ro = await client.post(
+    await client.post(
         "/v1/orders/",
         json={"event_id": event_id, "quantity": 1},
         headers={"Authorization": f"Bearer {token}", "Idempotency-Key": str(uuid4())},
     )
-    return ro.json()["id"], token
+    await drain()                                   # worker writes the order row
+    auth = {"Authorization": f"Bearer {token}"}
+    order_id = (await client.get("/v1/orders/me", headers=auth)).json()[0]["id"]
+    return order_id, token
 
 
 @pytest.mark.asyncio
-async def test_webhook_confirms_order_on_payment_success(client, published_event, monkeypatch):
-    order_id, token = await _create_pending_order(client, published_event.id)
+async def test_webhook_confirms_order_on_payment_success(client, published_event, monkeypatch, drain_orders):
+    order_id, token = await _create_pending_order(client, drain_orders, published_event.id)
 
     # 換掉簽章驗證,直接回傳一個 payment_intent.succeeded 事件
     def fake_construct_event(payload, sig_header, secret):

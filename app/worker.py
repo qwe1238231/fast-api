@@ -4,25 +4,34 @@ Run: arq app.worker.WorkerSettings
 """
 import json
 from datetime import timedelta, timezone, datetime
+from uuid import UUID
 
 from arq import cron
 from arq.connections import RedisSettings
 from sqlalchemy import select, delete
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
 from app.core.redis import create_redis_client
 from app.db.session import AsyncSessionLocal
 from app.models.order import Order, OrderStatus
 from app.services.orders import expire_order
+from app.crud.order import create_order, get_order_by_idempotency_key
 from app.crud.refresh_token import purge_expired
 from app.models.audit_log import AuditLog
 from app.services.audit import AUDIT_STREAM_KEY
 from app.models.event import Event, EventStatus
-from app.services.inventory import compute_expected_available, get_available
+from app.services.inventory import compute_expected_available, get_available, release, ORDER_STREAM_KEY
+from app.services.idempotency import mark_claim_failed
 
 PENDING_TIMEOUT_MINUTES = 10
 AUDIT_CONSUMER_GROUP = "audit-writer"
 AUDIT_CONSUMER_NAME = "worker"
+ORDER_CONSUMER_GROUP = "order-writer"
+ORDER_CONSUMER_NAME = "worker"
+ORDER_DEAD_LETTER_KEY = "orders:stream:dead"
+RECLAIM_IDLE_MS = 60_000   # only reclaim entries a (crashed?) consumer has held this long
+MAX_DELIVERIES = 5         # give up (dead-letter) after this many delivery attempts
 
 
 async def expire_pending_orders(ctx: dict) -> None:
@@ -95,16 +104,20 @@ async def startup(ctx: dict) -> None:
     """Open Redis client for inventory operations."""
     settings = get_settings()
     ctx["redis_client"] = create_redis_client(settings.REDIS_URL)
-    try:
-        await ctx["redis_client"].xgroup_create(
-            AUDIT_STREAM_KEY,
-            AUDIT_CONSUMER_GROUP,
-            id="0",
-            mkstream=True,
-        )
-    except Exception as exc:
-        if "BUSYGROUP" not in str(exc):
-            raise
+    for stream_key, group in (
+        (AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP),
+        (ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP),
+    ):
+        try:
+            await ctx["redis_client"].xgroup_create(
+                stream_key,
+                group,
+                id="0",
+                mkstream=True,
+            )
+        except Exception as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
 
 async def shutdown(ctx: dict) -> None:
     """Close Redis client."""
@@ -152,6 +165,115 @@ async def consume_audit_events(ctx: dict) -> None:
     if entry_ids:
         await redis.xack(AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP, *entry_ids)
 
+async def _persist_intent(fields: dict) -> str:
+    """Insert one order intent. Returns 'ok' | 'duplicate' | 'failed'.
+
+    'duplicate' -> idempotency_key already persisted (safe to ack).
+    'failed'    -> a real integrity problem (e.g. bad FK) — caller must NOT ack,
+                   so reclaim can retry and eventually dead-letter it.
+    Transient errors (DB down, etc.) propagate as exceptions.
+    """
+    async with AsyncSessionLocal() as db:
+        try:
+            await create_order(
+                db,
+                user_id=int(fields["user_id"]),
+                event_id=int(fields["event_id"]),
+                quantity=int(fields["quantity"]),
+                total_price_cents=int(fields["total_price_cents"]),
+                idempotency_key=UUID(fields["idempotency_key"]),
+            )
+            await db.commit()
+            return "ok"
+        except IntegrityError:
+            await db.rollback()
+            existing = await get_order_by_idempotency_key(db, UUID(fields["idempotency_key"]))
+            return "duplicate" if existing is not None else "failed"
+
+
+async def consume_order_intents(ctx: dict) -> None:
+    """Read new order intents from the stream and persist each as a PENDING order.
+
+    One DB transaction per entry. At-least-once: commit before ack. A genuine
+    integrity failure (bad FK, etc.) is left un-acked so reclaim retries it.
+    """
+    redis = ctx["redis_client"]
+
+    result = await redis.xreadgroup(
+        groupname=ORDER_CONSUMER_GROUP,
+        consumername=ORDER_CONSUMER_NAME,
+        streams={ORDER_STREAM_KEY: ">"},
+        count=500,
+        block=None,
+    )
+    if not result:
+        return
+
+    for entry_id, fields in result[0][1]:
+        try:
+            outcome = await _persist_intent(fields)
+            if outcome in ("ok", "duplicate"):
+                await redis.xack(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, entry_id)
+            # 'failed' -> leave un-acked for reclaim_stale_order_intents
+        except Exception as exc:
+            print(f"Failed to persist order intent {entry_id}: {exc}")
+
+
+async def _dead_letter_intent(redis, entry_id: str, fields: dict) -> None:
+    """Give up on a poison intent: park it for humans, refund the seat, mark FAILED."""
+    await redis.xadd(ORDER_DEAD_LETTER_KEY, {**fields, "original_id": entry_id})
+    await release(redis, event_id=int(fields["event_id"]), quantity=int(fields["quantity"]))
+    await mark_claim_failed(redis, idempotency_key=fields["idempotency_key"])
+    print(f"DEAD-LETTER order intent {entry_id}: {dict(fields)}")
+
+
+async def reclaim_stale_order_intents(
+        ctx: dict,
+        *,
+        min_idle_ms: int = RECLAIM_IDLE_MS,
+        max_deliveries: int = MAX_DELIVERIES,
+) -> None:
+    """Recover intents stuck in the pending list (read but never acked — the
+    consumer likely crashed). Retry each; dead-letter the poison ones.
+    """
+    redis = ctx["redis_client"]
+
+    pending = await redis.xpending_range(
+        ORDER_STREAM_KEY,
+        ORDER_CONSUMER_GROUP,
+        min="-",
+        max="+",
+        count=500,
+        idle=min_idle_ms,
+    )
+    for p in pending:
+        entry_id = p["message_id"]
+        times_delivered = p["times_delivered"]
+
+        claimed = await redis.xclaim(
+            ORDER_STREAM_KEY,
+            ORDER_CONSUMER_GROUP,
+            ORDER_CONSUMER_NAME,
+            min_idle_time=min_idle_ms,
+            message_ids=[entry_id],
+        )
+        if not claimed:
+            continue   # another worker grabbed it first
+        _, fields = claimed[0]
+
+        if times_delivered >= max_deliveries:
+            await _dead_letter_intent(redis, entry_id, fields)
+            await redis.xack(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, entry_id)
+            continue
+
+        try:
+            outcome = await _persist_intent(fields)
+            if outcome in ("ok", "duplicate"):
+                await redis.xack(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, entry_id)
+            # 'failed' -> leave; a later reclaim retries until max_deliveries, then dead-letters
+        except Exception as exc:
+            print(f"Reclaim failed for order intent {entry_id}: {exc}")
+
 async def detect_inventory_drift(ctx: dict) -> list[dict]:
     """比對每個 published event 的 Redis 庫存 vs Postgres 應有值,不一致就記錄。"""
     redis = ctx["redis_client"]
@@ -181,6 +303,8 @@ class WorkerSettings:
         cron(expire_pending_orders, minute={i for i in range(60)}),
         cron(purge_expired_refresh_tokens, hour={3}, minute={0}),
         cron(consume_audit_events, minute={i for i in range(60)}),
+        cron(consume_order_intents, minute={i for i in range(60)}),
+        cron(reclaim_stale_order_intents, minute={i for i in range(60)}),
         cron(purge_old_audit_logs, hour={2}, minute={30}),
         cron(detect_inventory_drift, minute=set(range(0, 60, 5))),
 

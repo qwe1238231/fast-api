@@ -1,5 +1,7 @@
 from datetime import datetime
+from enum import StrEnum
 from typing import Annotated
+from uuid import UUID
 
 from pydantic import BaseModel, Field, ConfigDict
 from app.models.order import OrderStatus
@@ -10,6 +12,16 @@ class OrderCreate(BaseModel):
 
     event_id: int
     quantity: Annotated[int, Field(ge=1, le=10)]
+
+
+class OrderAcceptedResponse(BaseModel):
+    """202 response: the order intent was accepted and is being processed.
+
+    The client holds `idempotency_key` as the handle to poll order status.
+    """
+
+    idempotency_key: UUID
+    status: str = "processing"
 
 class OrderResponse(BaseModel):
     """Order representation sent back to client."""
@@ -27,3 +39,16 @@ class OrderResponse(BaseModel):
     confirmed_at: datetime | None
     expired_at: datetime | None
     cancelled_at: datetime | None
+
+
+class OrderPollState(StrEnum):
+    PROCESSING = "processing"   # accepted, order row not written yet
+    READY = "ready"             # order persisted; see `order`
+    FAILED = "failed"           # gave up after retries; seat refunded
+
+
+class OrderStatusResponse(BaseModel):
+    """Poll response for GET /orders/by-key/{idempotency_key}."""
+
+    state: OrderPollState
+    order: OrderResponse | None = None      # set only when state == READY

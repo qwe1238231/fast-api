@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     ORDER_MAX_DELIVERIES: int = 5              # dead-letter after this many delivery attempts
     ORDER_BACKLOG_WARN: int = 1000             # log a warning when backlog exceeds this
 
+    # DB connection pool (per-process). The total across ALL processes
+    # (API workers + ARQ worker + order consumer) must fit Postgres max_connections:
+    #   total ≈ num_processes * (DB_POOL_SIZE + DB_MAX_OVERFLOW)
+    DB_POOL_SIZE: int = 5                       # persistent connections held open
+    DB_MAX_OVERFLOW: int = 10                   # extra temporary connections at peak
+    DB_POOL_PRE_PING: bool = True               # validate a connection before use (dead-conn defense)
+    DB_POOL_RECYCLE: int = 1800                 # recycle connections older than this many seconds
+
     model_config = SettingsConfigDict(env_file=".env",extra="ignore")
 
     @field_validator("PII_KEK_BASE64", "PII_LOOKUP_KEY_BASE64")

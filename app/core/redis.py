@@ -14,4 +14,6 @@ def create_redis_client(url: str) -> Redis:
         url,
         encoding="utf-8",
         decode_responses=True,
+        health_check_interval=30,   # PING a connection idle >=30s before reuse (dead-conn defense)
+        socket_keepalive=True,      # OS-level TCP keepalive so LB/NAT don't reap idle connections
     )

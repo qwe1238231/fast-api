@@ -19,25 +19,32 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
 #[pyfunction]
-fn hash_password(password: &str) -> PyResult<String> {
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-
-    let hash = argon2
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| PyValueError::new_err(format!("argon2 hash failed: {}", e)))?;
-    
-    Ok(hash.to_string())
+fn hash_password(py: Python<'_>, password: &str) -> PyResult<String> {
+    // Copy out of Python-owned memory so the closure is Ungil, then drop the GIL
+    // for the CPU-bound argon2 work. The PyErr is built after the GIL is reacquired.
+    let password = password.to_owned();
+    let result: Result<String, String> = py.detach(move || {
+        let salt = SaltString::generate(&mut OsRng);
+        Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map(|h| h.to_string())
+            .map_err(|e| format!("argon2 hash failed: {}", e))
+    });
+    result.map_err(PyValueError::new_err)
 }
 
 #[pyfunction]
-fn verify_password(password: &str, hash: &str) -> PyResult<bool> {
-  let parsed = PasswordHash::new(hash)
-    .map_err(|e| PyValueError::new_err(format!("invalid hash format: {}", e)))?;
-
-    Ok(Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .is_ok())
+fn verify_password(py: Python<'_>, password: &str, hash: &str) -> PyResult<bool> {
+    let password = password.to_owned();
+    let hash = hash.to_owned();
+    let result: Result<bool, String> = py.detach(move || {
+        let parsed = PasswordHash::new(&hash)
+            .map_err(|e| format!("invalid hash format: {}", e))?;
+        Ok(Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok())
+    });
+    result.map_err(PyValueError::new_err)
 }
 
 

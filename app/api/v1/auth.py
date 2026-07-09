@@ -2,6 +2,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status ,Request, Response
 from fastapi.security import OAuth2PasswordRequestForm
+from starlette.concurrency import run_in_threadpool
 
 from app.api.deps import DbSession, limiter, CurrentUser, Redis
 from app.core.config import get_settings
@@ -84,11 +85,13 @@ async def login_for_access_token(
 ) -> Token:
     user = await get_user_by_username(db, username=form_data.username)
     if user is None:
-        constant_time_dummy_verify(form_data.password)
+        # argon2 is CPU-bound; offload to a thread so it doesn't block the event
+        # loop (the Rust binding releases the GIL, so this runs off-core).
+        await run_in_threadpool(constant_time_dummy_verify, form_data.password)
         password_valid = False
     else:
-        password_valid = verify_password(
-            form_data.password, user.hashed_password
+        password_valid = await run_in_threadpool(
+            verify_password, form_data.password, user.hashed_password
         )
     if user is None or not password_valid or not user.is_active:
         await emit_event(

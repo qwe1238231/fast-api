@@ -6,7 +6,7 @@ from app.crud.event import create_event, get_event, list_published_events
 from app.models.event import Event
 from app.schemas.event import EventCreate, EventResponse
 from app.services.publish_event import publish_event
-from app.services.inventory import reconcile_inventory
+
 
 router = APIRouter(prefix="/events", tags=["events"])
 
@@ -46,13 +46,3 @@ async def get_event_endpoint(event_id: int, db: DbSession) -> Event:
     if event is None:
         raise EventNotFound(event_id=event_id)
     return event
-
-@router.post("/{event_id}/reconcile-inventory")
-async def reconcile_inventory_endpoint(
-    event_id: int,
-    db: DbSession,
-    redis: Redis,
-    current_admin: CurrentAdmin,
-) -> dict:
-    available = await reconcile_inventory(db, redis, event_id=event_id)
-    return{"event_id": event_id, "available": available}

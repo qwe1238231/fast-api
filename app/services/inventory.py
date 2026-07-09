@@ -11,7 +11,7 @@ from redis.asyncio import Redis
 from enum import StrEnum
 from dataclasses import dataclass
 
-from app.core.exceptions import InsufficientInventory ,EventNotFound
+from app.core.exceptions import InsufficientInventory ,EventNotFound,InventoryNotReconcilable
 from app.models.event import Event
 from app.models.order import Order, OrderStatus 
 from app.services.idempotency import _key as _claim_key
@@ -19,9 +19,19 @@ from app.services.idempotency import _key as _claim_key
 ORDER_STREAM_KEY="orders:stream"
 ORDER_DEAD_LETTER_KEY="orders:stream:dead"
 
+
+
 def _key(event_id: int) -> str:
     """Key for an event's available seat counter."""
     return f"event:{event_id}:available"
+
+async def queue_depth(redis: Redis) -> tuple[int, int]:
+    """回傳 (backlog, dead_letter):尚未落帳的 order intents、與永久失敗的。
+    兩者皆為 0 代表 DB 已追上 Redis,是『DB 此刻可信』的訊號。
+    """
+    backlog = await redis.xlen(ORDER_STREAM_KEY)
+    dead = await redis.xlen(ORDER_DEAD_LETTER_KEY)
+    return backlog, dead
 
 async def set_initial_stock(
         redis: Redis,
@@ -112,8 +122,13 @@ async def reconcile_inventory(
         redis: Redis,
         *,
         event_id: int,
+        force: bool = False,
 ) -> int:
     """從 Postgres 重算真實剩餘,覆蓋寫回 Redis。Redis 遺失後的權威重建。"""
+    if not force:                                    # ← 守衛搬進來
+        backlog, dead = await queue_depth(redis)
+        if backlog or dead:
+            raise InventoryNotReconcilable(event_id, backlog, dead)
     total_seats = await db.scalar(
         select(Event.total_seats).where(Event.id == event_id)
     )

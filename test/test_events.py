@@ -5,7 +5,8 @@ import pytest
 from app.core.security import get_password_hash
 from app.models.user import User
 from app.services.inventory import get_available
-
+from app.services.inventory import reconcile_inventory
+from app.core.exceptions import InventoryNotReconcilable
 
 async def _make_admin_and_login(client, db, username="admin"):
     db.add(User(username=username, hashed_password=get_password_hash("secret123"), is_admin=True))
@@ -84,11 +85,43 @@ async def test_reconcile_rebuilds_inventory_after_redis_loss(client, db, redis, 
     assert await get_available(redis, event_id=event_id) == 0
 
     # reconcile 從 Postgres 重建:100 - 30 = 70
-    rr = await client.post(f"/v1/events/{event_id}/reconcile-inventory", headers=headers)
-    assert rr.status_code == 200
-    assert rr.json()["available"] == 70
+    available = await reconcile_inventory(db, redis, event_id=event_id)
+    assert available == 70
     assert await get_available(redis, event_id=event_id) == 70
 
+@pytest.mark.asyncio
+async def test_reconcile_refuses_when_stream_not_drained(client, db, redis):
+    headers = await _make_admin_and_login(client, db)
+    event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
+    await client.post(f"/v1/events/{event_id}/publish", headers=headers)
+
+    # 下一單 → 進 stream,但故意「不 drain」→ backlog > 0
+    await client.post(
+        "/v1/orders/",
+        json={"event_id": event_id, "quantity": 1},
+        headers={**headers, "Idempotency-Key": str(uuid4())},
+    )
+
+    # 沒排空 + force=False(預設)→ 守衛應 raise
+    with pytest.raises(InventoryNotReconcilable):
+        await reconcile_inventory(db, redis, event_id=event_id)
+
+@pytest.mark.asyncio
+async def test_reconcile_force_bypasses_guard(client, db, redis):
+    headers = await _make_admin_and_login(client, db)
+    event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
+    await client.post(f"/v1/events/{event_id}/publish", headers=headers)
+
+    # 下一單 → stream 有 backlog,一樣不 drain
+    await client.post(
+        "/v1/orders/",
+        json={"event_id": event_id, "quantity": 1},
+        headers={**headers, "Idempotency-Key": str(uuid4())},
+    )
+
+    # force=True → 即使沒排空也不 raise,正常回傳
+    available = await reconcile_inventory(db, redis, event_id=event_id, force=True)
+    assert isinstance(available, int)
 
 @pytest.mark.asyncio
 async def test_detect_inventory_drift(client, db, redis):
@@ -105,6 +138,27 @@ async def test_detect_inventory_drift(client, db, redis):
     await redis.set(f"event:{event_id}:available", 42)
     drifts = await detect_inventory_drift({"redis_client": redis})
     assert drifts == [{"event_id": event_id, "expected": 100, "actual": 42}]
+
+@pytest.mark.asyncio
+async def test_drift_check_skipped_when_queue_not_drained(client, db, redis):
+    from app.worker import detect_inventory_drift
+
+    headers = await _make_admin_and_login(client, db)
+    event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
+    await client.post(f"/v1/events/{event_id}/publish", headers=headers)
+
+    # 下一單 → stream 有 backlog,故意不 drain
+    await client.post(
+        "/v1/orders/",
+        json={"event_id": event_id, "quantity": 1},
+        headers={**headers, "Idempotency-Key": str(uuid4())},
+    )
+
+    # 把 Redis 設成明顯錯的值 → 沒閘門的話這一定會被報成 drift
+    await redis.set(f"event:{event_id}:available", 42)
+
+    # 但因為 backlog > 0,drift 檢查應直接跳過、回 []
+    assert await detect_inventory_drift({"redis_client": redis}) == []
 
 
 @pytest.mark.asyncio

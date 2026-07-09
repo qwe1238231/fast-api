@@ -53,6 +53,17 @@ class DuplicateOrderRequest(OrderError):
 class InventoryError(DomainError):
     """Base for inventory-related errors."""
 
+class InventoryNotReconcilable(InventoryError):
+    def __init__(self, event_id: int, backlog: int, dead_letter: int):
+        self.event_id = event_id
+        self.backlog = backlog
+        self.dead_letter = dead_letter
+        super().__init__(
+            f"Cannot reconcile event {event_id}: order stream not drained "
+            f"(backlog={backlog}, dead_letter={dead_letter}). "
+            f"Drain the queue first, or use --force to override."
+        )
+
 class InsufficientInventory(InventoryError):
     def __init__(self, event_id: int, requested: int, available: int):
         self.event_id = event_id

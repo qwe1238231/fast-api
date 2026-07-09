@@ -24,7 +24,7 @@ from app.services.audit import AUDIT_STREAM_KEY
 from app.models.event import Event, EventStatus
 from app.services.inventory import (
     compute_expected_available, get_available, release,
-    ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY,
+    ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY,queue_depth,
 )
 from app.services.idempotency import mark_claim_failed
 
@@ -333,6 +333,10 @@ async def report_queue_depth(ctx: dict) -> dict:
 async def detect_inventory_drift(ctx: dict) -> list[dict]:
     """比對每個 published event 的 Redis 庫存 vs Postgres 應有值,不一致就記錄。"""
     redis = ctx["redis_client"]
+    backlog, dead = await queue_depth(redis)                    # ← 新增:先問排空了嗎
+    if backlog or dead:
+        print(f"drift check skipped: queue not drained (backlog={backlog}, dead_letter={dead})")
+        return []      
     drifts: list[dict] = []
     async with AsyncSessionLocal() as db:
         result = await db.execute(

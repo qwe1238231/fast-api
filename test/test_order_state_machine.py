@@ -51,6 +51,13 @@ async def test_cannot_pay_a_cancelled_order(db):
         await mark_paid(db, order)
 
 @pytest.mark.asyncio
+async def test_cannot_cancel_a_paid_order(db, redis):
+    order = make_order(OrderStatus.PAID)
+    with pytest.raises(InvalidOrderTransition):
+        await cancel_order(db, redis, order)     # PAID → CANCELLED 非法(付款後不能取消)
+
+
+@pytest.mark.asyncio
 async def test_cancel_releases_inventory(db, redis):
     await set_initial_stock(redis, event_id=1, total_seats=10)
 

@@ -4,7 +4,18 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exceptions import InvalidOrderTransition
 from app.models.order import Order, OrderStatus
+
+
+# 訂單狀態機:每個狀態能合法轉移到哪些狀態。空集合 = 終態。
+_VALID_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
+    OrderStatus.PENDING:   {OrderStatus.PAID, OrderStatus.EXPIRED, OrderStatus.CANCELLED},
+    OrderStatus.PAID:      {OrderStatus.CONFIRMED},   # 付款後只能確認,不能取消/逾時
+    OrderStatus.CONFIRMED: set(),                     # 終態,不能退
+    OrderStatus.EXPIRED:   set(),                     # 終態
+    OrderStatus.CANCELLED: set(),                     # 終態
+}
 
 
 async def create_order(
@@ -69,7 +80,13 @@ async def transition_order_status(
         order: Order,
         new_status: OrderStatus,
 ) -> None:
-    """Set status and matching timestamp. No transition validation."""
+    """Set status and matching timestamp. Rejects illegal state transitions."""
+    if new_status not in _VALID_TRANSITIONS[order.status]:
+        raise InvalidOrderTransition(
+            order_id=order.id,
+            from_status=order.status.value,
+            to_status=new_status.value,
+        )
     now = datetime.now(timezone.utc)
     order.status = new_status
     if new_status == OrderStatus.PAID:

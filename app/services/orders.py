@@ -1,7 +1,8 @@
-"""Order service — state transition validation + side effects.
+"""Order service — state transition side effects.
 
-CRUD layer (app/crud/order.py) does raw DB ops. This layer enforces business
-rules: which transitions are allowed, and what side effects each entails
+CRUD layer (app/crud/order.py) does the raw DB op AND enforces which
+transitions are legal (the state machine lives there, next to the mutation).
+This layer orchestrates the side effects each transition entails
 (e.g. releasing Redis inventory on cancel/expire).
 """
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 
 from app.core.exceptions import (
-    InvalidOrderTransition, EventCancelled, EventNotOnSale, EventNotFound, InsufficientInventory,
+    EventCancelled, EventNotOnSale, EventNotFound, InsufficientInventory,
 )
 from app.crud.order import transition_order_status
 from app.models.order import Order, OrderStatus
@@ -18,40 +19,13 @@ from app.services.inventory import release, reserve_and_enqueue, ReserveOutcome,
 from app.models.event import EventStatus
 from app.services.event_cache import get_event_meta
 
-_ALLOWED_TRANSITIONS : dict[OrderStatus, set[OrderStatus]] = {
-    OrderStatus.PENDING:{
-        OrderStatus.PAID,
-        OrderStatus.CANCELLED,
-        OrderStatus.EXPIRED,
-    },
-    OrderStatus.PAID: {
-        OrderStatus.CANCELLED,
-        OrderStatus.CONFIRMED,
-    },
-    OrderStatus.CONFIRMED: set(),
-    OrderStatus.CANCELLED: set(),
-    OrderStatus.EXPIRED: set(),
-}
-
-
-def _validate_transition(order: Order, new_status: OrderStatus) -> None:
-    if new_status not in _ALLOWED_TRANSITIONS[order.status]:
-        raise InvalidOrderTransition(
-            order_id=order.id,
-            from_status=order.status.value,
-            to_status=new_status.value,
-        )
-
-
 async def mark_paid(db: AsyncSession, order: Order) -> None:
-    """Transition PENDING ->PAID."""
-    _validate_transition(order, OrderStatus.PAID)
+    """Transition PENDING -> PAID."""
     await transition_order_status(db, order, OrderStatus.PAID)
 
 
 async def mark_confirmed(db: AsyncSession, order: Order) -> None:
     """Transition PAID -> CONFIRMED."""
-    _validate_transition(order, OrderStatus.CONFIRMED)
     await transition_order_status(db, order, OrderStatus.CONFIRMED)
 
 
@@ -61,7 +35,6 @@ async def cancel_order(
         order: Order
 ) -> None:
     """Cancel an order, Releases reserved inventory."""
-    _validate_transition(order, OrderStatus.CANCELLED)
     await transition_order_status(db, order, OrderStatus.CANCELLED)
     await release(redis, event_id=order.event_id, quantity=order.quantity)
 
@@ -72,7 +45,6 @@ async def expire_order(
         order: Order,
 ) -> None:
     """Mark order as expired due to payment timeout. Releases inventory."""
-    _validate_transition(order, OrderStatus.EXPIRED)
     await transition_order_status(db, order, OrderStatus.EXPIRED)
     await release(redis, event_id=order.event_id, quantity=order.quantity
 )

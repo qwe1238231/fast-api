@@ -7,6 +7,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.core.config import get_settings
 from app.core.redis import create_redis_client
+from app.services.stripe_client import create_stripe_client
 from app.api.deps import limiter
 from app.api.v1.router import api_router
 from app.api.exception_handlers import register_exception_handlers
@@ -20,7 +21,9 @@ from app.core.queue_metrics import QueueDepthCollector
 async def lifespan(app: FastAPI):
     settings = get_settings()
     app.state.redis = create_redis_client(settings.REDIS_URL)
+    app.state.stripe, app.state.stripe_http = create_stripe_client(settings.STRIPE_SECRET_KEY)
     yield
+    await app.state.stripe_http.close_async()
     await app.state.redis.aclose()
 
 

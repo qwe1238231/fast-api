@@ -1,32 +1,40 @@
 """Stripe API wrapper service.
 
-Centralizes Stripe SDK calls so route layer stays Stripe-agnostic.
+Centralizes Stripe SDK calls so the route layer stays Stripe-agnostic.
+Uses Stripe's async client (httpx backend) so PaymentIntent creation never
+blocks the event loop — the loop natively multiplexes the in-flight HTTPS call.
+The client is created once in app lifespan and injected via Depends.
 """
-import stripe
+from stripe import StripeClient, HTTPXClient
 
-from app.core.config import get_settings
 
-def _ensure_initialized() -> None:
-    """Set Stripe API key from settings. Safe to call multiple times."""
-    stripe.api_key = get_settings().STRIPE_SECRET_KEY
+def create_stripe_client(api_key: str) -> tuple[StripeClient, HTTPXClient]:
+    """Build an async Stripe client + its HTTP client.
 
-def create_payment_intent(
+    Returns both: the StripeClient for requests, and the HTTPXClient so lifespan
+    can `await http.close_async()` on shutdown (StripeClient exposes no close).
+    """
+    http = HTTPXClient()                          # async backend; one pooled connection set
+    return StripeClient(api_key, http_client=http), http
+
+
+async def create_payment_intent(
+        client: StripeClient,
         *,
         amount: int,
         currency: str,
         order_id: int,
 ) -> dict[str, str]:
     """Create a Stripe PaymentIntent for an order.
-    
-    Returns dict with `id` and `client_secret`.
+
+    Returns dict with `id` and `client_secret`. Non-blocking (async HTTP).
     """
-    _ensure_initialized()
-
-    intent = stripe.PaymentIntent.create(
-        amount=amount,
-        currency=currency,
-        metadata={"order_id": str(order_id)},
-        idempotency_key=f"order-{order_id}",
+    intent = await client.v1.payment_intents.create_async(
+        {
+            "amount": amount,
+            "currency": currency,
+            "metadata": {"order_id": str(order_id)},
+        },
+        {"idempotency_key": f"order-{order_id}"},   # idempotency_key lives in options
     )
-
     return {"id": intent.id, "client_secret": intent.client_secret}

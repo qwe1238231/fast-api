@@ -3,7 +3,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Header, status, HTTPException
 
-from app.api.deps import CurrentUser, DbSession, Redis
+from app.api.deps import CurrentUser, DbSession, Redis, Stripe
 from app.models.order import Order, OrderStatus
 from app.schemas.order import OrderCreate, OrderResponse, OrderAcceptedResponse, OrderStatusResponse, OrderPollState
 from app.services.orders import submit_order, cancel_order as cancel_order_service, mark_confirmed, mark_paid
@@ -127,6 +127,7 @@ async def create_order_payment_intent(
         order_id: int,
         current_user: CurrentUser,
         db: DbSession,
+        stripe: Stripe,
 ) -> PaymentIntentResponse:
     """Create a Stripe PaymentIntent for the given order.
     
@@ -143,7 +144,8 @@ async def create_order_payment_intent(
             to_status="paying",
         )
     
-    intent = create_payment_intent(
+    intent = await create_payment_intent(
+        stripe,
         amount=order.total_price_cents,
         currency="usd",
         order_id=order.id,

@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -7,6 +8,7 @@ from app.models.user import User
 from app.services.inventory import get_available
 from app.services.inventory import reconcile_inventory
 from app.core.exceptions import InventoryNotReconcilable
+from app.services import waiting_room as wr
 
 async def _make_admin_and_login(client, db, username="admin"):
     db.add(User(username=username, hashed_password=get_password_hash("secret123"), is_admin=True))
@@ -184,3 +186,57 @@ async def test_publish_invalidates_event_cache(client, db, redis):
 
     await client.post(f"/v1/events/{event_id}/publish", headers=headers)
     assert await redis.get(f"event:{event_id}:meta") is None  # 發佈清掉了快取
+
+
+def _payload_sale_in(seconds: int) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "name": "Concert", "venue": "Arena",
+        "starts_at": (now + timedelta(days=30)).isoformat(),
+        "ends_at": (now + timedelta(days=30, hours=3)).isoformat(),
+        "sale_starts_at": (now + timedelta(seconds=seconds)).isoformat(),
+        "sale_ends_at": (now + timedelta(days=1)).isoformat(),
+        "total_seats": 100, "price_cents": 1000,
+    }
+
+
+async def _publish_event(client, db, payload) -> tuple[int, dict]:
+    headers = await _make_admin_and_login(client, db)
+    event_id = (await client.post("/v1/events/", json=payload, headers=headers)).json()["id"]
+    await client.post(f"/v1/events/{event_id}/publish", headers=headers)
+    return event_id, headers
+
+
+@pytest.mark.asyncio
+async def test_queue_register_and_position(client, db):
+    # sale in 5 min → fallback window is OPEN now (opens sale-10m past, closes sale-30s future)
+    event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
+
+    r = await client.post(f"/v1/events/{event_id}/queue", headers=headers)
+    assert r.status_code == 200
+    assert r.json()["admitted"] is False
+    assert r.json()["people_ahead"] == 0        # first registrant, admission not started
+
+    s = await client.get(f"/v1/events/{event_id}/queue/status", headers=headers)
+    assert s.json()["admitted"] is False
+
+
+@pytest.mark.asyncio
+async def test_queue_admits_after_window_closes(client, db, redis):
+    event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
+    await client.post(f"/v1/events/{event_id}/queue", headers=headers)   # rank 0
+
+    # simulate the window having closed 10s ago → RATE*10 admitted, rank 0 is in
+    past = (datetime.now(timezone.utc) - timedelta(seconds=10)).timestamp()
+    await redis.set(wr._admit_start_key(event_id), past)
+
+    s = await client.get(f"/v1/events/{event_id}/queue/status", headers=headers)
+    assert s.json()["admitted"] is True
+
+
+@pytest.mark.asyncio
+async def test_queue_registration_closed(client, db):
+    # sale already started → fallback close (sale-30s) is in the past → registration closed
+    event_id, headers = await _publish_event(client, db, _payload_sale_in(0))
+    r = await client.post(f"/v1/events/{event_id}/queue", headers=headers)
+    assert r.status_code == 409

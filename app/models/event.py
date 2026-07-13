@@ -21,6 +21,10 @@ class Event(Base):
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     sale_starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     sale_ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Waiting-room window. Nullable → the service layer falls back to
+    # sale_starts_at minus configured lead/buffer defaults (behaviour "A").
+    queue_opens_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    queue_closes_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     total_seats: Mapped[int] = mapped_column(nullable=False)
     price_cents: Mapped[int] = mapped_column(nullable=False)
     status: Mapped[EventStatus] = mapped_column(

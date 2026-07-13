@@ -33,3 +33,11 @@ class EventResponse(BaseModel):
     status: EventStatus
     created_at: datetime
     updated_at: datetime
+
+
+class QueueStatusResponse(BaseModel):
+    """Waiting-room state for the current user."""
+
+    admitted: bool
+    people_ahead: int | None = None        # not-yet-admitted users ahead (0 = next); None if admitted/unregistered
+    poll_after_seconds: int | None = None  # suggested backoff before polling again; None once admitted

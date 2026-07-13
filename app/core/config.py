@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     DB_POOL_PRE_PING: bool = True               # validate a connection before use (dead-conn defense)
     DB_POOL_RECYCLE: int = 1800                 # recycle connections older than this many seconds
 
+    # Virtual waiting room (admission control). queue_opens/closes_at on an event
+    # override these; otherwise they fall back to sale_starts_at minus the leads below.
+    QUEUE_LEAD_TIME_SECONDS: int = 600          # registration opens this long before sale_starts_at
+    QUEUE_ADMISSION_BUFFER_SECONDS: int = 30    # registration closes / admission begins this long before sale
+    QUEUE_ADMISSION_RATE: int = 500             # users admitted per second (the gatekeeper throttle)
+
     model_config = SettingsConfigDict(env_file=".env",extra="ignore")
 
     @field_validator("PII_KEK_BASE64", "PII_LOOKUP_KEY_BASE64")

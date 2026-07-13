@@ -39,6 +39,8 @@ class QueueStatusResponse(BaseModel):
     """Waiting-room state for the current user."""
 
     admitted: bool
+    sold_out: bool = False                 # inventory exhausted — stop waiting, nothing to buy
+    paused: bool = False                   # admission frozen by the circuit breaker (downstream unhealthy)
     people_ahead: int | None = None        # not-yet-admitted users ahead (0 = next); None if admitted/unregistered
-    poll_after_seconds: int | None = None  # suggested backoff before polling again; None once admitted
+    poll_after_seconds: int | None = None  # suggested backoff before polling again; None once admitted/sold out
     access_token: str | None = None        # single-use admission pass for POST /orders/; set only when admitted

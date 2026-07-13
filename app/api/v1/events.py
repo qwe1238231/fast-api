@@ -11,7 +11,7 @@ from app.crud.event import create_event, get_event, list_published_events
 from app.models.event import Event
 from app.schemas.event import EventCreate, EventResponse, QueueStatusResponse
 from app.services.publish_event import publish_event
-from app.services.waiting_room import window, register as queue_register, status as queue_status
+from app.services.waiting_room import window, register as queue_register, status as queue_status, QueueState
 from app.services.rate_limit import enforce_rate_limit
 
 
@@ -59,18 +59,21 @@ async def get_event_endpoint(event_id: int, db: DbSession) -> Event:
     return event
 
 
-def _queue_response(admitted: bool, ahead: int | None, *, user_id: int, event_id: int) -> QueueStatusResponse:
+def _queue_response(state: QueueState, *, user_id: int, event_id: int) -> QueueStatusResponse:
     token = None
-    if admitted:
+    if state.admitted:
         token = create_admission_token(
             user_id=user_id,
             event_id=event_id,
             ttl_seconds=get_settings().QUEUE_ADMISSION_TOKEN_TTL_SECONDS,
         )
+    done = state.admitted or state.sold_out    # stop polling once admitted or nothing left to buy
     return QueueStatusResponse(
-        admitted=admitted,
-        people_ahead=ahead,
-        poll_after_seconds=None if admitted else 5,
+        admitted=state.admitted,
+        sold_out=state.sold_out,
+        paused=state.paused,
+        people_ahead=state.people_ahead,
+        poll_after_seconds=None if done else 5,
         access_token=token,
     )
 
@@ -99,8 +102,8 @@ async def join_queue(
     if now >= closes:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="queue registration closed")
     await queue_register(redis, event=event, user_id=current_user.id)
-    admitted, ahead = await queue_status(redis, event_id=event_id, user_id=current_user.id)
-    return _queue_response(admitted, ahead, user_id=current_user.id, event_id=event_id)
+    state = await queue_status(redis, event_id=event_id, user_id=current_user.id)
+    return _queue_response(state, user_id=current_user.id, event_id=event_id)
 
 
 @router.get("/{event_id}/queue/status", response_model=QueueStatusResponse)
@@ -110,5 +113,5 @@ async def queue_status_endpoint(
         redis: Redis,
 ) -> QueueStatusResponse:
     """Poll your waiting-room position / admission. Redis-only (no DB on the hot poll path)."""
-    admitted, ahead = await queue_status(redis, event_id=event_id, user_id=current_user.id)
-    return _queue_response(admitted, ahead, user_id=current_user.id, event_id=event_id)
+    state = await queue_status(redis, event_id=event_id, user_id=current_user.id)
+    return _queue_response(state, user_id=current_user.id, event_id=event_id)

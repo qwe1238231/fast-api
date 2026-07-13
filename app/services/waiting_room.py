@@ -13,6 +13,7 @@ status(): the user is admitted once their rank in the draw falls below the
 """
 import hashlib
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import jwt
@@ -22,6 +23,7 @@ from redis.asyncio import Redis
 from app.core.config import get_settings
 from app.core.exceptions import AdmissionDenied
 from app.models.event import Event
+from app.services.inventory import get_available
 
 
 def _draw_key(event_id: int) -> str:
@@ -34,6 +36,27 @@ def _admit_start_key(event_id: int) -> str:
 
 def _salt_key(event_id: int) -> str:
     return f"queue:{event_id}:salt"
+
+
+def _paused_key() -> str:
+    return "admission:paused"   # global circuit breaker — set by the health monitor
+
+
+@dataclass(frozen=True)
+class QueueState:
+    admitted: bool
+    people_ahead: int | None = None
+    sold_out: bool = False
+    paused: bool = False
+
+
+async def set_admission_paused(redis: Redis, paused: bool, *, ttl_seconds: int = 120) -> None:
+    """Circuit breaker toggle. Set with a TTL so admission auto-resumes if the
+    monitor stops running (fail-open); cleared promptly when healthy again."""
+    if paused:
+        await redis.set(_paused_key(), "1", ex=ttl_seconds)
+    else:
+        await redis.delete(_paused_key())
 
 
 def window(event: Event) -> tuple[datetime, datetime]:
@@ -84,19 +107,28 @@ async def _admitted_count(redis: Redis, event_id: int) -> int:
     return min(int(elapsed * get_settings().QUEUE_ADMISSION_RATE), total)
 
 
-async def status(redis: Redis, *, event_id: int, user_id: int) -> tuple[bool, int | None]:
-    """Return (admitted, people_ahead).
+async def status(redis: Redis, *, event_id: int, user_id: int) -> QueueState:
+    """Current waiting-room state for a user.
 
-    people_ahead is None if not registered, else the number of not-yet-admitted
-    users ahead in the draw (0 == you're next). None too once admitted.
+    Two resilience short-circuits stop admission (waiters keep their place):
+      - sold_out: inventory hit 0 — nothing to buy, so don't feed people into a
+        dead sale (real-time; recovers if released seats bring stock back).
+      - paused: the circuit breaker is open (downstream unhealthy).
     """
+    sold_out = await get_available(redis, event_id=event_id) <= 0
+    paused = bool(await redis.exists(_paused_key()))
     rank = await redis.zrank(_draw_key(event_id), str(user_id))
     if rank is None:
-        return False, None
-    admitted = await _admitted_count(redis, event_id)
-    if rank < admitted:
-        return True, None
-    return False, rank - admitted
+        return QueueState(admitted=False, sold_out=sold_out, paused=paused)
+    if sold_out:
+        return QueueState(admitted=False, sold_out=True, paused=paused)
+
+    admitted_count = await _admitted_count(redis, event_id)
+    if paused:                                    # admission frozen — hold position
+        return QueueState(admitted=False, people_ahead=max(0, rank - admitted_count), paused=True)
+    if rank < admitted_count:
+        return QueueState(admitted=True)
+    return QueueState(admitted=False, people_ahead=rank - admitted_count)
 
 
 async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: int) -> None:

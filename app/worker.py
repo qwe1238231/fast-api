@@ -27,6 +27,7 @@ from app.services.inventory import (
     ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY,queue_depth,
 )
 from app.services.idempotency import mark_claim_failed
+from app.services.waiting_room import set_admission_paused
 
 _settings = get_settings()
 
@@ -327,6 +328,17 @@ async def report_queue_depth(ctx: dict) -> dict:
         print(f"ALERT order dead-letter depth={stats['dead_letter']} — orders failing permanently")
     if stats["backlog"] > BACKLOG_WARN:
         print(f"WARN order backlog={stats['backlog']} — consumers may be falling behind")
+
+    # Circuit breaker: pause the waiting room's admission when the order pipeline is
+    # unhealthy, so we stop feeding new buyers into a system that can't keep up.
+    settings = get_settings()
+    unhealthy = (
+        stats["dead_letter"] > settings.ADMISSION_PAUSE_DEAD_LETTER_THRESHOLD
+        or stats["backlog"] > settings.ADMISSION_PAUSE_BACKLOG_THRESHOLD
+    )
+    await set_admission_paused(ctx["redis_client"], unhealthy)
+    if unhealthy:
+        print(f"CIRCUIT-BREAKER admission paused (backlog={stats['backlog']}, dead_letter={stats['dead_letter']})")
     return stats
 
 

@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     QUEUE_ADMISSION_RATE: int = 500             # users admitted per second (the gatekeeper throttle)
     QUEUE_ADMISSION_TOKEN_TTL_SECONDS: int = 120  # admitted buyers must complete within this window
     QUEUE_JOIN_LIMIT_PER_MINUTE: int = 30         # anti-hammer cap on queue-join per user per event
+    # Circuit breaker: pause admission when the downstream order pipeline is unhealthy.
+    ADMISSION_PAUSE_DEAD_LETTER_THRESHOLD: int = 100   # dead-lettered orders above this → pause
+    ADMISSION_PAUSE_BACKLOG_THRESHOLD: int = 10000     # unpersisted backlog above this → pause
 
     model_config = SettingsConfigDict(env_file=".env",extra="ignore")
 

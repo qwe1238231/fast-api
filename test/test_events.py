@@ -255,6 +255,37 @@ async def test_queue_registration_closed(client, db):
 
 
 @pytest.mark.asyncio
+async def test_queue_sold_out_stops_admission(client, db, redis):
+    event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
+    await client.post(f"/v1/events/{event_id}/queue", headers=headers)   # register (rank 0)
+
+    # window closed long ago (would normally admit) BUT inventory exhausted
+    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).timestamp()
+    await redis.set(wr._admit_start_key(event_id), past)
+    await redis.set(f"event:{event_id}:available", 0)
+
+    s = (await client.get(f"/v1/events/{event_id}/queue/status", headers=headers)).json()
+    assert s["sold_out"] is True
+    assert s["admitted"] is False          # sold-out short-circuits admission
+    assert s["access_token"] is None       # no pass handed out into a dead sale
+
+
+@pytest.mark.asyncio
+async def test_queue_admission_paused_by_circuit_breaker(client, db, redis):
+    event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
+    await client.post(f"/v1/events/{event_id}/queue", headers=headers)   # register (rank 0)
+
+    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).timestamp()
+    await redis.set(wr._admit_start_key(event_id), past)                 # would admit...
+    await wr.set_admission_paused(redis, True)                           # ...but breaker is open
+
+    s = (await client.get(f"/v1/events/{event_id}/queue/status", headers=headers)).json()
+    assert s["paused"] is True
+    assert s["admitted"] is False         # admission frozen; position held
+    assert s["access_token"] is None
+
+
+@pytest.mark.asyncio
 async def test_queue_join_rate_limited(client, db, monkeypatch):
     from app.core.config import get_settings
     monkeypatch.setattr(get_settings(), "QUEUE_JOIN_LIMIT_PER_MINUTE", 2)

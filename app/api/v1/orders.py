@@ -1,11 +1,13 @@
+import base64
+from datetime import datetime
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Header, status, HTTPException
+from fastapi import APIRouter, Header, status, HTTPException, Query
 
 from app.api.deps import CurrentUser, DbSession, Redis, Stripe
 from app.models.order import Order, OrderStatus
-from app.schemas.order import OrderCreate, OrderResponse, OrderAcceptedResponse, OrderStatusResponse, OrderPollState
+from app.schemas.order import OrderCreate, OrderResponse, OrderAcceptedResponse, OrderStatusResponse, OrderPollState, OrderPage
 from app.services.orders import submit_order, cancel_order as cancel_order_service, mark_confirmed, mark_paid
 from app.services.idempotency import get_claim_state, CLAIM_PENDING, CLAIM_FAILED
 from app.core.exceptions import OrderNotFound, InvalidOrderTransition
@@ -44,13 +46,44 @@ async def create_endpoint(
     )
     return OrderAcceptedResponse(idempotency_key=idempotency_key)
 
-@router.get("/me", response_model=list[OrderResponse])
+def _encode_cursor(order: Order) -> str:
+    """Opaque keyset cursor from an order's (created_at, id). Clients pass it back verbatim."""
+    raw = f"{order.created_at.isoformat()}|{order.id}"
+    return base64.urlsafe_b64encode(raw.encode()).decode()
+
+
+def _decode_cursor(token: str) -> tuple[datetime, int]:
+    try:
+        raw = base64.urlsafe_b64decode(token.encode()).decode()
+        created_at_str, id_str = raw.rsplit("|", 1)
+        return datetime.fromisoformat(created_at_str), int(id_str)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid cursor"
+        )
+
+
+@router.get("/me", response_model=OrderPage)
 async def list_my_orders(
     current_user: CurrentUser,
     db: DbSession,
-) -> list[Order]:
-    """List orders belonging to the authenticated user, newest first."""
-    return await list_orders_for_user(db, current_user.id)
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    cursor: str | None = None,
+) -> OrderPage:
+    """List the authenticated user's orders, newest first (keyset pagination).
+
+    Pass the previous response's `next_cursor` back as `?cursor=` for the next page.
+    """
+    decoded = _decode_cursor(cursor) if cursor else None
+    # fetch one extra to detect a next page without a COUNT
+    rows = await list_orders_for_user(db, current_user.id, limit=limit + 1, cursor=decoded)
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = _encode_cursor(page[-1]) if has_more else None
+    return OrderPage(
+        items=[OrderResponse.model_validate(o) for o in page],
+        next_cursor=next_cursor,
+    )
 
 @router.get("/by-key/{idempotency_key}", response_model=OrderStatusResponse)
 async def get_order_status(

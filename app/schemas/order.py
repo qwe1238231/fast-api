@@ -41,6 +41,13 @@ class OrderResponse(BaseModel):
     cancelled_at: datetime | None
 
 
+class OrderPage(BaseModel):
+    """Keyset-paginated page of a user's orders."""
+
+    items: list[OrderResponse]
+    next_cursor: str | None = None   # opaque token; pass back as ?cursor= for the next page
+
+
 class OrderPollState(StrEnum):
     PROCESSING = "processing"   # accepted, order row not written yet
     READY = "ready"             # order persisted; see `order`

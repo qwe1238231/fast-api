@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import InvalidOrderTransition
@@ -62,14 +62,20 @@ async def list_orders_for_user(
         user_id: int,
         *,
         limit: int = 50,
+        cursor: tuple[datetime, int] | None = None,
 ) -> list[Order]:
-    """Recent orders for a user, newest first."""
-    stmt = (
-        select(Order)
-        .where(Order.user_id == user_id)
-        .order_by(Order.created_at.desc())
-        .limit(limit)
-    )
+    """Recent orders for a user, newest first.
+
+    Keyset pagination: pass the previous page's last (created_at, id) as `cursor`
+    to get the next (older) page. Uses a row-value comparison so it maps to a
+    single index range scan on ix_orders_user_created (user_id, created_at, id) —
+    constant cost regardless of how deep the page is, and stable under new inserts.
+    """
+    stmt = select(Order).where(Order.user_id == user_id)
+    if cursor is not None:
+        # (created_at, id) < (cur_created_at, cur_id) — id breaks created_at ties
+        stmt = stmt.where(tuple_(Order.created_at, Order.id) < cursor)
+    stmt = stmt.order_by(Order.created_at.desc(), Order.id.desc()).limit(limit)
     result = await db.execute(stmt)
     return list(result.scalars().all())
 

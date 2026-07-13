@@ -15,7 +15,7 @@ async def _create_pending_order(client, drain, event_id):
     )
     await drain()                                   # worker writes the order row
     auth = {"Authorization": f"Bearer {token}"}
-    order_id = (await client.get("/v1/orders/me", headers=auth)).json()[0]["id"]
+    order_id = (await client.get("/v1/orders/me", headers=auth)).json()["items"][0]["id"]
     return order_id, token
 
 

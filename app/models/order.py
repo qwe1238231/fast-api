@@ -27,6 +27,9 @@ class Order(Base):
             "ix_orders_active", "event_id", "status",
             postgresql_where=text("status IN ('pending', 'paid', 'confirmed')"),
         ),
+        # Keyset pagination for list_orders_for_user: equality on user_id, then
+        # the (created_at, id) sort/cursor columns -> single index range scan.
+        Index("ix_orders_user_created", "user_id", "created_at", "id"),
         CheckConstraint(
             "status IN ('pending', 'paid', 'confirmed', 'expired', 'cancelled')",
             name="ck_orders_status",

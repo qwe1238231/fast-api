@@ -53,7 +53,7 @@ class Order(Base):
         ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)  # covered by ix_orders_user_created
     event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False, index=True)
     quantity: Mapped[int] = mapped_column(nullable=False)
     total_price_cents: Mapped[int] = mapped_column(nullable=False)

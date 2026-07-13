@@ -12,6 +12,7 @@ from app.models.event import Event
 from app.schemas.event import EventCreate, EventResponse, QueueStatusResponse
 from app.services.publish_event import publish_event
 from app.services.waiting_room import window, register as queue_register, status as queue_status
+from app.services.rate_limit import enforce_rate_limit
 
 
 router = APIRouter(prefix="/events", tags=["events"])
@@ -82,6 +83,12 @@ async def join_queue(
         redis: Redis,
 ) -> QueueStatusResponse:
     """Enter the waiting-room lottery for this event (idempotent, non-re-rollable)."""
+    await enforce_rate_limit(
+        redis,
+        f"qjoin:{event_id}:{current_user.id}",
+        limit=get_settings().QUEUE_JOIN_LIMIT_PER_MINUTE,
+        window_seconds=60,
+    )
     event = await get_event(db, event_id=event_id)
     if event is None:
         raise EventNotFound(event_id=event_id)

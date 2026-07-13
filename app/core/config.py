@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     QUEUE_ADMISSION_BUFFER_SECONDS: int = 30    # registration closes / admission begins this long before sale
     QUEUE_ADMISSION_RATE: int = 500             # users admitted per second (the gatekeeper throttle)
     QUEUE_ADMISSION_TOKEN_TTL_SECONDS: int = 120  # admitted buyers must complete within this window
+    QUEUE_JOIN_LIMIT_PER_MINUTE: int = 30         # anti-hammer cap on queue-join per user per event
 
     model_config = SettingsConfigDict(env_file=".env",extra="ignore")
 

@@ -77,6 +77,12 @@ class AdmissionDenied(DomainError):
         self.reason = reason
         super().__init__(reason)
 
+class RateLimited(DomainError):
+    """Too many requests in the window."""
+    def __init__(self, retry_after: int | None = None):
+        self.retry_after = retry_after
+        super().__init__("rate limit exceeded")
+
 class BuyerInfoError(DomainError):
     """Base for buyer info errors."""
 

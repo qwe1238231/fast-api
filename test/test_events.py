@@ -252,3 +252,16 @@ async def test_queue_registration_closed(client, db):
     event_id, headers = await _publish_event(client, db, _payload_sale_in(0))
     r = await client.post(f"/v1/events/{event_id}/queue", headers=headers)
     assert r.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_queue_join_rate_limited(client, db, monkeypatch):
+    from app.core.config import get_settings
+    monkeypatch.setattr(get_settings(), "QUEUE_JOIN_LIMIT_PER_MINUTE", 2)
+    event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
+
+    codes = [
+        (await client.post(f"/v1/events/{event_id}/queue", headers=headers)).status_code
+        for _ in range(3)
+    ]
+    assert codes == [200, 200, 429]     # 3rd join in the window is throttled

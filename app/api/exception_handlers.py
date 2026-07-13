@@ -17,6 +17,7 @@ from app.core.exceptions import (
     OrderNotFound,
     OrderNotOwned,
     AdmissionDenied,
+    RateLimited,
     BuyerInfoAlreadyExists,
     BuyerInfoNotFound,
     NationalIdAlreadyRegistered,
@@ -114,6 +115,15 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
             content={"detail": str(exc)},
+        )
+
+    @app.exception_handler(RateLimited)
+    async def _rate_limited(request: Request, exc: RateLimited):
+        headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": str(exc)},
+            headers=headers,
         )
 
     @app.exception_handler(DomainError)

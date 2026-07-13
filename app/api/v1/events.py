@@ -1,4 +1,6 @@
-from fastapi import APIRouter, status
+from typing import Annotated
+
+from fastapi import APIRouter, Query, status
 
 from app.api.deps import CurrentAdmin, DbSession, Redis
 from app.core.exceptions import EventNotFound
@@ -37,8 +39,12 @@ async def publish_event_endpoint(
     return event
 
 @router.get("/", response_model=list[EventResponse])
-async def list_published_endpoint(db: DbSession) -> list[Event]:
-    return await list_published_events(db)
+async def list_published_endpoint(
+        db: DbSession,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> list[Event]:
+    return await list_published_events(db, offset=offset, limit=limit)
 
 @router.get("/{event_id}", response_model=EventResponse)
 async def get_event_endpoint(event_id: int, db: DbSession) -> Event:

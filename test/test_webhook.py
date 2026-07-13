@@ -2,16 +2,27 @@ import pytest
 import stripe
 from uuid import uuid4
 
+from sqlalchemy import select
 
-async def _create_pending_order(client, drain, event_id):
+from app.core.security import create_admission_token
+from app.models.user import User
+
+
+async def _create_pending_order(client, db, drain, event_id):
     """註冊 + 登入 + 下單(202)+ 跑 worker 漆帳,回 (order_id, token)。"""
     await client.post("/v1/users/", json={"username": "alice", "password": "secret123"})
     r = await client.post("/v1/auth/token", data={"username": "alice", "password": "secret123"})
     token = r.json()["access_token"]
+    user_id = await db.scalar(select(User.id).where(User.username == "alice"))
+    admission = create_admission_token(user_id=user_id, event_id=event_id, ttl_seconds=120)
     await client.post(
         "/v1/orders/",
         json={"event_id": event_id, "quantity": 1},
-        headers={"Authorization": f"Bearer {token}", "Idempotency-Key": str(uuid4())},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Idempotency-Key": str(uuid4()),
+            "Admission-Token": admission,
+        },
     )
     await drain()                                   # worker writes the order row
     auth = {"Authorization": f"Bearer {token}"}
@@ -20,8 +31,8 @@ async def _create_pending_order(client, drain, event_id):
 
 
 @pytest.mark.asyncio
-async def test_webhook_confirms_order_on_payment_success(client, published_event, monkeypatch, drain_orders):
-    order_id, token = await _create_pending_order(client, drain_orders, published_event.id)
+async def test_webhook_confirms_order_on_payment_success(client, db, published_event, monkeypatch, drain_orders):
+    order_id, token = await _create_pending_order(client, db, drain_orders, published_event.id)
 
     # 換掉簽章驗證,直接回傳一個 payment_intent.succeeded 事件
     def fake_construct_event(payload, sig_header, secret):

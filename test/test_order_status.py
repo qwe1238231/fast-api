@@ -2,6 +2,10 @@
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
+
+from app.core.security import create_admission_token
+from app.models.user import User
 
 
 async def _auth(client, username):
@@ -10,20 +14,25 @@ async def _auth(client, username):
     return {"Authorization": f"Bearer {r.json()['access_token']}"}
 
 
-async def _create(client, headers, event_id, key, quantity=1):
+async def _create(client, db, headers, event_id, key, *, username="alice", quantity=1):
+    uid = await db.scalar(select(User.id).where(User.username == username))
     return await client.post(
         "/v1/orders/",
         json={"event_id": event_id, "quantity": quantity},
-        headers={**headers, "Idempotency-Key": key},
+        headers={
+            **headers,
+            "Idempotency-Key": key,
+            "Admission-Token": create_admission_token(user_id=uid, event_id=event_id, ttl_seconds=120),
+        },
     )
 
 
 @pytest.mark.asyncio
-async def test_status_processing_before_worker(client, published_event):
+async def test_status_processing_before_worker(client, db, published_event):
     """Created (202) but worker hasn't run -> processing, no order yet."""
     headers = await _auth(client, "alice")
     key = str(uuid4())
-    await _create(client, headers, published_event.id, key)
+    await _create(client, db, headers, published_event.id, key)
 
     r = await client.get(f"/v1/orders/by-key/{key}", headers=headers)
     assert r.status_code == 200
@@ -32,11 +41,11 @@ async def test_status_processing_before_worker(client, published_event):
 
 
 @pytest.mark.asyncio
-async def test_status_ready_after_worker(client, published_event, drain_orders):
+async def test_status_ready_after_worker(client, db, published_event, drain_orders):
     """After the worker persists it -> ready, the order is returned."""
     headers = await _auth(client, "alice")
     key = str(uuid4())
-    await _create(client, headers, published_event.id, key)
+    await _create(client, db, headers, published_event.id, key)
     await drain_orders()
 
     r = await client.get(f"/v1/orders/by-key/{key}", headers=headers)
@@ -47,13 +56,13 @@ async def test_status_ready_after_worker(client, published_event, drain_orders):
 
 
 @pytest.mark.asyncio
-async def test_status_failed_after_giveup(client, published_event, redis):
+async def test_status_failed_after_giveup(client, db, published_event, redis):
     """When the claim is marked FAILED (worker gave up) -> failed."""
     from app.services.idempotency import mark_claim_failed
 
     headers = await _auth(client, "alice")
     key = str(uuid4())
-    await _create(client, headers, published_event.id, key)
+    await _create(client, db, headers, published_event.id, key)
     await mark_claim_failed(redis, idempotency_key=key)
 
     r = await client.get(f"/v1/orders/by-key/{key}", headers=headers)
@@ -70,11 +79,11 @@ async def test_status_unknown_key_404(client):
 
 
 @pytest.mark.asyncio
-async def test_status_other_users_key_404(client, published_event, drain_orders):
+async def test_status_other_users_key_404(client, db, published_event, drain_orders):
     """A key that belongs to someone else -> 404 (don't leak its existence)."""
     alice = await _auth(client, "alice")
     key = str(uuid4())
-    await _create(client, alice, published_event.id, key)
+    await _create(client, db, alice, published_event.id, key)
     await drain_orders()
 
     bob = await _auth(client, "bob")

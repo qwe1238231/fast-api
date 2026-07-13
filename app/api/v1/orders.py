@@ -14,6 +14,7 @@ from app.core.exceptions import OrderNotFound, InvalidOrderTransition
 from app.crud.order import get_order_by_id, get_order_by_idempotency_key, list_orders_for_user
 from app.schemas.payment import PaymentIntentResponse
 from app.services.stripe_client import create_payment_intent
+from app.services.waiting_room import verify_admission
 
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -27,15 +28,20 @@ router = APIRouter(prefix="/orders", tags=["orders"])
 async def create_endpoint(
     order_in: OrderCreate,
     idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
+    admission_token: Annotated[str, Header(alias="Admission-Token")],
     current_user: CurrentUser,
     db: DbSession,
     redis: Redis,
 ) -> OrderAcceptedResponse:
     """Accept an order intent: validate, reserve a seat, enqueue for the worker.
 
-    Returns 202 immediately — the order row is written asynchronously by the
-    worker. The client polls order status with the Idempotency-Key.
+    Requires a valid waiting-room admission token for this event (checked before
+    any reserve work, so non-admitted requests are bounced cheaply). Returns 202
+    immediately — the order row is written asynchronously by the worker.
     """
+    await verify_admission(
+        redis, admission_token, user_id=current_user.id, event_id=order_in.event_id
+    )
     await submit_order(
         db,
         redis,

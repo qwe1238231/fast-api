@@ -41,3 +41,4 @@ class QueueStatusResponse(BaseModel):
     admitted: bool
     people_ahead: int | None = None        # not-yet-admitted users ahead (0 = next); None if admitted/unregistered
     poll_after_seconds: int | None = None  # suggested backoff before polling again; None once admitted
+    access_token: str | None = None        # single-use admission pass for POST /orders/; set only when admitted

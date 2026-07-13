@@ -71,6 +71,12 @@ class InsufficientInventory(InventoryError):
         self.available = available
         super().__init__(f"Event {event_id}: requested {requested}, only {available} available")
 
+class AdmissionDenied(DomainError):
+    """Order attempted without a valid waiting-room admission token."""
+    def __init__(self, reason: str = "admission required"):
+        self.reason = reason
+        super().__init__(reason)
+
 class BuyerInfoError(DomainError):
     """Base for buyer info errors."""
 

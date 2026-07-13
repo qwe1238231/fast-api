@@ -3,7 +3,9 @@ from uuid import uuid4
 
 import pytest
 
-from app.core.security import get_password_hash
+from sqlalchemy import select
+
+from app.core.security import get_password_hash, create_admission_token
 from app.models.user import User
 from app.services.inventory import get_available
 from app.services.inventory import reconcile_inventory
@@ -27,6 +29,16 @@ def _event_payload():
         "sale_ends_at": "2026-11-30T23:59:00+00:00",
         "total_seats": 100,
         "price_cents": 1500,
+    }
+
+
+async def _order_headers(db, headers, event_id, username="admin"):
+    """auth + a fresh admission token (bypasses the queue) + fresh idem key."""
+    uid = await db.scalar(select(User.id).where(User.username == username))
+    return {
+        **headers,
+        "Admission-Token": create_admission_token(user_id=uid, event_id=event_id, ttl_seconds=120),
+        "Idempotency-Key": str(uuid4()),
     }
 
 
@@ -76,7 +88,7 @@ async def test_reconcile_rebuilds_inventory_after_redis_loss(client, db, redis, 
         r = await client.post(
             "/v1/orders/",
             json={"event_id": event_id, "quantity": 10},
-            headers={**headers, "Idempotency-Key": str(uuid4())},
+            headers=await _order_headers(db, headers, event_id),
         )
         assert r.status_code == 202
     assert await get_available(redis, event_id=event_id) == 70
@@ -101,7 +113,7 @@ async def test_reconcile_refuses_when_stream_not_drained(client, db, redis):
     await client.post(
         "/v1/orders/",
         json={"event_id": event_id, "quantity": 1},
-        headers={**headers, "Idempotency-Key": str(uuid4())},
+        headers=await _order_headers(db, headers, event_id),
     )
 
     # 沒排空 + force=False(預設)→ 守衛應 raise
@@ -118,7 +130,7 @@ async def test_reconcile_force_bypasses_guard(client, db, redis):
     await client.post(
         "/v1/orders/",
         json={"event_id": event_id, "quantity": 1},
-        headers={**headers, "Idempotency-Key": str(uuid4())},
+        headers=await _order_headers(db, headers, event_id),
     )
 
     # force=True → 即使沒排空也不 raise,正常回傳
@@ -153,7 +165,7 @@ async def test_drift_check_skipped_when_queue_not_drained(client, db, redis):
     await client.post(
         "/v1/orders/",
         json={"event_id": event_id, "quantity": 1},
-        headers={**headers, "Idempotency-Key": str(uuid4())},
+        headers=await _order_headers(db, headers, event_id),
     )
 
     # 把 Redis 設成明顯錯的值 → 沒閘門的話這一定會被報成 drift

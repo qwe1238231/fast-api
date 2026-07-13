@@ -15,9 +15,12 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 
+import jwt
+from jwt.exceptions import InvalidTokenError
 from redis.asyncio import Redis
 
 from app.core.config import get_settings
+from app.core.exceptions import AdmissionDenied
 from app.models.event import Event
 
 
@@ -94,3 +97,28 @@ async def status(redis: Redis, *, event_id: int, user_id: int) -> tuple[bool, in
     if rank < admitted:
         return True, None
     return False, rank - admitted
+
+
+async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: int) -> None:
+    """Raise AdmissionDenied unless `token` is a valid, in-scope, unused admission pass.
+
+    Checks signature/expiry (jwt), type, that it was issued for this event and this
+    user, and that it hasn't been used before (single-use via SETNX on the jti).
+    """
+    settings = get_settings()
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    except InvalidTokenError:
+        raise AdmissionDenied("invalid or expired admission token")
+    if payload.get("typ") != "admission":
+        raise AdmissionDenied("wrong token type")
+    if payload.get("event_id") != event_id:
+        raise AdmissionDenied("admission token not valid for this event")
+    if payload.get("sub") != str(user_id):
+        raise AdmissionDenied("admission token belongs to another user")
+
+    jti = payload.get("jti")
+    ttl = max(1, int(payload["exp"] - datetime.now(timezone.utc).timestamp()))
+    first_use = await redis.set(f"admission_used:{jti}", "1", nx=True, ex=ttl)
+    if not first_use:
+        raise AdmissionDenied("admission token already used")

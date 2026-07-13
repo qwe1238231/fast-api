@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import  select, func
 
 from redis.asyncio import Redis
+from redis.commands.core import AsyncScript
 
 from enum import StrEnum
 from dataclasses import dataclass
@@ -89,6 +90,10 @@ redis.call('SET', KEYS[2], 'PENDING', 'EX', tonumber(ARGV[2]))
 
 return {'OK', stream_id}
 """
+
+# Registered once on first use (SHA1 computed there, not per order), then reused.
+# Constructing it needs a live client for the encoder, so it can't be built at import.
+_reserve_script: AsyncScript | None = None
 
 
 async def reserve(
@@ -194,8 +199,10 @@ async def reserve_and_enqueue(
     that is what welds "decrement stock" and "enqueue" into a single action and
     closes the gap.
     """
-    script = redis.register_script(_RESERVE_AND_ENQUEUE_LUA)
-    result = await script(
+    global _reserve_script
+    if _reserve_script is None:
+        _reserve_script = redis.register_script(_RESERVE_AND_ENQUEUE_LUA)   # SHA1 once
+    result = await _reserve_script(
         keys=[
             _key(event_id),                 # KEYS[1] stock
             _claim_key(idempotency_key),    # KEYS[2] claim
@@ -209,6 +216,7 @@ async def reserve_and_enqueue(
             total_price_cents,              # ARGV[5]
             idempotency_key,                # ARGV[6]
         ],
+        client=redis,                       # current client (app or test)
     )
 
     # client has decode_responses=True, so result items are already str (not bytes).

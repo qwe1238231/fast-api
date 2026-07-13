@@ -35,7 +35,10 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 register_exception_handlers(app)
-Instrumentator().instrument(app).expose(app)
+Instrumentator(
+    # regex, matched with re.search -> anchor so "/" doesn't match every path
+    excluded_handlers=["^/metrics$", "^/docs$", "^/openapi.json$", "^/$"],
+).instrument(app).expose(app)
 REGISTRY.register(QueueDepthCollector())   # order_stream_backlog / order_dead_letter_depth on /metrics
 app.include_router(api_router, prefix="/v1")
 

@@ -1,29 +1,11 @@
-# --- Monitoring: SNS alert channel ------------------------------------------
-# One topic is the single fan-in point for every CloudWatch alarm in this stack.
-# Each aws_cloudwatch_metric_alarm sets alarm_actions = [aws_sns_topic.alerts.arn]
-# (and ok_actions for the recovery notice), so we wire the destination ONCE here
-# instead of into N alarms. SNS then multiplexes to every confirmed subscription
-# — email now; later Slack/SMS/Lambda can be added with zero alarm changes.
-#
-# The alarms themselves are added in later layers (ECS / RDS / Redis / ALB, then
-# the pipeline alarms). This file holds the channel first because every alarm
-# references aws_sns_topic.alerts.arn.
-
-resource "aws_sns_topic" "alerts" {
-  name = "${var.project}-alerts"
-  tags = { Name = "${var.project}-alerts" }
-}
-
-# Email subscription — the one SNS protocol Terraform CANNOT auto-confirm (by
-# design: it proves a human controls the inbox). After `terraform apply` this
-# sits in state "PendingConfirmation" and delivers NOTHING until you click the
-# link in the "AWS Notification - Subscription Confirmation" email. That pending
-# state is NOT a plan/apply error, and re-applying won't disturb an
-# already-confirmed subscription (the endpoint is its identity).
-resource "aws_sns_topic_subscription" "alerts_email" {
-  topic_arn = aws_sns_topic.alerts.arn
-  protocol  = "email"
-  endpoint  = var.alert_email
+# --- Monitoring: alarm notification target ----------------------------------
+# SNS was removed. The alarms below still EVALUATE state (visible in the
+# CloudWatch console); they just push no notifications. Every alarm sets
+# alarm_actions/ok_actions = local.alarm_actions, so re-enabling later is a
+# one-line change here: create an aws_sns_topic (+ subscription) and point the
+# local at [aws_sns_topic.<your-topic>.arn].
+locals {
+  alarm_actions = [] # empty = notify nobody; set to a topic ARN list to re-enable
 }
 
 # --- ECS: per-service CPU / memory utilization ------------------------------
@@ -63,8 +45,8 @@ resource "aws_cloudwatch_metric_alarm" "ecs_util" {
     ServiceName = each.value.service
   }
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn] # recovery ("resolved") notice
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-${replace(each.key, "_", "-")}-high" }
 }
 
@@ -106,8 +88,8 @@ resource "aws_cloudwatch_metric_alarm" "ecs_service_down" {
     ServiceName = each.value
   }
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-${each.key}-no-running-tasks" }
 }
 
@@ -133,8 +115,8 @@ resource "aws_cloudwatch_metric_alarm" "worker_duplicate_tasks" {
     ServiceName = aws_ecs_service.worker.name
   }
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-worker-duplicate-tasks" }
 }
 
@@ -211,8 +193,8 @@ resource "aws_cloudwatch_metric_alarm" "rds" {
     DBInstanceIdentifier = aws_db_instance.main.identifier
   }
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-rds-${replace(each.key, "_", "-")}" }
 }
 
@@ -282,8 +264,8 @@ resource "aws_cloudwatch_metric_alarm" "redis" {
     CacheClusterId = aws_elasticache_cluster.main.cluster_id
   }
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-redis-${replace(each.key, "_", "-")}" }
 }
 
@@ -312,8 +294,8 @@ resource "aws_cloudwatch_metric_alarm" "alb_elb_5xx_high" {
 
   dimensions = { LoadBalancer = aws_lb.main.arn_suffix }
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-alb-elb-5xx-high" }
 }
 
@@ -337,8 +319,8 @@ resource "aws_cloudwatch_metric_alarm" "alb_target_5xx_high" {
     TargetGroup  = aws_lb_target_group.api.arn_suffix
   }
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-alb-target-5xx-high" }
 }
 
@@ -363,8 +345,8 @@ resource "aws_cloudwatch_metric_alarm" "alb_target_p95_latency_high" {
     TargetGroup  = aws_lb_target_group.api.arn_suffix
   }
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-alb-target-p95-latency-high" }
 }
 
@@ -391,8 +373,8 @@ resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
     TargetGroup  = aws_lb_target_group.api.arn_suffix
   }
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-alb-unhealthy-hosts" }
 }
 
@@ -400,32 +382,8 @@ resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
 # LAYER 3 — pipeline / meta alarms (what the stock resource metrics can't see)
 # =============================================================================
 
-# (A) The alert channel itself. If SNS fails to deliver, every alarm above fires
-# into the void. NumberOfNotificationsFailed is most meaningful once the topic
-# has HTTP/Lambda/SQS subscribers (email delivery-failure signal is limited), so
-# treat this as forward-looking coverage.
-# ⚠️ KNOWN LIMITATION: this alarm publishes to the SAME topic it watches, so if
-# delivery is TOTALLY broken (e.g. the only email is unconfirmed) it can't get
-# through either. The production-correct fix is a SECOND, independent channel
-# (different email / SMS) for meta-alarms — deferred for this dev stack.
-resource "aws_cloudwatch_metric_alarm" "sns_delivery_failed" {
-  alarm_name          = "${var.project}-sns-delivery-failed"
-  alarm_description   = "SNS failed to deliver > 0 notifications in a minute — the alert channel is degraded"
-  namespace           = "AWS/SNS"
-  metric_name         = "NumberOfNotificationsFailed"
-  statistic           = "Sum"
-  period              = 60
-  evaluation_periods  = 1
-  comparison_operator = "GreaterThanThreshold"
-  threshold           = 0
-  treat_missing_data  = "notBreaching"
-
-  dimensions = { TopicName = aws_sns_topic.alerts.name }
-
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
-  tags          = { Name = "${var.project}-sns-delivery-failed" }
-}
+# (A) [removed] SNS delivery-failed meta-alarm — dropped together with the SNS
+# channel. It only made sense while notifications went to an SNS topic.
 
 # (B) Pipeline alarms via LOG METRIC FILTERS. These failure modes have NO stock
 # CloudWatch metric — but the worker already prints a distinct line for each. A
@@ -484,8 +442,8 @@ resource "aws_cloudwatch_metric_alarm" "pipeline_log" {
   threshold           = 0
   treat_missing_data  = "notBreaching" # worker silent (down) → covered by ecs_service_down
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-${replace(each.key, "_", "-")}" }
 }
 
@@ -524,7 +482,7 @@ resource "aws_cloudwatch_metric_alarm" "pipeline_gauge" {
   threshold           = each.value.threshold
   treat_missing_data  = "notBreaching" # no data until the app publishes; worker-down covered elsewhere
 
-  alarm_actions = [aws_sns_topic.alerts.arn]
-  ok_actions    = [aws_sns_topic.alerts.arn]
+  alarm_actions = local.alarm_actions
+  ok_actions    = local.alarm_actions
   tags          = { Name = "${var.project}-${replace(each.key, "_", "-")}" }
 }

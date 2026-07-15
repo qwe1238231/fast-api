@@ -1,0 +1,87 @@
+# --- CI/CD: let GitHub Actions deploy without long-lived AWS keys (OIDC) -----
+# GitHub Actions presents a short-lived OIDC token proving "I'm a run of
+# repo X on branch main"; AWS (trusting GitHub's OIDC provider) swaps it for
+# 15-min temporary credentials scoped to the role below. No secrets stored.
+
+variable "github_repo" {
+  description = "owner/repo allowed to assume the CI role."
+  type        = string
+  default     = "qwe1238231/fast-api"
+}
+
+# 1) Tell AWS to trust GitHub's OIDC issuer. thumbprint_list is omitted on
+#    purpose — for this well-known endpoint the AWS provider fills it in.
+resource "aws_iam_openid_connect_provider" "github" {
+  url            = "https://token.actions.githubusercontent.com"
+  client_id_list = ["sts.amazonaws.com"]
+}
+
+# 2) Trust policy: ONLY runs of <repo> on refs/heads/main may assume this role.
+#    Locking `sub` to the branch is what stops a fork / another branch / PR from
+#    getting deploy creds.
+data "aws_iam_policy_document" "github_assume" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = ["sts.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = ["repo:${var.github_repo}:ref:refs/heads/main"]
+    }
+  }
+}
+
+resource "aws_iam_role" "github_actions" {
+  name               = "${var.project}-github-actions"
+  assume_role_policy = data.aws_iam_policy_document.github_assume.json
+  tags               = { Name = "${var.project}-github-actions" }
+}
+
+# 3) What CI may do: push to ECR, run the migration task, roll the ECS services.
+data "aws_iam_policy_document" "cicd" {
+  # ECR login token is an account-level call -> must be "*"
+  statement {
+    actions   = ["ecr:GetAuthorizationToken"]
+    resources = ["*"]
+  }
+  # Push/pull layers to our repo only
+  statement {
+    actions = [
+      "ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer", "ecr:BatchGetImage",
+      "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage",
+    ]
+    resources = [aws_ecr_repository.app.arn]
+  }
+  # Roll services + run the one-off migration task + register new task defs
+  statement {
+    actions = [
+      "ecs:UpdateService", "ecs:DescribeServices",
+      "ecs:RunTask", "ecs:DescribeTasks", "ecs:RegisterTaskDefinition",
+    ]
+    resources = ["*"] # dev: broad; could scope to this cluster's ARNs
+  }
+  # RunTask/UpdateService must be allowed to PASS the task roles to the tasks
+  statement {
+    actions   = ["iam:PassRole"]
+    resources = [aws_iam_role.ecs_execution.arn, aws_iam_role.ecs_task.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "cicd" {
+  name   = "${var.project}-cicd"
+  role   = aws_iam_role.github_actions.id
+  policy = data.aws_iam_policy_document.cicd.json
+}
+
+# The workflow needs this ARN (set it as a GitHub Actions variable / in the yml).
+output "github_actions_role_arn" {
+  value = aws_iam_role.github_actions.arn
+}

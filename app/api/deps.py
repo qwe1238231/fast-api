@@ -3,6 +3,7 @@ from typing import Annotated
 import jwt
 from fastapi import Depends, HTTPException, status, Request
 from redis.asyncio import Redis as RedisClient
+from stripe import StripeClient
 from fastapi.security import OAuth2PasswordBearer
 from jwt.exceptions import InvalidTokenError
 from pydantic import ValidationError
@@ -29,6 +30,11 @@ async def get_redis(request: Request) -> RedisClient:
     """
     return request.app.state.redis
 Redis = Annotated[RedisClient, Depends(get_redis)]
+
+async def get_stripe(request: Request) -> StripeClient:
+    """Return the app-wide async Stripe client (created in lifespan)."""
+    return request.app.state.stripe
+Stripe = Annotated[StripeClient, Depends(get_stripe)]
 
 async def get_current_user(
         token: Annotated[str, Depends(oauth2_scheme)],
@@ -67,3 +73,10 @@ async def get_current_active_user(
     return current_user
 
 CurrentUser = Annotated[User, Depends(get_current_active_user)]
+
+async def get_current_admin(current_user: CurrentUser) -> User:
+    if not current_user.is_admin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
+    return current_user
+
+CurrentAdmin = Annotated[User, Depends(get_current_admin)]

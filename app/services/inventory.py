@@ -3,14 +3,36 @@
 Single source of truth for "how many seats remain". DB stores `events.total_seats`
 as configuration; this module manages live decrement during sale.
 """
-from redis.asyncio import Redis
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import  select, func
 
-from app.core.exceptions import InsufficientInventory
+from redis.asyncio import Redis
+from redis.commands.core import AsyncScript
+
+from enum import StrEnum
+from dataclasses import dataclass
+
+from app.core.exceptions import InsufficientInventory ,EventNotFound,InventoryNotReconcilable
+from app.models.event import Event
+from app.models.order import Order, OrderStatus 
+from app.services.idempotency import _key as _claim_key
+
+ORDER_STREAM_KEY="orders:stream"
+ORDER_DEAD_LETTER_KEY="orders:stream:dead"
+
 
 
 def _key(event_id: int) -> str:
     """Key for an event's available seat counter."""
     return f"event:{event_id}:available"
+
+async def queue_depth(redis: Redis) -> tuple[int, int]:
+    """回傳 (backlog, dead_letter):尚未落帳的 order intents、與永久失敗的。
+    兩者皆為 0 代表 DB 已追上 Redis,是『DB 此刻可信』的訊號。
+    """
+    backlog = await redis.xlen(ORDER_STREAM_KEY)
+    dead = await redis.xlen(ORDER_DEAD_LETTER_KEY)
+    return backlog, dead
 
 async def set_initial_stock(
         redis: Redis,
@@ -29,6 +51,50 @@ async def get_available(
     """Read current available count. Returns 0 if key missing or negative (race)."""
     val = await redis.get(_key(event_id))
     return max(0, int(val)) if val is not None else 0
+
+# Atomic script: dedup + decrement stock + enqueue + write claim, all-or-nothing.
+# KEYS[1]=stock key   KEYS[2]=claim key   KEYS[3]=stream key
+# ARGV[1]=quantity  ARGV[2]=claim TTL seconds  ARGV[3]=user_id
+# ARGV[4]=event_id  ARGV[5]=total_price_cents  ARGV[6]=idempotency_key
+# Returns (a list on the Python side):
+#   {'DUP'}                 -> this idempotency_key was already processed
+#   {'SOLD_OUT', remaining} -> not enough stock
+#   {'OK', stream msg id}   -> seat reserved and order intent enqueued
+_RESERVE_AND_ENQUEUE_LUA = """
+local qty = tonumber(ARGV[1])
+
+-- 1) Dedup: if the claim already exists, return DUP and never decrement.
+if redis.call('EXISTS', KEYS[2]) == 1 then
+    return {'DUP'}
+end
+
+-- 2) Read stock and check sold-out (GET on a missing key yields false -> nil after tonumber).
+local avail = tonumber(redis.call('GET', KEYS[1]))
+if avail == nil or avail < qty then
+    return {'SOLD_OUT', tostring(avail or 0)}
+end
+
+-- 3) Decrement stock.
+redis.call('DECRBY', KEYS[1], qty)
+
+-- 4) Push the order intent into the stream, capture the auto-generated message id.
+local stream_id = redis.call('XADD', KEYS[3], '*',
+    'user_id', ARGV[3],
+    'event_id', ARGV[4],
+    'quantity', ARGV[1],
+    'total_price_cents', ARGV[5],
+    'idempotency_key', ARGV[6])
+
+-- 5) Write the claim (with TTL) so the next request with the same key is blocked at step 1.
+redis.call('SET', KEYS[2], 'PENDING', 'EX', tonumber(ARGV[2]))
+
+return {'OK', stream_id}
+"""
+
+# Registered once on first use (SHA1 computed there, not per order), then reused.
+# Constructing it needs a live client for the encoder, so it can't be built at import.
+_reserve_script: AsyncScript | None = None
+
 
 async def reserve(
         redis: Redis,
@@ -55,3 +121,115 @@ async def release(
 ) -> None:
     """Return `quantity` seats to inventory (order expired/cancelled)."""
     await redis.incrby(_key(event_id), quantity)
+
+async def reconcile_inventory(
+        db: AsyncSession,
+        redis: Redis,
+        *,
+        event_id: int,
+        force: bool = False,
+) -> int:
+    """從 Postgres 重算真實剩餘,覆蓋寫回 Redis。Redis 遺失後的權威重建。"""
+    if not force:                                    # ← 守衛搬進來
+        backlog, dead = await queue_depth(redis)
+        if backlog or dead:
+            raise InventoryNotReconcilable(event_id, backlog, dead)
+    total_seats = await db.scalar(
+        select(Event.total_seats).where(Event.id == event_id)
+    )
+    if total_seats is None:
+        raise EventNotFound(event_id=event_id)
+    
+    held = (OrderStatus.PENDING, OrderStatus.PAID, OrderStatus.CONFIRMED)
+    sold = await db.scalar(
+        select(func.coalesce(func.sum(Order.quantity), 0))
+        .where(Order.event_id == event_id, Order.status.in_(held))
+    )
+
+    remaining = total_seats - sold
+    await redis.set(_key(event_id), remaining)
+    return remaining
+
+async def compute_expected_available(
+        db: AsyncSession,
+        *,
+        event_id: int,
+) -> int:
+    """從 Postgres 算出『應有的剩餘庫存』—— 不碰 Redis,純讀。"""
+    total_seats = await db.scalar(
+        select(Event.total_seats).where(Event.id == event_id)
+    )
+    if total_seats is None:
+        raise EventNotFound(event_id=event_id)
+    
+    held = (OrderStatus.PENDING, OrderStatus.PAID, OrderStatus.CONFIRMED)
+    sold = await db.scalar(
+        select(func.coalesce(func.sum(Order.quantity), 0))
+        .where(Order.event_id == event_id, Order.status.in_(held))
+    )
+    return total_seats - sold
+
+class ReserveOutcome(StrEnum):
+    """The three possible outcomes of reserve_and_enqueue."""
+    OK = "OK"
+    DUP = "DUP"
+    SOLD_OUT = "SOLD_OUT"
+
+
+@dataclass(frozen=True)
+class ReserveResult:
+    outcome: ReserveOutcome
+    stream_id: str | None = None   # set only when outcome == OK
+    available: int | None = None   # set only when outcome == SOLD_OUT
+
+
+async def reserve_and_enqueue(
+        redis: Redis,
+        *,
+        event_id: int,
+        user_id: int,
+        quantity: int,
+        total_price_cents: int,
+        idempotency_key: str,
+        claim_ttl_seconds: int = 86400,
+) -> ReserveResult:
+    """Atomically: dedup + decrement stock + enqueue + write claim.
+
+    Everything runs inside one Lua script, so no other request can interleave --
+    that is what welds "decrement stock" and "enqueue" into a single action and
+    closes the gap.
+    """
+    global _reserve_script
+    if _reserve_script is None:
+        _reserve_script = redis.register_script(_RESERVE_AND_ENQUEUE_LUA)   # SHA1 once
+    result = await _reserve_script(
+        keys=[
+            _key(event_id),                 # KEYS[1] stock
+            _claim_key(idempotency_key),    # KEYS[2] claim
+            ORDER_STREAM_KEY,               # KEYS[3] stream
+        ],
+        args=[
+            quantity,                       # ARGV[1]
+            claim_ttl_seconds,              # ARGV[2]
+            user_id,                        # ARGV[3]
+            event_id,                       # ARGV[4]
+            total_price_cents,              # ARGV[5]
+            idempotency_key,                # ARGV[6]
+        ],
+        client=redis,                       # current client (app or test)
+    )
+
+    # client has decode_responses=True, so result items are already str (not bytes).
+    status = result[0]
+    if status == ReserveOutcome.DUP:
+        return ReserveResult(outcome=ReserveOutcome.DUP)
+    if status == ReserveOutcome.SOLD_OUT:
+        return ReserveResult(
+            outcome=ReserveOutcome.SOLD_OUT,
+            available=int(result[1]),
+        )
+    return ReserveResult(
+        outcome=ReserveOutcome.OK,
+        stream_id=result[1],
+    )
+    

@@ -53,12 +53,35 @@ class DuplicateOrderRequest(OrderError):
 class InventoryError(DomainError):
     """Base for inventory-related errors."""
 
+class InventoryNotReconcilable(InventoryError):
+    def __init__(self, event_id: int, backlog: int, dead_letter: int):
+        self.event_id = event_id
+        self.backlog = backlog
+        self.dead_letter = dead_letter
+        super().__init__(
+            f"Cannot reconcile event {event_id}: order stream not drained "
+            f"(backlog={backlog}, dead_letter={dead_letter}). "
+            f"Drain the queue first, or use --force to override."
+        )
+
 class InsufficientInventory(InventoryError):
     def __init__(self, event_id: int, requested: int, available: int):
         self.event_id = event_id
         self.requested = requested
         self.available = available
         super().__init__(f"Event {event_id}: requested {requested}, only {available} available")
+
+class AdmissionDenied(DomainError):
+    """Order attempted without a valid waiting-room admission token."""
+    def __init__(self, reason: str = "admission required"):
+        self.reason = reason
+        super().__init__(reason)
+
+class RateLimited(DomainError):
+    """Too many requests in the window."""
+    def __init__(self, retry_after: int | None = None):
+        self.retry_after = retry_after
+        super().__init__("rate limit exceeded")
 
 class BuyerInfoError(DomainError):
     """Base for buyer info errors."""

@@ -2,26 +2,48 @@
 
 Run: arq app.worker.WorkerSettings
 """
+import asyncio
 import json
+import os
+import boto3
+from botocore.config import Config
 from datetime import timedelta, timezone, datetime
+from uuid import UUID
 
 from arq import cron
 from arq.connections import RedisSettings
 from sqlalchemy import select, delete
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
 from app.core.redis import create_redis_client
 from app.db.session import AsyncSessionLocal
 from app.models.order import Order, OrderStatus
 from app.services.orders import expire_order
+from app.crud.order import create_order, get_order_by_idempotency_key
 from app.crud.refresh_token import purge_expired
 from app.models.audit_log import AuditLog
 from app.services.audit import AUDIT_STREAM_KEY
+from app.models.event import Event, EventStatus
+from app.services.inventory import (
+    compute_expected_available, get_available, release,
+    ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY,queue_depth,
+)
+from app.services.idempotency import mark_claim_failed
+from app.services.waiting_room import set_admission_paused
 
+_settings = get_settings()
 
 PENDING_TIMEOUT_MINUTES = 10
 AUDIT_CONSUMER_GROUP = "audit-writer"
 AUDIT_CONSUMER_NAME = "worker"
+ORDER_CONSUMER_GROUP = "order-writer"
+ORDER_CONSUMER_NAME = "worker"
+ORDER_LOOP_CONSUMER_NAME = "stream-consumer"   # the dedicated long-lived consumer process
+RECLAIM_IDLE_MS = _settings.ORDER_RECLAIM_IDLE_MS      # only reclaim entries idle at least this long
+MAX_DELIVERIES = _settings.ORDER_MAX_DELIVERIES        # dead-letter after this many delivery attempts
+CONSUMER_BLOCK_MS = _settings.ORDER_CONSUMER_BLOCK_MS  # how long the loop blocks per read
+BACKLOG_WARN = _settings.ORDER_BACKLOG_WARN            # log a warning above this backlog
 
 
 async def expire_pending_orders(ctx: dict) -> None:
@@ -90,20 +112,21 @@ async def purge_old_audit_logs(ctx: dict) -> None:
             await db.rollback()
             print(f"Failed to purge audit logs: {exc}")
 
+async def ensure_consumer_group(redis, stream_key: str, group: str) -> None:
+    """Create a consumer group (and the stream) if it doesn't already exist."""
+    try:
+        await redis.xgroup_create(stream_key, group, id="0", mkstream=True)
+    except Exception as exc:
+        if "BUSYGROUP" not in str(exc):
+            raise
+
+
 async def startup(ctx: dict) -> None:
     """Open Redis client for inventory operations."""
     settings = get_settings()
     ctx["redis_client"] = create_redis_client(settings.REDIS_URL)
-    try:
-        await ctx["redis_client"].xgroup_create(
-            AUDIT_STREAM_KEY,
-            AUDIT_CONSUMER_GROUP,
-            id="0",
-            mkstream=True,
-        )
-    except Exception as exc:
-        if "BUSYGROUP" not in str(exc):
-            raise
+    await ensure_consumer_group(ctx["redis_client"], AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP)
+    await ensure_consumer_group(ctx["redis_client"], ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP)
 
 async def shutdown(ctx: dict) -> None:
     """Close Redis client."""
@@ -150,6 +173,242 @@ async def consume_audit_events(ctx: dict) -> None:
 
     if entry_ids:
         await redis.xack(AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP, *entry_ids)
+
+async def _persist_intent(fields: dict) -> str:
+    """Insert one order intent. Returns 'ok' | 'duplicate' | 'failed'.
+
+    'duplicate' -> idempotency_key already persisted (safe to ack).
+    'failed'    -> a real integrity problem (e.g. bad FK) — caller must NOT ack,
+                   so reclaim can retry and eventually dead-letter it.
+    Transient errors (DB down, etc.) propagate as exceptions.
+    """
+    async with AsyncSessionLocal() as db:
+        try:
+            await create_order(
+                db,
+                user_id=int(fields["user_id"]),
+                event_id=int(fields["event_id"]),
+                quantity=int(fields["quantity"]),
+                total_price_cents=int(fields["total_price_cents"]),
+                idempotency_key=UUID(fields["idempotency_key"]),
+            )
+            await db.commit()
+            return "ok"
+        except IntegrityError:
+            await db.rollback()
+            existing = await get_order_by_idempotency_key(db, UUID(fields["idempotency_key"]))
+            return "duplicate" if existing is not None else "failed"
+
+
+async def _ack_and_remove(redis, entry_id: str) -> None:
+    """Ack the entry, then delete it from the stream so it doesn't accumulate.
+
+    XACK only clears the pending list; the entry itself lingers in the stream
+    forever unless removed. Deleting once it's safely persisted keeps
+    orders:stream bounded to roughly the un-processed backlog.
+    """
+    await redis.xack(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, entry_id)
+    await redis.xdel(ORDER_STREAM_KEY, entry_id)
+
+
+async def _consume_batch(redis, *, consumer: str = ORDER_CONSUMER_NAME, block: int | None = None) -> int:
+    """Drain one batch of new order intents. Returns how many entries were read.
+
+    One DB transaction per entry; commit before ack. A genuine integrity failure
+    (bad FK) is left un-acked so reclaim retries / dead-letters it.
+    """
+    result = await redis.xreadgroup(
+        groupname=ORDER_CONSUMER_GROUP,
+        consumername=consumer,
+        streams={ORDER_STREAM_KEY: ">"},
+        count=500,
+        block=block,
+    )
+    if not result:
+        return 0
+
+    entries = result[0][1]
+    for entry_id, fields in entries:
+        try:
+            outcome = await _persist_intent(fields)
+            if outcome in ("ok", "duplicate"):
+                await _ack_and_remove(redis, entry_id)
+            # 'failed' -> leave un-acked for reclaim_stale_order_intents
+        except Exception as exc:
+            print(f"Failed to persist order intent {entry_id}: {exc}")
+    return len(entries)
+
+
+async def consume_order_intents(ctx: dict) -> None:
+    """One non-blocking drain pass (used by tests and as a fallback)."""
+    await _consume_batch(ctx["redis_client"], block=None)
+
+
+async def run_order_consumer_loop(redis, *, block_ms: int = CONSUMER_BLOCK_MS, stop_event=None) -> None:
+    """Long-lived consumer: block-wait on the stream and drain continuously.
+
+    Run as a dedicated process (app/order_consumer.py) for near-real-time persist
+    latency instead of the 1-minute cron. block_ms lets it sleep efficiently
+    between bursts; stop_event allows graceful shutdown.
+    """
+    while stop_event is None or not stop_event.is_set():
+        try:
+            await _consume_batch(redis, consumer=ORDER_LOOP_CONSUMER_NAME, block=block_ms)
+        except Exception as exc:
+            print(f"order consumer loop error: {exc}")
+            await asyncio.sleep(1)   # avoid hot-spinning on a persistent error
+
+
+async def _dead_letter_intent(redis, entry_id: str, fields: dict) -> None:
+    """Give up on a poison intent: park it for humans, refund the seat, mark FAILED."""
+    await redis.xadd(ORDER_DEAD_LETTER_KEY, {**fields, "original_id": entry_id})
+    await release(redis, event_id=int(fields["event_id"]), quantity=int(fields["quantity"]))
+    await mark_claim_failed(redis, idempotency_key=fields["idempotency_key"])
+    print(f"DEAD-LETTER order intent {entry_id}: {dict(fields)}")
+
+
+async def reclaim_stale_order_intents(
+        ctx: dict,
+        *,
+        min_idle_ms: int = RECLAIM_IDLE_MS,
+        max_deliveries: int = MAX_DELIVERIES,
+) -> None:
+    """Recover intents stuck in the pending list (read but never acked — the
+    consumer likely crashed). Retry each; dead-letter the poison ones.
+    """
+    redis = ctx["redis_client"]
+
+    pending = await redis.xpending_range(
+        ORDER_STREAM_KEY,
+        ORDER_CONSUMER_GROUP,
+        min="-",
+        max="+",
+        count=500,
+        idle=min_idle_ms,
+    )
+    for p in pending:
+        entry_id = p["message_id"]
+        times_delivered = p["times_delivered"]
+
+        claimed = await redis.xclaim(
+            ORDER_STREAM_KEY,
+            ORDER_CONSUMER_GROUP,
+            ORDER_CONSUMER_NAME,
+            min_idle_time=min_idle_ms,
+            message_ids=[entry_id],
+        )
+        if not claimed:
+            continue
+        _, fields = claimed[0]
+
+        if times_delivered >= max_deliveries:
+            await _dead_letter_intent(redis, entry_id, fields)
+            await _ack_and_remove(redis, entry_id)
+            continue
+
+        try:
+            outcome = await _persist_intent(fields)
+            if outcome in ("ok", "duplicate"):
+                await _ack_and_remove(redis, entry_id)
+        except Exception as exc:
+            print(f"Reclaim failed for order intent {entry_id}: {exc}")
+
+async def collect_queue_stats(redis) -> dict:
+    """Current order-queue depths. backlog = unprocessed intents still in the
+    stream; dead_letter = intents given up on (should stay 0)."""
+    return {
+        "backlog": await redis.xlen(ORDER_STREAM_KEY),
+        "dead_letter": await redis.xlen(ORDER_DEAD_LETTER_KEY),
+    }
+
+METRIC_NAMESPACE_ENV_VAR = "PIPELINE_METRIC_NAMESPACE"
+METRIC_NAME_BACKLOG = "order_stream_backlog"
+METRIC_NAME_DEAD_LETTER = "order_dead_letter_depth"
+
+_METRIC_NAMESPACE = os.environ.get(METRIC_NAMESPACE_ENV_VAR)
+# Build the client only when BOTH env vars are present (the deployed worker task
+# def injects them together); either missing (e.g. local dev) → disabled. This
+# way a missing AWS_REGION degrades to "no metrics" instead of a NoRegionError at
+# import that would stop the worker booting. Short timeouts + no retries: a
+# CloudWatch stall must never wedge this once-a-minute cron (it also drives the
+# circuit breaker). Region is read from AWS_REGION by boto3.
+_cloudwatch = (
+    boto3.client(
+        "cloudwatch",
+        config=Config(connect_timeout=2, read_timeout=3, retries={"total_max_attempts": 1}),
+    )
+    if _METRIC_NAMESPACE and os.environ.get("AWS_REGION")
+    else None
+)
+
+async def _publish_pipeline_gauges(backlog: int, dead_letter: int) -> None:
+    if _cloudwatch is None:
+        return
+    try:
+        await asyncio.to_thread(
+            _cloudwatch.put_metric_data,
+            Namespace=_METRIC_NAMESPACE,
+            MetricData=[
+                {
+                    "MetricName": METRIC_NAME_BACKLOG,
+                    "Value": backlog,
+                    "Unit": "Count",
+                },
+                {
+                    "MetricName": METRIC_NAME_DEAD_LETTER,
+                    "Value": dead_letter,
+                    "Unit": "Count",
+                },
+            ],
+        )
+    except Exception as exc:
+        print(f"WARN pipeline metric publish failed: {exc}")
+
+
+
+async def report_queue_depth(ctx: dict) -> dict:
+    """Cron: log a smoke-alarm when the dead-letter stream is non-empty or the
+    backlog is climbing. (Grafana reads the same depths via the API /metrics.)"""
+    stats = await collect_queue_stats(ctx["redis_client"])
+    await _publish_pipeline_gauges(stats["backlog"], stats["dead_letter"])
+    if stats["dead_letter"] > 0:
+        print(f"ALERT order dead-letter depth={stats['dead_letter']} — orders failing permanently")
+    if stats["backlog"] > BACKLOG_WARN:
+        print(f"WARN order backlog={stats['backlog']} — consumers may be falling behind")
+
+    # Circuit breaker: pause the waiting room's admission when the order pipeline is
+    # unhealthy, so we stop feeding new buyers into a system that can't keep up.
+    settings = get_settings()
+    unhealthy = (
+        stats["dead_letter"] > settings.ADMISSION_PAUSE_DEAD_LETTER_THRESHOLD
+        or stats["backlog"] > settings.ADMISSION_PAUSE_BACKLOG_THRESHOLD
+    )
+    await set_admission_paused(ctx["redis_client"], unhealthy)
+    if unhealthy:
+        print(f"CIRCUIT-BREAKER admission paused (backlog={stats['backlog']}, dead_letter={stats['dead_letter']})")
+    return stats
+
+
+async def detect_inventory_drift(ctx: dict) -> list[dict]:
+    """比對每個 published event 的 Redis 庫存 vs Postgres 應有值,不一致就記錄。"""
+    redis = ctx["redis_client"]
+    backlog, dead = await queue_depth(redis)                    # ← 新增:先問排空了嗎
+    if backlog or dead:
+        print(f"drift check skipped: queue not drained (backlog={backlog}, dead_letter={dead})")
+        return []      
+    drifts: list[dict] = []
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(Event.id).where(Event.status == EventStatus.PUBLISHED)
+        )
+        for event_id in result.scalars().all():
+            expected = await compute_expected_available(db, event_id=event_id)
+            actual = await get_available(redis, event_id=event_id)
+            if expected != actual:
+                drifts.append({"event_id":event_id, "expected": expected, "actual":actual})
+                print(f"INVENTORY DRIFT event={event_id} redis={actual} expected={expected}")
+
+    return drifts
         
 class WorkerSettings:
     """ARQ worker config. Launch: `arq app.worker.WorkerSettings`"""
@@ -163,5 +422,12 @@ class WorkerSettings:
         cron(expire_pending_orders, minute={i for i in range(60)}),
         cron(purge_expired_refresh_tokens, hour={3}, minute={0}),
         cron(consume_audit_events, minute={i for i in range(60)}),
+        # order intents are drained by the dedicated app.order_consumer process
+        # (near-real-time); the ARQ worker only runs the reclaim safety net.
+        cron(reclaim_stale_order_intents, minute={i for i in range(60)}),
+        cron(report_queue_depth, minute={i for i in range(60)}),
         cron(purge_old_audit_logs, hour={2}, minute={30}),
+        cron(detect_inventory_drift, minute=set(range(0, 60, 5))),
+
     ]
+

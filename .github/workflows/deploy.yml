@@ -1,0 +1,50 @@
+name: deploy
+
+# Push to main → build the image, push to ECR, roll the ECS services.
+on:
+  push:
+    branches: [main]
+
+# id-token: write is REQUIRED for OIDC (GitHub mints the token AWS trusts).
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-2
+  CLUSTER: justin-test
+  ECR_REPO: 992382571445.dkr.ecr.ap-northeast-2.amazonaws.com/justin-test
+  ROLE_ARN: arn:aws:iam::992382571445:role/justin-test-github-actions
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest # x86_64 runner → native build (task defs are X86_64)
+    steps:
+      - uses: actions/checkout@v4
+
+      # Swap the OIDC token for 15-min AWS creds — no stored access keys.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Tag with the commit SHA (identifiable/rollback-able) AND latest (what the
+      # task defs pull). Native x86 build on the runner — no QEMU.
+      - name: Build & push image
+        run: |
+          docker build -t "$ECR_REPO:$GITHUB_SHA" -t "$ECR_REPO:latest" .
+          docker push "$ECR_REPO:$GITHUB_SHA"
+          docker push "$ECR_REPO:latest"
+
+      # force-new-deployment makes each service pull the new :latest and roll.
+      - name: Roll ECS services
+        run: |
+          for s in api consumer worker; do
+            aws ecs update-service --cluster "$CLUSTER" --service "$CLUSTER-$s" \
+              --force-new-deployment --region "$AWS_REGION" >/dev/null
+            echo "rolled $CLUSTER-$s"
+          done

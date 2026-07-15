@@ -1,0 +1,9 @@
+# Copy to terraform.tfvars (gitignored) and fill real values.
+# admin_cidr: your laptop public IP -> curl https://checkip.amazonaws.com
+admin_cidr = "1.2.3.4/32"
+
+# App secrets — copy from your .env / shell env:
+app_secret_key        = "your-SECRET_KEY"
+pii_kek_base64        = "your-PII_KEK_BASE64"
+pii_lookup_key_base64 = "your-PII_LOOKUP_KEY_BASE64"
+stripe_secret_key     = "your-STRIPE_SECRET_KEY"

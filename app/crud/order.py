@@ -1,10 +1,21 @@
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exceptions import InvalidOrderTransition
 from app.models.order import Order, OrderStatus
+
+
+# 訂單狀態機:每個狀態能合法轉移到哪些狀態。空集合 = 終態。
+_VALID_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
+    OrderStatus.PENDING:   {OrderStatus.PAID, OrderStatus.EXPIRED, OrderStatus.CANCELLED},
+    OrderStatus.PAID:      {OrderStatus.CONFIRMED},   # 付款後只能確認,不能取消/逾時
+    OrderStatus.CONFIRMED: set(),                     # 終態,不能退
+    OrderStatus.EXPIRED:   set(),                     # 終態
+    OrderStatus.CANCELLED: set(),                     # 終態
+}
 
 
 async def create_order(
@@ -37,19 +48,34 @@ async def get_order_by_id(
     return await db.get(Order, order_id)
 
 
+async def get_order_by_idempotency_key(
+        db: AsyncSession,
+        idempotency_key: UUID,
+) -> Order | None:
+    """Look up an order by its idempotency_key (UNIQUE, indexed)."""
+    stmt = select(Order).where(Order.idempotency_key == idempotency_key)
+    return (await db.execute(stmt)).scalar_one_or_none()
+
+
 async def list_orders_for_user(
         db: AsyncSession,
         user_id: int,
         *,
         limit: int = 50,
+        cursor: tuple[datetime, int] | None = None,
 ) -> list[Order]:
-    """Recent orders for a user, newest first."""
-    stmt = (
-        select(Order)
-        .where(Order.user_id == user_id)
-        .order_by(Order.created_at.desc())
-        .limit(limit)
-    )
+    """Recent orders for a user, newest first.
+
+    Keyset pagination: pass the previous page's last (created_at, id) as `cursor`
+    to get the next (older) page. Uses a row-value comparison so it maps to a
+    single index range scan on ix_orders_user_created (user_id, created_at, id) —
+    constant cost regardless of how deep the page is, and stable under new inserts.
+    """
+    stmt = select(Order).where(Order.user_id == user_id)
+    if cursor is not None:
+        # (created_at, id) < (cur_created_at, cur_id) — id breaks created_at ties
+        stmt = stmt.where(tuple_(Order.created_at, Order.id) < cursor)
+    stmt = stmt.order_by(Order.created_at.desc(), Order.id.desc()).limit(limit)
     result = await db.execute(stmt)
     return list(result.scalars().all())
 
@@ -60,7 +86,13 @@ async def transition_order_status(
         order: Order,
         new_status: OrderStatus,
 ) -> None:
-    """Set status and matching timestamp. No transition validation."""
+    """Set status and matching timestamp. Rejects illegal state transitions."""
+    if new_status not in _VALID_TRANSITIONS[order.status]:
+        raise InvalidOrderTransition(
+            order_id=order.id,
+            from_status=order.status.value,
+            to_status=new_status.value,
+        )
     now = datetime.now(timezone.utc)
     order.status = new_status
     if new_status == OrderStatus.PAID:

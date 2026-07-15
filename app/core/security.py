@@ -48,6 +48,23 @@ def create_access_token(
         algorithm=setting.ALGORITHM,
     )
 
+def create_admission_token(*, user_id: int, event_id: int, ttl_seconds: int) -> str:
+    """Short-lived, single-use pass proving the user was admitted to buy `event_id`.
+    Signed with the app secret (HS256); the order endpoint verifies it before reserving.
+    """
+    settings = get_settings()
+    now = datetime.now(timezone.utc)
+    payload: dict[str, Any] = {
+        "sub": str(user_id),
+        "event_id": event_id,
+        "typ": "admission",
+        "jti": secrets.token_urlsafe(16),      # unique id → single-use enforcement in Redis
+        "iat": now,
+        "exp": now + timedelta(seconds=ttl_seconds),
+    }
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+
+
 _DUMMY_PASSWORD_HASH = get_password_hash("dummy-password-for-timing-defense")
 
 def constant_time_dummy_verify(password: str)   -> None:

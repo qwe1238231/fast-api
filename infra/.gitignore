@@ -1,0 +1,14 @@
+# Terraform state can contain secrets (DB passwords, etc.) — never commit it.
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+
+# tfvars may hold secrets; commit a *.tfvars.example instead.
+# (.gitignore has NO inline comments — the # must be on its own line, or the
+#  whole rest of the line becomes part of the pattern and matches nothing.)
+*.tfvars
+!*.tfvars.example
+
+# Keep the provider lock file committed (pins versions) — do NOT ignore it:
+!.terraform.lock.hcl

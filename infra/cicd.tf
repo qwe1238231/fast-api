@@ -9,11 +9,15 @@ variable "github_repo" {
   default     = "qwe1238231/fast-api"
 }
 
-# 1) Tell AWS to trust GitHub's OIDC issuer. thumbprint_list is omitted on
-#    purpose — for this well-known endpoint the AWS provider fills it in.
-resource "aws_iam_openid_connect_provider" "github" {
-  url            = "https://token.actions.githubusercontent.com"
-  client_id_list = ["sts.amazonaws.com"]
+# 1) The GitHub OIDC provider is ACCOUNT-GLOBAL (one per URL) and ALREADY EXISTS
+#    in this shared account (another project created it), so we REFERENCE it via
+#    a data source instead of creating it. Two reasons: (a) creating a duplicate
+#    is a 409 error; (b) if we owned it, `terraform destroy` would delete a
+#    provider other projects depend on. NOTE: the existing provider must list
+#    "sts.amazonaws.com" as an audience (client_id) or the assume will fail at
+#    deploy — standard for GitHub↔AWS OIDC, so almost certainly already set.
+data "aws_iam_openid_connect_provider" "github" {
+  url = "https://token.actions.githubusercontent.com"
 }
 
 # 2) Trust policy: ONLY runs of <repo> on refs/heads/main may assume this role.
@@ -24,7 +28,7 @@ data "aws_iam_policy_document" "github_assume" {
     actions = ["sts:AssumeRoleWithWebIdentity"]
     principals {
       type        = "Federated"
-      identifiers = [aws_iam_openid_connect_provider.github.arn]
+      identifiers = [data.aws_iam_openid_connect_provider.github.arn]
     }
     condition {
       test     = "StringEquals"

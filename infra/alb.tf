@@ -7,7 +7,7 @@ resource "aws_lb" "main" {
   load_balancer_type = "application"
   internal           = false
   security_groups    = [aws_security_group.alb.id] # public 80/443 in
-  subnets            = aws_subnet.public[*].id      # ALB spans the 2 public subnets
+  subnets            = aws_subnet.public[*].id     # ALB spans the 2 public subnets
   tags               = { Name = "${var.project}-alb" }
 }
 

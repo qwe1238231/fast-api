@@ -3,7 +3,16 @@
 # is free; you pay per-task vCPU/memory-seconds while tasks run.
 
 resource "aws_ecs_cluster" "main" {
-  name = "${var.project}"
+  name = var.project
+
+  # Publishes the ECS/ContainerInsights namespace (RunningTaskCount etc.) that
+  # the task-count alarms need — the default AWS/ECS namespace has no task count.
+  # "enabled" is the standard (cheaper) tier; bills per ingested metric/log.
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
   tags = { Name = "${var.project}" }
 }
 

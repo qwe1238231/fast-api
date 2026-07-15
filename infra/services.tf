@@ -52,6 +52,15 @@ resource "aws_ecs_service" "worker" {
   desired_count   = 1 # SINGLETON — the ARQ crons must not double-fire
   launch_type     = "FARGATE"
 
+  # Enforce the singleton ACROSS DEPLOYS. The Fargate default (max 200% / min
+  # 100%) would start the new task before stopping the old one → 2 workers run
+  # briefly → crons double-fire (double seat release → oversell). max 100% / min
+  # 0% flips it to stop-old-then-start-new: a brief gap with 0 workers (fine for
+  # periodic crons) instead of an overlap. The duplicate-task alarm backstops
+  # the rare edge cases this can't prevent (e.g. a task stuck terminating).
+  deployment_maximum_percent         = 100
+  deployment_minimum_healthy_percent = 0
+
   network_configuration {
     subnets          = aws_subnet.public[*].id
     security_groups  = [aws_security_group.app.id]

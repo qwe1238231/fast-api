@@ -48,3 +48,12 @@ variable "stripe_secret_key" {
   type        = string
   sensitive   = true
 }
+
+# --- Monitoring -------------------------------------------------------------
+# Not sensitive (an email address isn't a credential) and intentionally has NO
+# default: an alert channel pointing nowhere is worse than a hard failure, so
+# terraform errors out until you set it in terraform.tfvars.
+variable "alert_email" {
+  description = "Address that receives all CloudWatch alarm notifications via SNS. After apply you MUST click the confirmation link SNS emails here before any alert is delivered."
+  type        = string
+}

@@ -27,10 +27,32 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# Task role — the app's own identity inside the container. No policies yet
-# (the app makes no AWS API calls until Phase F wires Secrets Manager).
+# Task role — the app's own identity inside the container, for AWS API calls the
+# CODE makes at runtime. (App secrets are injected via the EXECUTION role's
+# valueFrom, not here.) The worker's report_queue_depth cron publishes pipeline
+# depth gauges to CloudWatch, so it needs PutMetricData.
 resource "aws_iam_role" "ecs_task" {
   name               = "${var.project}-ecs-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_assume.json
   tags               = { Name = "${var.project}-ecs-task" }
+}
+
+# PutMetricData has NO resource-level ARN (resources must be "*"), so we scope it
+# with a condition on the metric namespace instead of granting blanket access.
+data "aws_iam_policy_document" "ecs_task_metrics" {
+  statement {
+    actions   = ["cloudwatch:PutMetricData"]
+    resources = ["*"]
+    condition {
+      test     = "StringEquals"
+      variable = "cloudwatch:namespace"
+      values   = ["${var.project}/pipeline"]
+    }
+  }
+}
+
+resource "aws_iam_role_policy" "ecs_task_metrics" {
+  name   = "${var.project}-ecs-task-metrics"
+  role   = aws_iam_role.ecs_task.id
+  policy = data.aws_iam_policy_document.ecs_task_metrics.json
 }

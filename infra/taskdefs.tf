@@ -82,12 +82,12 @@ resource "aws_ecs_task_definition" "consumer" {
   }
 
   container_definitions = jsonencode([{
-    name        = "consumer"
-    image       = local.image
-    essential   = true
-    command     = ["python", "-m", "app.order_consumer"] # override CMD; no port
-    environment = [local.redis_env]
-    secrets     = local.app_secrets
+    name             = "consumer"
+    image            = local.image
+    essential        = true
+    command          = ["python", "-m", "app.order_consumer"] # override CMD; no port
+    environment      = [local.redis_env]
+    secrets          = local.app_secrets
     logConfiguration = { logDriver = "awslogs", options = local.log_options.consumer }
   }])
 
@@ -110,12 +110,20 @@ resource "aws_ecs_task_definition" "worker" {
   }
 
   container_definitions = jsonencode([{
-    name        = "worker"
-    image       = local.image
-    essential   = true
-    command     = ["arq", "app.worker.WorkerSettings"] # override CMD; no port
-    environment = [local.redis_env]
-    secrets     = local.app_secrets
+    name      = "worker"
+    image     = local.image
+    essential = true
+    command   = ["arq", "app.worker.WorkerSettings"] # override CMD; no port
+    # report_queue_depth publishes pipeline gauges via boto3 PutMetricData:
+    #  - AWS_REGION: Fargate does NOT auto-set it; boto3 needs a region.
+    #  - PIPELINE_METRIC_NAMESPACE: keeps the project-scoped namespace out of app
+    #    code (must match the IAM condition + the alarm namespace).
+    environment = [
+      local.redis_env,
+      { name = "AWS_REGION", value = var.region },
+      { name = "PIPELINE_METRIC_NAMESPACE", value = "${var.project}/pipeline" },
+    ]
+    secrets          = local.app_secrets
     logConfiguration = { logDriver = "awslogs", options = local.log_options.worker }
   }])
 

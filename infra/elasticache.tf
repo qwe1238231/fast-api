@@ -16,13 +16,30 @@ resource "aws_elasticache_subnet_group" "main" {
   subnet_ids = aws_subnet.private[*].id
 }
 
+# This Redis holds durable-ish 搶票 state (order stream, inventory reserves,
+# waiting-room tokens), so on OOM we want writes to FAIL LOUDLY — the app's
+# circuit breaker + admission pause are built to shed that load — instead of the
+# default volatile-lru SILENTLY evicting TTL-bearing keys (a lost reserve/token
+# = a correctness bug). maxmemory-policy is a dynamic parameter (no reboot).
+resource "aws_elasticache_parameter_group" "main" {
+  name   = "${var.project}-redis7"
+  family = "redis7"
+
+  parameter {
+    name  = "maxmemory-policy"
+    value = "noeviction"
+  }
+
+  tags = { Name = "${var.project}-redis7" }
+}
+
 resource "aws_elasticache_cluster" "main" {
   cluster_id           = "${var.project}-redis"
   engine               = "redis"
   engine_version       = "7.1"
   node_type            = "cache.t4g.micro"
   num_cache_nodes      = 1
-  parameter_group_name = "default.redis7"
+  parameter_group_name = aws_elasticache_parameter_group.main.name
   port                 = 6379
   subnet_group_name    = aws_elasticache_subnet_group.main.name
   security_group_ids   = [aws_security_group.redis.id]

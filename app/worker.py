@@ -4,6 +4,9 @@ Run: arq app.worker.WorkerSettings
 """
 import asyncio
 import json
+import os
+import boto3
+from botocore.config import Config
 from datetime import timedelta, timezone, datetime
 from uuid import UUID
 
@@ -295,7 +298,7 @@ async def reclaim_stale_order_intents(
             message_ids=[entry_id],
         )
         if not claimed:
-            continue   # another worker grabbed it first
+            continue
         _, fields = claimed[0]
 
         if times_delivered >= max_deliveries:
@@ -307,7 +310,6 @@ async def reclaim_stale_order_intents(
             outcome = await _persist_intent(fields)
             if outcome in ("ok", "duplicate"):
                 await _ack_and_remove(redis, entry_id)
-            # 'failed' -> leave; a later reclaim retries until max_deliveries, then dead-letters
         except Exception as exc:
             print(f"Reclaim failed for order intent {entry_id}: {exc}")
 
@@ -319,11 +321,56 @@ async def collect_queue_stats(redis) -> dict:
         "dead_letter": await redis.xlen(ORDER_DEAD_LETTER_KEY),
     }
 
+METRIC_NAMESPACE_ENV_VAR = "PIPELINE_METRIC_NAMESPACE"
+METRIC_NAME_BACKLOG = "order_stream_backlog"
+METRIC_NAME_DEAD_LETTER = "order_dead_letter_depth"
+
+_METRIC_NAMESPACE = os.environ.get(METRIC_NAMESPACE_ENV_VAR)
+# Build the client only when BOTH env vars are present (the deployed worker task
+# def injects them together); either missing (e.g. local dev) → disabled. This
+# way a missing AWS_REGION degrades to "no metrics" instead of a NoRegionError at
+# import that would stop the worker booting. Short timeouts + no retries: a
+# CloudWatch stall must never wedge this once-a-minute cron (it also drives the
+# circuit breaker). Region is read from AWS_REGION by boto3.
+_cloudwatch = (
+    boto3.client(
+        "cloudwatch",
+        config=Config(connect_timeout=2, read_timeout=3, retries={"total_max_attempts": 1}),
+    )
+    if _METRIC_NAMESPACE and os.environ.get("AWS_REGION")
+    else None
+)
+
+async def _publish_pipeline_gauges(backlog: int, dead_letter: int) -> None:
+    if _cloudwatch is None:
+        return
+    try:
+        await asyncio.to_thread(
+            _cloudwatch.put_metric_data,
+            Namespace=_METRIC_NAMESPACE,
+            MetricData=[
+                {
+                    "MetricName": METRIC_NAME_BACKLOG,
+                    "Value": backlog,
+                    "Unit": "Count",
+                },
+                {
+                    "MetricName": METRIC_NAME_DEAD_LETTER,
+                    "Value": dead_letter,
+                    "Unit": "Count",
+                },
+            ],
+        )
+    except Exception as exc:
+        print(f"WARN pipeline metric publish failed: {exc}")
+
+
 
 async def report_queue_depth(ctx: dict) -> dict:
     """Cron: log a smoke-alarm when the dead-letter stream is non-empty or the
     backlog is climbing. (Grafana reads the same depths via the API /metrics.)"""
     stats = await collect_queue_stats(ctx["redis_client"])
+    await _publish_pipeline_gauges(stats["backlog"], stats["dead_letter"])
     if stats["dead_letter"] > 0:
         print(f"ALERT order dead-letter depth={stats['dead_letter']} — orders failing permanently")
     if stats["backlog"] > BACKLOG_WARN:

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import select, tuple_
+from sqlalchemy import select, tuple_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import InvalidOrderTransition
@@ -15,6 +15,14 @@ _VALID_TRANSITIONS: dict[OrderStatus, set[OrderStatus]] = {
     OrderStatus.CONFIRMED: set(),                     # 終態,不能退
     OrderStatus.EXPIRED:   set(),                     # 終態
     OrderStatus.CANCELLED: set(),                     # 終態
+}
+
+# 每個目標狀態對應要蓋的時間戳欄位。
+_STATUS_TIMESTAMP: dict[OrderStatus, str] = {
+    OrderStatus.PAID:      "paid_at",
+    OrderStatus.CONFIRMED: "confirmed_at",
+    OrderStatus.EXPIRED:   "expired_at",
+    OrderStatus.CANCELLED: "cancelled_at",
 }
 
 
@@ -85,22 +93,45 @@ async def transition_order_status(
         db: AsyncSession,
         order: Order,
         new_status: OrderStatus,
-) -> None:
-    """Set status and matching timestamp. Rejects illegal state transitions."""
-    if new_status not in _VALID_TRANSITIONS[order.status]:
+) -> bool:
+    """Compare-and-swap the order to `new_status`. Returns True iff applied.
+
+    Two outcomes are distinguished on purpose:
+      - ILLEGAL transition (e.g. CONFIRMED->PENDING): a programming bug -> raises
+        InvalidOrderTransition.
+      - LEGAL transition that LOST a race (the row already moved out of the state
+        we read): returns False, so the caller can skip (expire cron) or map it
+        to 409 (endpoint) WITHOUT treating a normal race as an error.
+
+    The UPDATE carries `WHERE status = <expected>`, so it only applies while the
+    row is STILL in the state we read. A bare `UPDATE ... WHERE id=N` (the old
+    code) let a concurrent writer be silently overwritten — e.g. /pay committing
+    just as the expire cron fires flips a paid order to EXPIRED and re-releases
+    its seat (oversell). We never mutate the ORM `order` attributes by hand (that
+    would mark it dirty and flush a SECOND, unpredicated UPDATE — the same race);
+    instead we refresh it from the row we just conditionally updated so the caller
+    sees the new state.
+    """
+    expected = order.status
+    if new_status not in _VALID_TRANSITIONS[expected]:
         raise InvalidOrderTransition(
             order_id=order.id,
-            from_status=order.status.value,
+            from_status=expected.value,
             to_status=new_status.value,
         )
+
     now = datetime.now(timezone.utc)
-    order.status = new_status
-    if new_status == OrderStatus.PAID:
-        order.paid_at = now
-    elif new_status == OrderStatus.CONFIRMED:
-        order.confirmed_at = now
-    elif new_status == OrderStatus.EXPIRED:
-        order.expired_at = now
-    elif new_status == OrderStatus.CANCELLED:
-        order.cancelled_at = now
-    await db.flush()
+    ts_attr = _STATUS_TIMESTAMP[new_status]
+    result = await db.execute(
+        update(Order)
+        .where(Order.id == order.id, Order.status == expected)
+        .values(status=new_status, **{ts_attr: now})
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        return False  # lost the race: the row already left `expected`
+
+    # Reload the identity-map object from the row we just wrote so the caller sees
+    # the new status/timestamp. (expire_on_commit=False keeps it valid post-commit.)
+    await db.refresh(order)
+    return True

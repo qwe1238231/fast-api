@@ -19,36 +19,50 @@ from app.services.inventory import release, reserve_and_enqueue, ReserveOutcome,
 from app.models.event import EventStatus
 from app.services.event_cache import get_event_meta
 
-async def mark_paid(db: AsyncSession, order: Order) -> None:
-    """Transition PENDING -> PAID."""
-    await transition_order_status(db, order, OrderStatus.PAID)
+async def mark_paid(db: AsyncSession, order: Order) -> bool:
+    """CAS PENDING -> PAID. Returns True iff applied (False = order left PENDING)."""
+    return await transition_order_status(db, order, OrderStatus.PAID)
 
 
-async def mark_confirmed(db: AsyncSession, order: Order) -> None:
-    """Transition PAID -> CONFIRMED."""
-    await transition_order_status(db, order, OrderStatus.CONFIRMED)
+async def mark_confirmed(db: AsyncSession, order: Order) -> bool:
+    """CAS PAID -> CONFIRMED. Returns True iff applied."""
+    return await transition_order_status(db, order, OrderStatus.CONFIRMED)
 
 
-async def cancel_order(
-        db: AsyncSession,
-        redis: RedisClient,
-        order: Order
-) -> None:
-    """Cancel an order, Releases reserved inventory."""
-    await transition_order_status(db, order, OrderStatus.CANCELLED)
-    await release(redis, event_id=order.event_id, quantity=order.quantity)
+async def cancel_order(db: AsyncSession, order: Order) -> bool:
+    """CAS PENDING -> CANCELLED. Returns True iff applied.
+
+    Like expire_order, the seat release is a POST-COMMIT step owned by the caller
+    (the endpoint): pair a True return with `db.commit()` then release_order_seat().
+    """
+    return await transition_order_status(db, order, OrderStatus.CANCELLED)
 
 
-async def expire_order(
-        db: AsyncSession,
-        redis: RedisClient,
-        order: Order,
-) -> None:
-    """Mark order as expired due to payment timeout. Releases inventory."""
-    await transition_order_status(db, order, OrderStatus.EXPIRED)
-    await release(redis, event_id=order.event_id, quantity=order.quantity
-)
-    
+async def expire_order(db: AsyncSession, order: Order) -> bool:
+    """CAS the order PENDING -> EXPIRED. Returns True iff applied.
+
+    The seat release is deliberately NOT done here: it must happen AFTER the
+    caller commits (a rolled-back transition must never leave a released seat),
+    and the commit is owned by the caller (the expire cron). The caller pairs a
+    True return with `db.commit()` then `release_order_seat()`.
+    """
+    return await transition_order_status(db, order, OrderStatus.EXPIRED)
+
+
+async def release_order_seat(redis: RedisClient, order: Order) -> bool:
+    """Idempotently return an order's seat to inventory — a POST-COMMIT step.
+
+    Keyed by the order id, so the same order's seat is returned at most once
+    (guards double-release across cancel/expire/retries/crashes). Returns True
+    if this call actually returned the seat, False if it was already released.
+    """
+    return await release(
+        redis,
+        event_id=order.event_id,
+        quantity=order.quantity,
+        marker=f"order:{order.id}",
+    )
+
 
 async def submit_order(
         db: AsyncSession,

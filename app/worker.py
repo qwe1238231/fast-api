@@ -19,7 +19,7 @@ from app.core.config import get_settings
 from app.core.redis import create_redis_client
 from app.db.session import AsyncSessionLocal
 from app.models.order import Order, OrderStatus
-from app.services.orders import expire_order
+from app.services.orders import expire_order, release_order_seat
 from app.crud.order import create_order, get_order_by_idempotency_key
 from app.crud.refresh_token import purge_expired
 from app.models.audit_log import AuditLog
@@ -48,9 +48,12 @@ BACKLOG_WARN = _settings.ORDER_BACKLOG_WARN            # log a warning above thi
 
 async def expire_pending_orders(ctx: dict) -> None:
     """Cron job: expire pending orders older than PENDING_TIMEOUT_MINUTES.
-    
-    Each order processed in its own DB transaction — one failure doesn't
-    abort the batch.
+
+    Each order in its own DB transaction — one failure doesn't abort the batch.
+    The seat release is a POST-COMMIT, idempotent step: commit the EXPIRED
+    transition first (so a rollback never leaves a freed seat), then return the
+    seat. A CAS miss (the order was paid/cancelled meanwhile) is skipped, not an
+    error — its new owner is responsible for the seat.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=PENDING_TIMEOUT_MINUTES)
     redis = ctx["redis_client"]
@@ -64,17 +67,25 @@ async def expire_pending_orders(ctx: dict) -> None:
         result = await read_db.execute(stmt)
         order_ids = list(result.scalars().all())
 
-        for order_id in order_ids:
-            async with AsyncSessionLocal() as db:
-                try:
-                    order = await db.get(Order, order_id)
-                    if order is None or order.status != OrderStatus.PENDING:
-                        continue  # skip if already processed by another worker
-                    await expire_order(db, redis, order)
-                    await db.commit()
-                except Exception as exc:
-                    await db.rollback()
-                    print(f"Failed to expire order {order_id}: {exc}")
+    for order_id in order_ids:
+        async with AsyncSessionLocal() as db:
+            try:
+                order = await db.get(Order, order_id)
+                if order is None or order.status != OrderStatus.PENDING:
+                    continue  # cheap early-out; the CAS in expire_order is the real guard
+                if not await expire_order(db, order):
+                    continue  # lost the race (just paid/cancelled) — skip, don't release
+                await db.commit()
+            except Exception as exc:
+                await db.rollback()
+                print(f"Failed to expire order {order_id}: {exc}")
+                continue
+            # committed EXPIRED — return the seat post-commit (idempotent, own step).
+            # order.* stays readable after commit because expire_on_commit=False.
+            try:
+                await release_order_seat(redis, order)
+            except Exception as exc:
+                print(f"Order {order_id} expired but seat release failed (reconcile recovers): {exc}")
 
 async def purge_expired_refresh_tokens(ctx: dict) -> None:
     """Cron job: purge expired refresh tokens."""
@@ -260,11 +271,32 @@ async def run_order_consumer_loop(redis, *, block_ms: int = CONSUMER_BLOCK_MS, s
 
 
 async def _dead_letter_intent(redis, entry_id: str, fields: dict) -> None:
-    """Give up on a poison intent: park it for humans, refund the seat, mark FAILED."""
+    """Give up on a poison intent: park it for humans, refund the seat IFF it was
+    never persisted, mark the claim FAILED.
+
+    The refund is guarded two ways so it can never oversell:
+      - DB existence check: if the order row already exists (it committed but the
+        consumer crashed before ack, then reclaim exhausted its deliveries), the
+        order legitimately holds its seat -> do NOT refund.
+      - idempotent release (marker dl:{key}): a replayed dead-letter (crash before
+        the ack) can't double-refund.
+    (A replay can still XADD a duplicate dead-letter entry — cosmetic; the dead
+    stream's lifecycle is batch 2.)
+    """
+    idem = fields["idempotency_key"]
+    async with AsyncSessionLocal() as db:
+        already_persisted = await get_order_by_idempotency_key(db, UUID(idem)) is not None
+
     await redis.xadd(ORDER_DEAD_LETTER_KEY, {**fields, "original_id": entry_id})
-    await release(redis, event_id=int(fields["event_id"]), quantity=int(fields["quantity"]))
-    await mark_claim_failed(redis, idempotency_key=fields["idempotency_key"])
-    print(f"DEAD-LETTER order intent {entry_id}: {dict(fields)}")
+    if not already_persisted:
+        await release(
+            redis,
+            event_id=int(fields["event_id"]),
+            quantity=int(fields["quantity"]),
+            marker=f"dl:{idem}",
+        )
+    await mark_claim_failed(redis, idempotency_key=idem)
+    print(f"DEAD-LETTER order intent {entry_id} (persisted={already_persisted}): {dict(fields)}")
 
 
 async def reclaim_stale_order_intents(

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Header, status, HTTPException, Query
 from app.api.deps import CurrentUser, DbSession, Redis, Stripe
 from app.models.order import Order, OrderStatus
 from app.schemas.order import OrderCreate, OrderResponse, OrderAcceptedResponse, OrderStatusResponse, OrderPollState, OrderPage
-from app.services.orders import submit_order, cancel_order as cancel_order_service, mark_confirmed, mark_paid
+from app.services.orders import submit_order, cancel_order as cancel_order_service, mark_confirmed, mark_paid, release_order_seat
 from app.services.idempotency import get_claim_state, CLAIM_PENDING, CLAIM_FAILED
 from app.core.exceptions import OrderNotFound, InvalidOrderTransition
 from app.crud.order import get_order_by_id, get_order_by_idempotency_key, list_orders_for_user
@@ -141,9 +141,16 @@ async def pay_order(
     if order is None or order.user_id != current_user.id:
         raise OrderNotFound(order_id=order_id)
     
-    await mark_paid(db, order)
-    await mark_confirmed(db, order)
-
+    # CAS PENDING->PAID: False means the order left PENDING (e.g. the expire cron
+    # got it first) -> 409, do NOT proceed. This is the /pay half of the
+    # expire-vs-pay race; the CAS in transition_order_status makes the two writers
+    # serialize instead of blindly overwriting each other.
+    if not await mark_paid(db, order):
+        await db.refresh(order)   # read the real current status for the 409 detail
+        raise InvalidOrderTransition(
+            order_id=order_id, from_status=order.status.value, to_status="paid",
+        )
+    await mark_confirmed(db, order)   # same txn: our own PAID is visible -> applies
     await db.commit()
 
 @router.post("/{order_id}/cancel", status_code=status.HTTP_204_NO_CONTENT)
@@ -158,8 +165,18 @@ async def cancel_order(
     if order is None or order.user_id != current_user.id:
         raise OrderNotFound (order_id=order_id)
     
-    await cancel_order_service(db, redis, order)
+    if not await cancel_order_service(db, order):
+        await db.refresh(order)
+        raise InvalidOrderTransition(
+            order_id=order_id, from_status=order.status.value, to_status="cancelled",
+        )
     await db.commit()
+    # post-commit, idempotent seat return; a failure here is a recoverable lost
+    # seat (reconcile), NOT a failed cancel -> log, don't 500 the client.
+    try:
+        await release_order_seat(redis, order)
+    except Exception as exc:
+        print(f"Order {order_id} cancelled but seat release failed (reconcile recovers): {exc}")
 
 @router.post("/{order_id}/payment-intent", response_model=PaymentIntentResponse)
 async def create_order_payment_intent(

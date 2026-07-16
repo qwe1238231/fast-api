@@ -26,6 +26,10 @@ def _key(event_id: int) -> str:
     """Key for an event's available seat counter."""
     return f"event:{event_id}:available"
 
+def _released_key(marker: str) -> str:
+    """Idempotency marker for a single release event (guards double-release)."""
+    return f"released:{marker}"
+
 async def queue_depth(redis: Redis) -> tuple[int, int]:
     """回傳 (backlog, dead_letter):尚未落帳的 order intents、與永久失敗的。
     兩者皆為 0 代表 DB 已追上 Redis,是『DB 此刻可信』的訊號。
@@ -113,14 +117,49 @@ async def reserve(
             available=available,
         )
     
+# Atomic idempotent release: mark-then-return-seats, all-or-nothing.
+# KEYS[1]=released marker   KEYS[2]=stock key
+# ARGV[1]=quantity          ARGV[2]=marker TTL seconds
+# The SETNX marker makes a replayed release (crash between commit and release,
+# stream re-delivery, double cancel) a no-op — seats are returned at most once.
+# Returns the new available count on the first release, or -1 if already released.
+_RELEASE_LUA = """
+if redis.call('SET', KEYS[1], '1', 'NX', 'EX', tonumber(ARGV[2])) then
+    return redis.call('INCRBY', KEYS[2], tonumber(ARGV[1]))
+end
+return -1
+"""
+
+# Registered once on first use (same pattern as the reserve script).
+_release_script: AsyncScript | None = None
+
+
 async def release(
         redis: Redis,
         *,
         event_id: int,
         quantity: int,
-) -> None:
-    """Return `quantity` seats to inventory (order expired/cancelled)."""
-    await redis.incrby(_key(event_id), quantity)
+        marker: str,
+        ttl_seconds: int = 86400,
+) -> bool:
+    """Return `quantity` seats to inventory — idempotently.
+
+    `marker` uniquely identifies THIS release event; the `released:{marker}`
+    SETNX guard returns the seats at most once even if the call is replayed
+    (a crash between commit and release, a reclaimed stream entry, a double
+    cancel). Use "order:{id}" for expire/cancel and "dl:{idempotency_key}" for
+    dead-letter. Returns True if this call actually returned the seats, False
+    if it was a no-op because they were already released.
+    """
+    global _release_script
+    if _release_script is None:
+        _release_script = redis.register_script(_RELEASE_LUA)   # SHA1 once
+    result = await _release_script(
+        keys=[_released_key(marker), _key(event_id)],
+        args=[quantity, ttl_seconds],
+        client=redis,
+    )
+    return int(result) != -1
 
 async def reconcile_inventory(
         db: AsyncSession,

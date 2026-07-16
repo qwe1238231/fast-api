@@ -171,7 +171,11 @@ async def reconcile_inventory(
     """從 Postgres 重算真實剩餘,覆蓋寫回 Redis。Redis 遺失後的權威重建。"""
     if not force:                                    # ← 守衛搬進來
         backlog, dead = await queue_depth(redis)
-        if backlog or dead:
+        # Only un-persisted backlog means inventory is genuinely in flight and the
+        # DB SUM can't be trusted. dead-lettered intents are already settled
+        # (batch 1: persisted → counted in the SUM; not persisted → seat refunded),
+        # so dead>0 must NOT block reconcile — else one poison disables it forever.
+        if backlog:
             raise InventoryNotReconcilable(event_id, backlog, dead)
     total_seats = await db.scalar(
         select(Event.total_seats).where(Event.id == event_id)

@@ -14,6 +14,7 @@ os.environ.setdefault("REFRESH_TOKEN_REUSE_GRACE_SECONDS", "0")
 
 import pytest
 import pytest_asyncio
+from unittest.mock import AsyncMock, MagicMock
 from httpx import AsyncClient, ASGITransport
 
 from app.main import app
@@ -55,6 +56,12 @@ async def client():
     # lifespan 不會在 ASGITransport 下執行,手動接上 app.state.redis
     # (登入端點寫稽核事件需要它),用完關掉避免連線洩漏。
     app.state.redis = create_redis_client(get_settings().REDIS_URL)
+    # webhook/payment endpoints resolve get_stripe -> app.state.stripe; lifespan
+    # doesn't run under ASGITransport, so stub it with a mock (refunds recorded).
+    app.state.stripe = MagicMock()
+    app.state.stripe.v1.refunds.create_async = AsyncMock(
+        return_value=MagicMock(id="re_test", status="succeeded")
+    )
     try:
         async with AsyncClient(
             transport=ASGITransport(app=app),

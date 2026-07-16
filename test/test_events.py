@@ -138,6 +138,32 @@ async def test_reconcile_force_bypasses_guard(client, db, redis):
     assert isinstance(available, int)
 
 @pytest.mark.asyncio
+async def test_safety_net_not_disabled_by_dead_letter(client, db, redis):
+    """dead>0 (with backlog==0) is inventory-settled, so it must NOT disable the
+    safety net. Regression for the 'one poison disables reconcile/drift forever'
+    gap: reconcile proceeds and drift detection runs despite a dead-letter entry."""
+    from app.services.inventory import queue_depth, ORDER_DEAD_LETTER_KEY
+    from app.worker import detect_inventory_drift
+
+    headers = await _make_admin_and_login(client, db)
+    event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
+    await client.post(f"/v1/events/{event_id}/publish", headers=headers)   # 庫存 100
+
+    # park a dead-letter entry; the order stream is drained -> backlog==0, dead>0
+    await redis.xadd(ORDER_DEAD_LETTER_KEY, {"idempotency_key": "poison", "event_id": str(event_id), "quantity": "1"})
+    backlog, dead = await queue_depth(redis)
+    assert backlog == 0 and dead >= 1
+
+    # reconcile PROCEEDS (previously raised because dead>0)
+    assert await reconcile_inventory(db, redis, event_id=event_id) == 100
+
+    # drift detection RUNS (not skipped): make Redis wrong -> it must report drift
+    await redis.set(f"event:{event_id}:available", 42)
+    assert await detect_inventory_drift({"redis_client": redis}) == [
+        {"event_id": event_id, "expected": 100, "actual": 42}
+    ]
+
+@pytest.mark.asyncio
 async def test_detect_inventory_drift(client, db, redis):
     from app.worker import detect_inventory_drift
 

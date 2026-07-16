@@ -38,3 +38,20 @@ async def create_payment_intent(
         {"idempotency_key": f"order-{order_id}"},   # idempotency_key lives in options
     )
     return {"id": intent.id, "client_secret": intent.client_secret}
+
+
+async def create_refund(
+        client: StripeClient,
+        *,
+        payment_intent_id: str,
+) -> dict[str, str]:
+    """Refund a PaymentIntent in full — used when a charge lands on an order that
+    is no longer payable (expired/cancelled after payment) or the captured amount
+    doesn't match. Idempotent per intent, so a re-delivered webhook won't
+    double-refund. Non-blocking (async HTTP).
+    """
+    refund = await client.v1.refunds.create_async(
+        {"payment_intent": payment_intent_id},
+        {"idempotency_key": f"refund-{payment_intent_id}"},
+    )
+    return {"id": refund.id, "status": refund.status}

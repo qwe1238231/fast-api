@@ -63,6 +63,11 @@ async def expire_pending_orders(ctx: dict) -> None:
             select(Order.id)
             .where(Order.status == OrderStatus.PENDING)
             .where(Order.created_at < cutoff)
+            # Skip orders in the Stripe flow: their lifecycle is driven by the
+            # payment webhooks (succeeded -> paid; canceled/failed -> released),
+            # not this timeout — so a buyer paying near the boundary keeps the
+            # ticket instead of being expired out from under a successful charge.
+            .where(Order.payment_provider_id.is_(None))
         )
         result = await read_db.execute(stmt)
         order_ids = list(result.scalars().all())
@@ -212,14 +217,17 @@ async def _persist_intent(fields: dict) -> str:
 
 
 async def _ack_and_remove(redis, entry_id: str) -> None:
-    """Ack the entry, then delete it from the stream so it doesn't accumulate.
+    """Ack + delete the entry ATOMICALLY (MULTI/EXEC).
 
-    XACK only clears the pending list; the entry itself lingers in the stream
-    forever unless removed. Deleting once it's safely persisted keeps
-    orders:stream bounded to roughly the un-processed backlog.
+    XACK only clears the pending list; the entry lingers in the stream until
+    XDEL. Doing them as two separate calls lets a crash in between leave an
+    acked-but-undeleted ORPHAN that XLEN counts as backlog forever — which then
+    wedges the drift/reconcile guards. MULTI/EXEC runs both or neither.
     """
-    await redis.xack(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, entry_id)
-    await redis.xdel(ORDER_STREAM_KEY, entry_id)
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.xack(ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP, entry_id)
+        pipe.xdel(ORDER_STREAM_KEY, entry_id)
+        await pipe.execute()
 
 
 async def _consume_batch(redis, *, consumer: str = ORDER_CONSUMER_NAME, block: int | None = None) -> int:
@@ -424,9 +432,9 @@ async def report_queue_depth(ctx: dict) -> dict:
 async def detect_inventory_drift(ctx: dict) -> list[dict]:
     """比對每個 published event 的 Redis 庫存 vs Postgres 應有值,不一致就記錄。"""
     redis = ctx["redis_client"]
-    backlog, dead = await queue_depth(redis)                    # ← 新增:先問排空了嗎
-    if backlog or dead:
-        print(f"drift check skipped: queue not drained (backlog={backlog}, dead_letter={dead})")
+    backlog, _ = await queue_depth(redis)   # only un-persisted backlog blocks drift;
+    if backlog:                             # dead-lettered intents are inventory-settled (batch 1)
+        print(f"drift check skipped: {backlog} intents not yet persisted")
         return []      
     drifts: list[dict] = []
     async with AsyncSessionLocal() as db:

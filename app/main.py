@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -7,6 +8,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.core.config import get_settings
 from app.core.redis import create_redis_client
+from app.services.queue_events import run_subscriber
 from app.services.stripe_client import create_stripe_client
 from app.api.deps import limiter
 from app.api.v1.router import api_router
@@ -22,7 +24,13 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     app.state.redis = create_redis_client(settings.REDIS_URL)
     app.state.stripe, app.state.stripe_http = create_stripe_client(settings.STRIPE_SECRET_KEY)
+    subscriber = asyncio.create_task(run_subscriber(app.state.redis))   # waiting-room pokes -> SSE mailboxes
     yield
+    subscriber.cancel()
+    try:
+        await subscriber
+    except asyncio.CancelledError:
+        pass
     await app.state.stripe_http.close_async()
     await app.state.redis.aclose()
 

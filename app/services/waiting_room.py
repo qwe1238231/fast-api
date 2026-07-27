@@ -24,6 +24,7 @@ from app.core.config import get_settings
 from app.core.exceptions import AdmissionDenied
 from app.models.event import Event
 from app.services.inventory import get_available
+from app.services.queue_events import publish_global_poke
 
 
 def _draw_key(event_id: int) -> str:
@@ -57,6 +58,7 @@ async def set_admission_paused(redis: Redis, paused: bool, *, ttl_seconds: int =
         await redis.set(_paused_key(), "1", ex=ttl_seconds)
     else:
         await redis.delete(_paused_key())
+    await publish_global_poke(redis)   # nudge every waiting SSE connection to re-read status()
 
 
 def window(event: Event) -> tuple[datetime, datetime]:
@@ -129,6 +131,29 @@ async def status(redis: Redis, *, event_id: int, user_id: int) -> QueueState:
     if rank < admitted_count:
         return QueueState(admitted=True)
     return QueueState(admitted=False, people_ahead=rank - admitted_count)
+
+
+async def admit_deadline(redis: Redis, *, event_id: int, user_id: int) -> float | None:
+    """Wall-clock epoch seconds at which this user's rank crosses the admission
+    cutoff — or None if they're not registered / admission isn't scheduled yet.
+
+    Both inputs are frozen once the registration window closes (no new
+    registrations can change the rank; the rate is config), so the SSE stream
+    computes this ONCE and sleeps precisely until it instead of polling for it.
+
+    Derivation from _admitted_count / status():
+        admitted  <=>  rank < int(elapsed * RATE)
+                  <=>  elapsed >= (rank + 1) / RATE
+        =>  admit_at = admit_start + (rank + 1) / RATE
+    """
+    start = await redis.get(_admit_start_key(event_id))
+    if start is None:
+        return None
+    rank = await redis.zrank(_draw_key(event_id), str(user_id))
+    if rank is None:
+        return None
+    rate = get_settings().QUEUE_ADMISSION_RATE
+    return float(start) + (rank + 1) / rate
 
 
 async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: int) -> None:

@@ -14,8 +14,9 @@ from dataclasses import dataclass
 
 from app.core.exceptions import InsufficientInventory ,EventNotFound,InventoryNotReconcilable
 from app.models.event import Event
-from app.models.order import Order, OrderStatus 
+from app.models.order import Order, OrderStatus
 from app.services.idempotency import _key as _claim_key
+from app.services.queue_events import publish_event_poke
 
 ORDER_STREAM_KEY="orders:stream"
 ORDER_DEAD_LETTER_KEY="orders:stream:dead"
@@ -61,9 +62,10 @@ async def get_available(
 # ARGV[1]=quantity  ARGV[2]=claim TTL seconds  ARGV[3]=user_id
 # ARGV[4]=event_id  ARGV[5]=total_price_cents  ARGV[6]=idempotency_key
 # Returns (a list on the Python side):
-#   {'DUP'}                 -> this idempotency_key was already processed
-#   {'SOLD_OUT', remaining} -> not enough stock
-#   {'OK', stream msg id}   -> seat reserved and order intent enqueued
+#   {'DUP'}                            -> this idempotency_key was already processed
+#   {'SOLD_OUT', remaining}            -> not enough stock
+#   {'OK', stream msg id, remaining}   -> seat reserved and order intent enqueued
+#                                         (remaining lets the caller detect a sold-out crossing)
 _RESERVE_AND_ENQUEUE_LUA = """
 local qty = tonumber(ARGV[1])
 
@@ -92,7 +94,7 @@ local stream_id = redis.call('XADD', KEYS[3], '*',
 -- 5) Write the claim (with TTL) so the next request with the same key is blocked at step 1.
 redis.call('SET', KEYS[2], 'PENDING', 'EX', tonumber(ARGV[2]))
 
-return {'OK', stream_id}
+return {'OK', stream_id, tostring(avail - qty)}
 """
 
 # Registered once on first use (SHA1 computed there, not per order), then reused.
@@ -116,18 +118,24 @@ async def reserve(
             requested=quantity,
             available=available,
         )
-    
+    if remaining == 0:                                   # just took the last seat(s)
+        await publish_event_poke(redis, event_id)        # wake waiters -> they re-read -> sold_out
+
 # Atomic idempotent release: mark-then-return-seats, all-or-nothing.
 # KEYS[1]=released marker   KEYS[2]=stock key
 # ARGV[1]=quantity          ARGV[2]=marker TTL seconds
 # The SETNX marker makes a replayed release (crash between commit and release,
 # stream re-delivery, double cancel) a no-op — seats are returned at most once.
-# Returns the new available count on the first release, or -1 if already released.
+# Returns (a tagged list, like the reserve script):
+#   {'OK', new_available}  -> first release; seats returned
+#   {'DUP'}                -> already released; no-op
+# A tagged table (not a bare -1 sentinel) so a legitimate new count of -1 — reachable
+# when reconcile writes negative stock during oversell recovery — isn't misread as DUP.
 _RELEASE_LUA = """
 if redis.call('SET', KEYS[1], '1', 'NX', 'EX', tonumber(ARGV[2])) then
-    return redis.call('INCRBY', KEYS[2], tonumber(ARGV[1]))
+    return {'OK', tostring(redis.call('INCRBY', KEYS[2], tonumber(ARGV[1])))}
 end
-return -1
+return {'DUP'}
 """
 
 # Registered once on first use (same pattern as the reserve script).
@@ -159,7 +167,12 @@ async def release(
         args=[quantity, ttl_seconds],
         client=redis,
     )
-    return int(result) != -1
+    if result[0] == "DUP":
+        return False                                     # replayed release — no-op, no crossing
+    new_available = int(result[1])
+    if new_available - quantity <= 0 < new_available:    # crossed from sold-out back to available
+        await publish_event_poke(redis, event_id)        # wake waiters -> they re-read -> not sold_out
+    return True
 
 async def reconcile_inventory(
         db: AsyncSession,
@@ -271,6 +284,9 @@ async def reserve_and_enqueue(
             outcome=ReserveOutcome.SOLD_OUT,
             available=int(result[1]),
         )
+    remaining = int(result[2])
+    if remaining == 0:                                   # this reservation took the last seat(s)
+        await publish_event_poke(redis, event_id)        # wake waiters -> they re-read -> sold_out
     return ReserveResult(
         outcome=ReserveOutcome.OK,
         stream_id=result[1],

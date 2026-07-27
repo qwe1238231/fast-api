@@ -273,6 +273,31 @@ async def test_queue_admits_after_window_closes(client, db, redis):
 
 
 @pytest.mark.asyncio
+async def test_queue_stream_pushes_admission(client, db, redis):
+    """The SSE stream emits the admission (+ token) then closes — the push
+    alternative to polling /queue/status."""
+    import json
+
+    event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
+    await client.post(f"/v1/events/{event_id}/queue", headers=headers)          # rank 0
+    past = (datetime.now(timezone.utc) - timedelta(seconds=10)).timestamp()
+    await redis.set(wr._admit_start_key(event_id), past)                        # rank 0 admitted
+
+    async with client.stream("GET", f"/v1/events/{event_id}/queue/stream", headers=headers) as resp:
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        payload = None
+        async for line in resp.aiter_lines():
+            if line.startswith("data: "):
+                payload = json.loads(line[len("data: "):])
+                break
+
+    assert payload is not None
+    assert payload["admitted"] is True
+    assert payload["access_token"]                                             # token pushed on the stream
+
+
+@pytest.mark.asyncio
 async def test_queue_registration_closed(client, db):
     # sale already started → fallback close (sale-30s) is in the past → registration closed
     event_id, headers = await _publish_event(client, db, _payload_sale_in(0))

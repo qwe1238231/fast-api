@@ -1,7 +1,9 @@
+import asyncio
 from datetime import datetime, timezone
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 
 from app.api.deps import CurrentAdmin, CurrentUser, DbSession, Redis
 from app.core.config import get_settings
@@ -11,7 +13,10 @@ from app.crud.event import create_event, get_event, list_published_events
 from app.models.event import Event
 from app.schemas.event import EventCreate, EventResponse, QueueStatusResponse
 from app.services.publish_event import publish_event
-from app.services.waiting_room import window, register as queue_register, status as queue_status, QueueState
+from app.services.queue_events import register as sse_register, unregister as sse_unregister
+from app.services.waiting_room import (
+    window, register as queue_register, status as queue_status, QueueState, admit_deadline,
+)
 from app.services.rate_limit import enforce_rate_limit
 
 
@@ -115,3 +120,90 @@ async def queue_status_endpoint(
     """Poll your waiting-room position / admission. Redis-only (no DB on the hot poll path)."""
     state = await queue_status(redis, event_id=event_id, user_id=current_user.id)
     return _queue_response(state, user_id=current_user.id, event_id=event_id)
+
+
+_SSE_HEARTBEAT_SECONDS = 20   # keep-alive + poll fallback if a poke is missed (< ALB's 60s idle)
+_SSE_MAX_SECONDS = 300        # cap one connection; the browser's EventSource then auto-reconnects
+
+
+@router.get("/{event_id}/queue/stream")
+async def queue_stream(
+        event_id: int,
+        current_user: CurrentUser,
+        redis: Redis,
+        request: Request,
+) -> StreamingResponse:
+    """Server-Sent Events stream of waiting-room position/admission — the push
+    alternative to polling /queue/status.
+
+    Correctness lives in waiting_room.status (the single source of truth); the
+    stream re-reads it on every wake. Immediacy is layered on top:
+      - admission is a pure function of time, so we compute the exact deadline
+        and sleep until it (no polling for it);
+      - pause / sold-out are real events, delivered as a Pub/Sub "poke" via the
+        per-process subscriber (app/services/queue_events.py) which nudges this
+        connection's mailbox.
+    A wake from any source — poke, admit deadline, or heartbeat timeout — just
+    re-reads status(). Each frame also doubles as the ALB keep-alive.
+
+    NOTE: the browser's native EventSource can't send an Authorization header, so
+    a real frontend would pass the JWT via query param (+ a query-token auth dep)
+    or use a fetch-based SSE client. The server contract here is Bearer, matching
+    the rest of the API.
+    """
+    def _frame(state: QueueState) -> str:
+        body = _queue_response(state, user_id=current_user.id, event_id=event_id).model_dump_json()
+        return f"data: {body}\n\n"
+
+    async def gen():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+
+        # Register the mailbox BEFORE the first read: a poke fired in between then
+        # lands in the maxsize=1 mailbox instead of being lost, so the loop's first
+        # wait returns at once. finally covers every exit, incl. the early return.
+        mailbox = sse_register(event_id)
+        try:
+            # First frame immediately: the authoritative state right now. If we're
+            # already admitted / sold out we never enter the wait at all.
+            state = await queue_status(redis, event_id=event_id, user_id=current_user.id)
+            yield _frame(state)
+            if state.admitted or state.sold_out:
+                return
+
+            while loop.time() - started < _SSE_MAX_SECONDS:
+                # Recompute each wake: a rank only freezes at window close, so an
+                # early joiner's deadline self-corrects once it's real. Tighten the
+                # wait only while the deadline is still ahead; once it has passed,
+                # fall back to the heartbeat and rely on a poke (e.g. pause lifted)
+                # — never spin at a sub-second floor (that would hammer Redis right
+                # when admission is paused, i.e. when downstream is already sick).
+                timeout = float(_SSE_HEARTBEAT_SECONDS)
+                admit_at = await admit_deadline(redis, event_id=event_id, user_id=current_user.id)
+                if admit_at is not None:
+                    until_admit = admit_at - datetime.now(timezone.utc).timestamp()
+                    if until_admit > 0:
+                        timeout = min(timeout, until_admit)
+
+                try:
+                    await asyncio.wait_for(mailbox.get(), timeout)
+                except asyncio.TimeoutError:
+                    pass                     # woke by heartbeat / admit deadline, not a poke
+
+                if await request.is_disconnected():
+                    return
+                state = await queue_status(redis, event_id=event_id, user_id=current_user.id)
+                yield _frame(state)
+                if state.admitted or state.sold_out:
+                    return                   # terminal — close the stream
+        finally:
+            sse_unregister(event_id, mailbox)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",       # ask proxies not to buffer the stream
+        },
+    )

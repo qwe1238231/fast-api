@@ -69,20 +69,27 @@ async def _handle_payment_succeeded(db, stripe_client, intent: dict) -> None:
     if order is None:
         return
 
-    # (1) amount must equal what the order costs — else refund, never confirm.
+    # Snapshot what we need NOW, so the refund branches can end the read transaction
+    # before the external Stripe call — never hold a pooled connection (and the vacuum
+    # xmin horizon) across a network round-trip.
+    total = order.total_price_cents
+    current_status = order.status
     captured = intent.get("amount_received") or intent.get("amount")
-    if captured != order.total_price_cents:
-        await _refund(stripe_client, intent,
-                      reason=f"amount {captured} != order total {order.total_price_cents}")
+
+    # (1) amount must equal what the order costs — else refund, never confirm.
+    if captured != total:
+        await db.rollback()   # release the read txn before the network call
+        await _refund(stripe_client, intent, reason=f"amount {captured} != order total {total}")
         return
 
     # (2) already paid/confirmed (Stripe re-delivered the event) — idempotent no-op.
-    if order.status in (OrderStatus.PAID, OrderStatus.CONFIRMED):
+    if current_status in (OrderStatus.PAID, OrderStatus.CONFIRMED):
         return
 
     # (3) order is no longer payable (e.g. cancelled while paying) — refund.
-    if order.status != OrderStatus.PENDING:
-        await _refund(stripe_client, intent, reason=f"order {order_id} is {order.status.value}")
+    if current_status != OrderStatus.PENDING:
+        await db.rollback()
+        await _refund(stripe_client, intent, reason=f"order {order_id} is {current_status.value}")
         return
 
     # (4) PENDING: pay it. A concurrent transition makes the CAS miss -> refund.

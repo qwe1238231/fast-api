@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum 
 
-from sqlalchemy import DateTime, String
+from sqlalchemy import CheckConstraint, DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from sqlalchemy import Enum as SAEnum
@@ -14,6 +14,12 @@ class EventStatus(str, Enum):
     
 class Event(Base):
     __tablename__ = "events"
+    __table_args__ = (
+        # total_seats is the ceiling the whole oversell / inventory-reconcile logic
+        # trusts; a 0/negative from an admin typo would poison it. Guard at the DB.
+        CheckConstraint("total_seats > 0", name="ck_events_total_seats_pos"),
+        CheckConstraint("price_cents >= 0", name="ck_events_price_nonneg"),
+    )
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     venue: Mapped[str] = mapped_column(String(255), nullable=False)

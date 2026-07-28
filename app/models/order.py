@@ -30,10 +30,21 @@ class Order(Base):
         # Keyset pagination for list_orders_for_user: equality on user_id, then
         # the (created_at, id) sort/cursor columns -> single index range scan.
         Index("ix_orders_user_created", "user_id", "created_at", "id"),
+        # Expiry sweep (worker.expire_pending_orders) filters exactly these rows every
+        # minute; a partial index on created_at keeps that a tiny range scan instead of
+        # a seq scan of orders, and stays small (rows drop out as they leave PENDING).
+        Index(
+            "ix_orders_pending_sweep", "created_at",
+            postgresql_where=text("status = 'pending' AND payment_provider_id IS NULL"),
+        ),
         CheckConstraint(
             "status IN ('pending', 'paid', 'confirmed', 'expired', 'cancelled')",
             name="ck_orders_status",
         ),
+        # Values must stay sane even when a row is INSERTed by the order-consumer
+        # worker off a Redis Stream payload (which bypasses the Pydantic request layer).
+        CheckConstraint("quantity > 0", name="ck_orders_quantity_pos"),
+        CheckConstraint("total_price_cents >= 0", name="ck_orders_total_nonneg"),
         # 每個 milestone status 必須有對應的時間戳(forward correspondence)。
         CheckConstraint(
             "status <> 'paid' OR paid_at IS NOT NULL",
@@ -54,7 +65,7 @@ class Order(Base):
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)  # covered by ix_orders_user_created
-    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False, index=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)  # covered by ix_orders_active (event_id, status)
     quantity: Mapped[int] = mapped_column(nullable=False)
     total_price_cents: Mapped[int] = mapped_column(nullable=False)
     status: Mapped[OrderStatus] = mapped_column(

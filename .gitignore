@@ -102,3 +102,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 cookies.txt
+
+# ===== Load-test generated artifacts =====
+# Bulk-minted JWTs written by loadtest/seed*.py; large, ephemeral, signed with
+# SECRET_KEY — regenerate, never commit.
+loadtest/tokens.json
+loadtest/admission.json

@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from app.api.deps import CurrentAdmin, CurrentUser, DbSession, Redis
+from app.api.deps import CurrentAdmin, CurrentUser, DbSession, Redis, StreamUser
 from app.core.config import get_settings
 from app.core.exceptions import EventNotFound
 from app.core.security import create_admission_token
@@ -129,7 +129,7 @@ _SSE_MAX_SECONDS = 300        # cap one connection; the browser's EventSource th
 @router.get("/{event_id}/queue/stream")
 async def queue_stream(
         event_id: int,
-        current_user: CurrentUser,
+        current_user: StreamUser,
         redis: Redis,
         request: Request,
 ) -> StreamingResponse:
@@ -146,10 +146,9 @@ async def queue_stream(
     A wake from any source — poke, admit deadline, or heartbeat timeout — just
     re-reads status(). Each frame also doubles as the ALB keep-alive.
 
-    NOTE: the browser's native EventSource can't send an Authorization header, so
-    a real frontend would pass the JWT via query param (+ a query-token auth dep)
-    or use a fetch-based SSE client. The server contract here is Bearer, matching
-    the rest of the API.
+    AUTH: via get_stream_user — the JWT comes from the Authorization header (API
+    clients) or an ?access_token= query param (browsers, since native EventSource
+    can't send headers). See get_stream_user for the token-in-URL security note.
     """
     def _frame(state: QueueState) -> str:
         body = _queue_response(state, user_id=current_user.id, event_id=event_id).model_dump_json()

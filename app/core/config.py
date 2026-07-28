@@ -1,9 +1,8 @@
 from functools import lru_cache
 from pydantic_settings import BaseSettings,SettingsConfigDict
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from datetime import timedelta
 import base64
-from pydantic import field_validator
 
 
 class Settings(BaseSettings):
@@ -13,6 +12,14 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REDIS_URL: str = "redis://localhost:6380/0"
     DEBUG:bool = False
+    # SQL statement echo. Decoupled from DEBUG on purpose: load tests need the
+    # bypass (which requires DEBUG) WITHOUT paying for a synchronous log line per
+    # statement. Keep False unless you're actually debugging SQL.
+    SQL_ECHO: bool = False
+    # Load-test escape hatch: skip the waiting-room admission check on POST /orders so
+    # the order/inventory path can be pressure-tested directly. Guarded below — only
+    # honoured when DEBUG is on; the app refuses to start if this is set without DEBUG.
+    LOADTEST_BYPASS_ADMISSION: bool = False
     REFRESH_TOKEN_SLIDING_DAYS: int = 14
     REFRESH_TOKEN_ABSOLUTE_EXPIRE_DAYS: int = 30
     REFRESH_TOKEN_REUSE_GRACE_SECONDS: int =10
@@ -63,6 +70,16 @@ class Settings(BaseSettings):
                 "Generate one: python -c \"import os, base64; print(base64.b64encode(os.urandom(32)).decode())\""
             )
         return v
+
+    @model_validator(mode="after")
+    def _guard_loadtest_bypass(self) -> "Settings":
+        # Fail-closed: the admission bypass must never be reachable in a non-DEBUG
+        # (production-like) deployment. Refuse to boot rather than silently allow it.
+        if self.LOADTEST_BYPASS_ADMISSION and not self.DEBUG:
+            raise ValueError(
+                "LOADTEST_BYPASS_ADMISSION requires DEBUG=True; refusing to start"
+            )
+        return self
 
     @property
     def access_token_lifetime(self) -> timedelta:

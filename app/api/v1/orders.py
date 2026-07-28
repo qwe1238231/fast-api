@@ -10,6 +10,7 @@ from app.models.order import Order, OrderStatus
 from app.schemas.order import OrderCreate, OrderResponse, OrderAcceptedResponse, OrderStatusResponse, OrderPollState, OrderPage
 from app.services.orders import submit_order, cancel_order as cancel_order_service, mark_confirmed, mark_paid, release_order_seat
 from app.services.idempotency import get_claim_state, CLAIM_PENDING, CLAIM_FAILED
+from app.core.config import get_settings
 from app.core.exceptions import OrderNotFound, InvalidOrderTransition
 from app.crud.order import get_order_by_id, get_order_by_idempotency_key, list_orders_for_user
 from app.schemas.payment import PaymentIntentResponse
@@ -39,9 +40,12 @@ async def create_endpoint(
     any reserve work, so non-admitted requests are bounced cheaply). Returns 202
     immediately — the order row is written asynchronously by the worker.
     """
-    await verify_admission(
-        redis, admission_token, user_id=current_user.id, event_id=order_in.event_id
-    )
+    # Bypass is guarded in Settings (only honoured under DEBUG); in prod this
+    # branch is dead and every order goes through admission verification.
+    if not get_settings().LOADTEST_BYPASS_ADMISSION:
+        await verify_admission(
+            redis, admission_token, user_id=current_user.id, event_id=order_in.event_id
+        )
     await submit_order(
         db,
         redis,

@@ -6,7 +6,7 @@ settings = get_settings()
 
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=settings.DEBUG,
+    echo=settings.SQL_ECHO,
     pool_size=settings.DB_POOL_SIZE,
     max_overflow=settings.DB_MAX_OVERFLOW,
     pool_pre_ping=settings.DB_POOL_PRE_PING,

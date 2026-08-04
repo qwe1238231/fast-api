@@ -45,6 +45,24 @@ class ZoneNotForEvent(EventError):
         self.reason = reason
         super().__init__(f"Zone {zone_id} is not sellable for event {event_id}: {reason}")
 
+class SeatMapMismatch(EventError):
+    """`events.total_seats` 與座位圖的實際容量不符。
+
+    座位場次的 total_seats 是衍生值(Σ seat_blocks.capacity),但沒有任何資料庫約束
+    能表達跨表的這個關係,所以在 publish 擋。不自動修正而是拒絕發佈:庫存上限被
+    悄悄改掉比發佈失敗嚴重得多,而且填錯的那個數字會讓 detect_inventory_drift
+    永久誤報(它用 total_seats − SUM(quantity) 算期望值)—— 變成狼來了。
+    """
+    def __init__(self, event_id: int, total_seats: int, capacity: int):
+        self.event_id = event_id
+        self.total_seats = total_seats
+        self.capacity = capacity
+        super().__init__(
+            f"Event {event_id}: total_seats={total_seats} but the seat map holds "
+            f"{capacity} seats — fix total_seats before publishing"
+        )
+
+
 class OrderError(DomainError):
     """Base for Order-related errors."""
 

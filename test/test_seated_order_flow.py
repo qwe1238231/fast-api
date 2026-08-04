@@ -268,3 +268,39 @@ async def test_group_of_two_always_sits_together(
     assert all(hold.length == 2 for hold in holds), "兩人票永遠是一段連續區間"
     # 24 席全部兩兩售罄,不該剩下任何孤兒。
     assert all(run.length != 1 for run in await _redis_runs(redis, event.id, zone_id))
+
+
+# ─ 守衛：total_seats 必須等於座位圖容量
+
+async def test_publish_refuses_a_mismatched_total_seats(db, redis) -> None:
+    """填錯 total_seats 會讓 detect_inventory_drift 永久誤報(它用
+    total_seats − SUM(quantity) 算期望值)—— 漂移偵測就變成狼來了。
+
+    不自動修正而是拒絕發佈:庫存上限被悄悄改掉比發佈失敗嚴重得多。
+    """
+    from app.core.exceptions import SeatMapMismatch
+
+    spec = VenueSpec(
+        name="Mismatch Arena",
+        zones=(ZoneSpec(name="唯一區", display_order=0, rows=(RowSpec("A", (12,)),)),),
+    )
+    venue = await seed_venue(db, spec)
+    zone_id = await db.scalar(select(Zone.id).where(Zone.venue_id == venue.id))
+    now = datetime.now(timezone.utc)
+    event = Event(
+        name="Mismatch Show", venue=spec.name, venue_id=venue.id,
+        starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
+        sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
+        total_seats=100,                      # 座位圖只有 12 席
+        price_cents=100, status=EventStatus.DRAFT,
+    )
+    db.add(event)
+    await db.flush()
+    db.add(EventZonePrice(event_id=event.id, zone_id=zone_id, price_cents=1000))
+
+    with pytest.raises(SeatMapMismatch) as excinfo:
+        await publish_event(db, redis, event)
+    assert excinfo.value.capacity == 12
+    assert excinfo.value.total_seats == 100
+    # 擋在改狀態之前 —— 失敗的發佈不該留下半途的狀態。
+    assert event.status == EventStatus.DRAFT

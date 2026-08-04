@@ -37,10 +37,19 @@ from redis.commands.core import AsyncScript
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import NoSeatsAvailable, SeatContention
+from app.core.exceptions import (
+    InventoryNotReconcilable,
+    NoSeatsAvailable,
+    SeatContention,
+)
 from app.models.seating import Seat, SeatBlock, SeatHold
 from app.services.idempotency import _key as _claim_key
-from app.services.inventory import ORDER_STREAM_KEY, _key as _event_available_key
+from app.services.inventory import (
+    ORDER_STREAM_KEY,
+    _key as _event_available_key,
+    _released_key,
+    queue_depth,
+)
 from app.services.queue_events import publish_event_poke
 from app.services.seating import (
     ENDGAME_POLICY,
@@ -73,6 +82,11 @@ MAX_TICKETS_PER_ORDER = 10
 #: 立刻用放寬策略重試,所以實際上只有 2 個人看到拒絕)。
 STRICT_MISS_THRESHOLD = 3
 
+#: 連拒計數的存活時間。有它之後語意才精確是「**最近**連續被拒幾筆」——
+#: 沒有的話,一個沒流量的 zone 每小時被拒一筆、三小時後也會觸發。順便讓這個
+#: 計數器不會在活動結束後永久留在 Redis。
+STRICT_MISS_TTL_SECONDS = 300
+
 
 def _runs_key(event_id: int, zone_id: int) -> str:
     return f"event:{event_id}:zone:{zone_id}:runs"
@@ -98,10 +112,6 @@ def _relaxed_key(event_id: int, zone_id: int) -> str:
     return f"event:{event_id}:zone:{zone_id}:relaxed"
 
 
-def _released_key(marker: str) -> str:
-    return f"released:{marker}"
-
-
 async def is_relaxed(redis: Redis, *, event_id: int, zone_id: int) -> bool:
     """這個 zone 是否已經切進收尾期策略。單向 —— 一旦切了就不回頭。"""
     return bool(await redis.exists(_relaxed_key(event_id, zone_id)))
@@ -113,10 +123,13 @@ async def _record_strict_miss(redis: Redis, *, event_id: int, zone_id: int) -> b
     不做原子化:INCR 與 SET 之間的競態最多讓兩個請求同時把 ratchet 打開,而 SET
     本來就是冪等的。為了一個單向的布林旗標開 Lua 不划算。
     """
-    misses = await redis.incr(_misses_key(event_id, zone_id))
+    key = _misses_key(event_id, zone_id)
+    misses = await redis.incr(key)
+    await redis.expire(key, STRICT_MISS_TTL_SECONDS)
     if misses < STRICT_MISS_THRESHOLD:
         return False
     await redis.set(_relaxed_key(event_id, zone_id), "1")
+    await redis.delete(key)          # 已經切了,這個計數器不再有意義
     return True
 
 
@@ -135,7 +148,12 @@ class ZoneState:
 # ─────────────────────────────── 重建（權威復原路徑）
 
 async def rebuild_zone_runs(
-    db: AsyncSession, redis: Redis, *, event_id: int, zone_id: int
+    db: AsyncSession,
+    redis: Redis,
+    *,
+    event_id: int,
+    zone_id: int,
+    force: bool = False,
 ) -> int:
     """從 Postgres 重算整個 zone 的空段結構並覆寫 Redis。回傳剩餘席數。
 
@@ -146,10 +164,19 @@ async def rebuild_zone_runs(
 
     重建則自動涵蓋了「該退的座位」:DB 沒有紀錄的座位就是空的。
 
-    呼叫端必須先確認 order stream 已排空(見 inventory.queue_depth) —— in-flight
-    的 intent 持有 Redis 認定的區間但 DB 還沒有,此時重建會把它們算成空的,
-    worker 落帳時必然衝突。
+    **stream 未排空時拒絕執行**,跟 reconcile_inventory 一樣的守衛:in-flight 的
+    intent 持有 Redis 認定的區間但 DB 還沒有,此時重建會把它們算成空的 —— 那些座位
+    會被賣第二次,而原本的 intent 落帳時撞上 EXCLUDE。這是整個功能最容易誤觸的一顆
+    地雷(ops 想「修一下漂移」就會踩到),所以守衛必須在程式裡而不是在註解裡。
+
+    `force=True` 只在確定沒有 in-flight intent 指向這個 event 時才可以用 ——
+    例如 publish 當下:場次還沒開賣,不可能有訂單。
     """
+    if not force:
+        backlog, dead = await queue_depth(redis)
+        if backlog:
+            raise InventoryNotReconcilable(event_id, backlog, dead)
+
     blocks = (
         await db.scalars(select(SeatBlock).where(SeatBlock.zone_id == zone_id))
     ).all()

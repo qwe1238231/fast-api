@@ -1,10 +1,10 @@
 from redis.asyncio import Redis as RedisClient
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import EventError
+from app.core.exceptions import EventError, SeatMapMismatch
 from app.models.event import Event, EventStatus
-from app.models.seating import Zone
+from app.models.seating import SeatBlock, Zone
 from app.services.inventory import set_initial_stock
 from app.services.event_cache import invalidate_event_meta
 from app.services.seat_runs import rebuild_zone_runs
@@ -20,6 +20,18 @@ async def publish_event(
         raise EventError(
             f"Cannot publish event with status {event.status.value}"
         )
+    if event.venue_id is not None:
+        # total_seats 對座位場次是衍生值,但沒有資料庫約束能表達跨表關係 —— 填錯
+        # 會讓 detect_inventory_drift 永久誤報(它用 total_seats − SUM(quantity)
+        # 算期望值),漂移偵測就變成狼來了。在這裡擋,而且擋在改狀態之前。
+        capacity = await db.scalar(
+            select(func.coalesce(func.sum(SeatBlock.capacity), 0))
+            .join(Zone, Zone.id == SeatBlock.zone_id)
+            .where(Zone.venue_id == event.venue_id)
+        )
+        if capacity != event.total_seats:
+            raise SeatMapMismatch(event.id, event.total_seats, capacity)
+
     event.status = EventStatus.PUBLISHED
     await db.flush()
     await set_initial_stock(redis, event_id=event.id, total_seats=event.total_seats)
@@ -31,7 +43,12 @@ async def publish_event(
             await db.scalars(select(Zone.id).where(Zone.venue_id == event.venue_id))
         ).all()
         for zone_id in zone_ids:
-            await rebuild_zone_runs(db, redis, event_id=event.id, zone_id=zone_id)
+            # force:場次此刻才要開賣,不可能有 in-flight intent 指向它。而
+            # queue_depth 是**全域**的 —— 不 force 的話,別的場次有 backlog 就
+            # 發佈不了新場次。
+            await rebuild_zone_runs(
+                db, redis, event_id=event.id, zone_id=zone_id, force=True
+            )
     await setup_waiting_room(redis, event)          # fix salt + admission-start for the queue
     await invalidate_event_meta(redis, event_id=event.id)
     return event

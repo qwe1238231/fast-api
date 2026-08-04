@@ -18,10 +18,12 @@ from app.models.user import User
 from app.models.order import Order, OrderStatus
 from app.scripts.seed_venue import RowSpec, VenueSpec, ZoneSpec, odd_even_labels, seed_venue
 from app.services.inventory import ORDER_STREAM_KEY, _key as _event_available_key
-from app.core.exceptions import NoSeatsAvailable
+from app.core.exceptions import InventoryNotReconcilable, NoSeatsAvailable
 from app.services.seat_runs import (
     MAX_TICKETS_PER_ORDER,
     STRICT_MISS_THRESHOLD,
+    STRICT_MISS_TTL_SECONDS,
+    _misses_key,
     is_relaxed,
     _CLAIM_SEATS_LUA,
     _ends_key,
@@ -500,3 +502,62 @@ async def test_ratchet_recovers_the_seats_uniform_demand_would_strand(db, redis)
     assert sold == 8, "應該賣到只剩 1 席(算術下限),不是剩 3 席"
     assert await is_relaxed(redis, event_id=event.id, zone_id=zone_id)
     assert int(await redis.get(_zone_available_key(event.id, zone_id))) == 1
+
+
+# ─ 守衛：backlog 未排空時不得重建
+
+async def test_rebuild_refuses_while_intents_are_in_flight(db, redis, zone_fixture) -> None:
+    """in-flight 的 intent 持有 Redis 認定的區間但 DB 還沒有。此時重建會把它們算成
+    空的 —— 那些座位會被賣第二次,而原本的 intent 落帳時撞上 EXCLUDE。
+
+    這是整個功能最容易誤觸的地雷(ops 想「修一下漂移」就會踩到),所以守衛必須在
+    程式裡而不是在 docstring 裡。
+    """
+    event, zone_id = zone_fixture["event"], zone_fixture["zone_id"]
+    assert await reserve_seats_and_enqueue(
+        redis, event_id=event.id, zone_id=zone_id, user_id=1, quantity=2,
+        total_price_cents=200, idempotency_key=str(uuid4()),
+    ) is not None
+
+    with pytest.raises(InventoryNotReconcilable):
+        await rebuild_zone_runs(db, redis, event_id=event.id, zone_id=zone_id)
+
+
+async def test_rebuild_force_bypasses_the_guard(db, redis, zone_fixture) -> None:
+    """force 只在確定沒有 in-flight intent 指向這個 event 時能用(例如 publish 當下)。
+
+    需要它的原因是 queue_depth 是**全域**的:不 force 的話,別的場次有 backlog
+    就發佈不了新場次。
+    """
+    event, zone_id = zone_fixture["event"], zone_fixture["zone_id"]
+    await reserve_seats_and_enqueue(
+        redis, event_id=event.id, zone_id=zone_id, user_id=1, quantity=2,
+        total_price_cents=200, idempotency_key=str(uuid4()),
+    )
+    # DB 沒有 hold(intent 還沒落帳)→ 重建會把整個 block 算成空的。
+    assert await rebuild_zone_runs(
+        db, redis, event_id=event.id, zone_id=zone_id, force=True
+    ) == 48
+
+
+async def test_tripping_the_ratchet_clears_the_miss_counter(db, redis) -> None:
+    """切到收尾期之後那個計數器不再有意義,不該永久留在 Redis。"""
+    event, zone_id = await _tiny_zone(db, redis, 5)
+    for _ in range(STRICT_MISS_THRESHOLD - 1):
+        with pytest.raises(NoSeatsAvailable):
+            await _try(redis, event, zone_id, 4)
+    assert await redis.exists(_misses_key(event.id, zone_id))
+
+    assert await _try(redis, event, zone_id, 4) is not None
+    assert await is_relaxed(redis, event_id=event.id, zone_id=zone_id)
+    assert not await redis.exists(_misses_key(event.id, zone_id))
+
+
+async def test_the_miss_counter_expires(db, redis) -> None:
+    """有 TTL 之後語意才精確是「**最近**連續被拒幾筆」—— 沒有的話,一個沒流量的
+    zone 每小時被拒一筆、三小時後也會誤觸。"""
+    event, zone_id = await _tiny_zone(db, redis, 5)
+    with pytest.raises(NoSeatsAvailable):
+        await _try(redis, event, zone_id, 4)
+    ttl = await redis.ttl(_misses_key(event.id, zone_id))
+    assert 0 < ttl <= STRICT_MISS_TTL_SECONDS

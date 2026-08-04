@@ -18,9 +18,9 @@ from app.models.user import User
 from app.models.order import Order, OrderStatus
 from app.scripts.seed_venue import RowSpec, VenueSpec, ZoneSpec, odd_even_labels, seed_venue
 from app.services.inventory import ORDER_STREAM_KEY, _key as _event_available_key
+from app.core.exceptions import NoSeatsAvailable
 from app.services.seat_runs import (
     MAX_TICKETS_PER_ORDER,
-    NoSeatsAvailable,
     _CLAIM_SEATS_LUA,
     _ends_key,
     _geom_key,

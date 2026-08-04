@@ -26,9 +26,26 @@ class Policy:
     min_run: int = 2
     """端點切之後的殘餘不得落在 [1, min_run)。設 1 等於允許製造孤兒。"""
 
+    allow_mid_cut: bool = False
+    """允不允許從空段中間切(而不是只從兩端)。
+
+    **預設關閉,因為實測它用庫存換品質、比例約 1:1。** 中切會把一段偶數長度的
+    空位切成兩段奇數,而奇數空段在均勻需求下必然擱淺(5 → 賣掉 2 → 剩 3 → 再賣 2
+    會留下孤兒 → 禁止 → 3 席死掉)。量測(app/scripts/simulate_seating):
+
+        需求            中切ON        中切OFF
+        混合 1/2/3/4    100.0%       100.0%      ← 完全沒有貢獻
+        只有 2 人票       88.0%        94.0%
+        只有 3 人票       84.0%        90.0%
+        2 與 4           85.0%        94.0%
+
+    混合需求下連座位品質都一模一樣(0.3473 vs 0.3473)。唯一值得打開的情況是
+    **確定賣不完的場次** —— 那時擱淺的席位本來也賣不掉,而品質是唯一的槓桿。
+    """
+
     mid_cut_guard: int = 4
-    """中切時兩側剩餘的下限。設成「單筆張數上限」代表:切完兩側都還能服務
-    任何一張合法訂單,可服務能力零損失。"""
+    """中切時兩側剩餘的下限(僅在 allow_mid_cut 時生效)。設成「單筆張數上限」
+    代表切完兩側都還能服務任何一張合法訂單,可服務能力零損失。"""
 
     orphan_value: float = 0.3
     """φ(1):一個孤兒座之後真的被單人票買走的機率。單人票佔比越低就設越低。"""
@@ -228,9 +245,10 @@ def candidates(
 ) -> Iterator[Placement]:
     """一個 run 最多產生 3 個候選,每個 O(1)。
 
-    候選集合是 {靠左端, 靠右端} ∪ [mid_lo, tail − mid_lo] 夾出的中切點。
+    預設只有兩個候選(靠左端、靠右端)。`allow_mid_cut` 打開時多一個中切點:
     中切窗口是連續區間、且窗口內 cut_cost 恆為常數,所以「品質對位置單峰」
     保證 clamp 取到的就是窗口內最佳 —— 不必枚舉 tail + 1 個位置。
+    (單峰性正是 BlockGeometry 擋掉 decay < 0 的原因。)
 
     tail == 1 時一個候選都不產生。這就是「長度 L 的空段配不出 L − 1 張」的
     來源:每個空段的可配集合恰好是 {L} ∪ [1, L − 2]。
@@ -244,6 +262,8 @@ def candidates(
         if tail > 0:                                        # tail == 0 時兩端同一刀
             yield placement_at(run, tail, quantity, geo, policy)
 
+    if not policy.allow_mid_cut:
+        return
     lo, hi = policy.mid_lo, tail - policy.mid_lo            # 中切窗口
     if lo <= hi:
         ideal = geo.ideal_start(quantity) - run.start

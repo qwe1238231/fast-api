@@ -114,6 +114,6 @@ async def _handle_payment_aborted(db, redis, intent: dict) -> None:
         return  # someone else already transitioned it
     await db.commit()
     try:
-        await release_order_seat(redis, order)
+        await release_order_seat(db, redis, order)
     except Exception as exc:  # release is idempotent; a blip is a recoverable lost seat
         print(f"payment aborted for order {order_id}; expired but seat release failed: {exc}")

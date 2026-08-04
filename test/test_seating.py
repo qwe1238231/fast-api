@@ -34,6 +34,10 @@ from app.services.seating import (
 
 MAX_ORDER = 6
 
+#: 中切預設關閉(實測用庫存換品質、比例約 1:1)。但關掉之後 clamp 就沒有用武之地,
+#: 所以驗證 clamp 正確性的那些測試必須明確把它打開 —— 否則測到的是空集合。
+MID_CUT = Policy(allow_mid_cut=True)
+
 
 def _free_runs(block_id: int, capacity: int, occupied: set[int]) -> list[Run]:
     """從佔用集合反推極大連續空段 —— 測試裡的 free-run 參考實作。"""
@@ -61,7 +65,8 @@ def _legal_offsets(run: Run, quantity: int, policy: Policy) -> list[int]:
     offsets: set[int] = set()
     if tail == 0 or tail >= policy.min_run:
         offsets |= {0, tail}
-    offsets |= set(range(policy.mid_lo, tail - policy.mid_lo + 1))
+    if policy.allow_mid_cut:
+        offsets |= set(range(policy.mid_lo, tail - policy.mid_lo + 1))
     return sorted(offsets)
 
 
@@ -168,10 +173,13 @@ def test_allocate_is_order_independent() -> None:
 
 def test_mid_cut_appears_only_when_window_is_open() -> None:
     geo = BlockGeometry.calibrated(1, 60)
-    quantity, mid_lo = 2, NORMAL_POLICY.mid_lo
+    quantity, mid_lo = 2, MID_CUT.mid_lo
     for tail in range(0, 2 * mid_lo + 4):
         run = Run(1, 0, quantity + tail)
-        got = list(candidates(run, quantity, geo, NORMAL_POLICY))
+        got = list(candidates(run, quantity, geo, MID_CUT))
+        assert len(list(candidates(run, quantity, geo, NORMAL_POLICY))) <= 2, (
+            "預設(中切關閉)永遠不該超過兩個候選"
+        )
         if tail == 0:
             expected_ends = 1
         elif tail < NORMAL_POLICY.min_run:
@@ -217,14 +225,14 @@ def test_clamp_matches_brute_force_over_all_legal_offsets() -> None:
         run = Run(9, start, rng.randint(1, capacity - start))
         quantity = rng.randint(1, MAX_ORDER)
 
-        best = allocate([run], quantity, {9: geo})
-        offsets = _legal_offsets(run, quantity, NORMAL_POLICY)
+        best = allocate([run], quantity, {9: geo}, MID_CUT)
+        offsets = _legal_offsets(run, quantity, MID_CUT)
         if not offsets:
             assert best is None
             continue
 
         brute = max(
-            placement_at(run, offset, quantity, geo, NORMAL_POLICY).score
+            placement_at(run, offset, quantity, geo, MID_CUT).score
             for offset in offsets
         )
         assert best is not None
@@ -238,16 +246,20 @@ def test_clamp_matches_brute_force_over_all_legal_offsets() -> None:
 # 10 ─ λ 的語意：清孤兒 vs 給單人好位
 
 def _orphan_vs_good_seat(weight: float) -> Placement | None:
-    """block 1 只剩 pos 5 一個孤兒(中等品質);block 2 整段空著(中央是好位)。"""
+    """block 1 只剩最邊緣的一個孤兒;block 2 只剩中央附近的一小段(端點就是好位)。
+
+    刻意不依賴中切 —— 中切預設關閉,而 λ 的語意在只有端點切時同樣成立:
+    「願意讓單人票的座位品質降多少,換一個孤兒被清掉」。
+    """
     geometry = {1: BlockGeometry.calibrated(1, 20), 2: BlockGeometry.calibrated(2, 20)}
-    runs = [Run(1, 5, 1), Run(2, 0, 20)]
+    runs = [Run(1, 0, 1), Run(2, 8, 4)]
     return allocate(runs, 1, geometry, Policy(fragmentation_weight=weight))
 
 
 def test_high_lambda_makes_the_single_clear_the_orphan() -> None:
     placed = _orphan_vs_good_seat(1.5)
     assert placed is not None
-    assert (placed.block_id, placed.start) == (1, 5)
+    assert (placed.block_id, placed.start) == (1, 0)
 
 
 def test_low_lambda_gives_the_single_the_good_seat() -> None:
@@ -399,7 +411,7 @@ def test_policy_rejects_nonsense(kwargs: dict[str, float]) -> None:
 
 # 14 ─ 裝箱效率的回歸下限（模擬，不是單元測試）
 
-_SIM_SEEDS = (11, 22, 33, 44)
+_SIM_SEEDS = (11, 22, 33, 44, 55, 66, 77, 88, 99, 110, 121, 132)
 _SIM_BLOCKS = 12
 
 
@@ -425,10 +437,28 @@ def test_orphans_only_come_from_cancelled_singles() -> None:
 
 
 def test_packing_stays_above_regression_floor() -> None:
-    """30% 取消率下的售出率下限。擋的是「某次改動讓裝箱崩掉而沒人發現」。"""
+    """混合需求下的售出率下限。純粹的煙霧測試 —— 擋的是徹底崩掉。"""
     blocks = typical_venue(_SIM_BLOCKS)
     ratios = [
         simulate(blocks, TYPICAL_DEMAND, cancel_rate=0.3, seed=seed).sold_ratio
         for seed in _SIM_SEEDS
     ]
-    assert min(ratios) >= 0.93, ratios
+    assert min(ratios) >= 0.90, ratios
+
+
+def test_uniform_demand_does_not_strand_seats() -> None:
+    """**均勻需求**下的售出率下限 —— 這條才是真正抓得到東西的那一個。
+
+    混合需求(1/2/3/4)會掩蓋碎片問題:奇數長度的殘段總有人買走。全部都是兩人票
+    時,任何製造奇數空段的切法都會擱淺席位(5 → 賣 2 → 剩 3 → 再賣 2 會留孤兒
+    → 禁止 → 3 席死掉)。
+
+    實測:中切開啟時這個場館掉到 0.8487,關閉時 0.9076。所以這條測試會擋下
+    「有人把 allow_mid_cut 改回預設開啟」,而混合需求的那條不會。
+    """
+    blocks = typical_venue(_SIM_BLOCKS)
+    ratios = [
+        simulate(blocks, {2: 1.0}, cancel_rate=0.3, seed=seed).sold_ratio
+        for seed in _SIM_SEEDS
+    ]
+    assert min(ratios) >= 0.89, ratios

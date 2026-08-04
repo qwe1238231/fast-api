@@ -191,7 +191,7 @@ async def cancel_order(
     # post-commit, idempotent seat return; a failure here is a recoverable lost
     # seat (reconcile), NOT a failed cancel -> log, don't 500 the client.
     try:
-        await release_order_seat(redis, order)
+        await release_order_seat(db, redis, order)
     except Exception as exc:
         print(f"Order {order_id} cancelled but seat release failed (reconcile recovers): {exc}")
 

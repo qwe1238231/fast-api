@@ -93,7 +93,7 @@ async def test_cancel_releases_inventory(db, redis, published_event):
 
     assert await cancel_order(db, order) is True          # PENDING → CANCELLED (transition only)
     await db.commit()
-    assert await release_order_seat(redis, order) is True  # post-commit seat return
+    assert await release_order_seat(db, redis, order) is True  # post-commit seat return
 
     assert order.status == OrderStatus.CANCELLED
     assert await get_available(redis, event_id=published_event.id) == 5   # 票全還回來了

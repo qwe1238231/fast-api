@@ -91,6 +91,38 @@ class InsufficientInventory(InventoryError):
         self.available = available
         super().__init__(f"Event {event_id}: requested {requested}, only {available} available")
 
+class NoSeatsAvailable(InventoryError):
+    """這個張數在當下的空段分佈裡配不出來 —— **不等於賣完**。
+
+    `feasible` 帶著「現在配得出來的張數」,呼叫端才能給出可行的替代方案。明明看得到
+    空位卻被告知售完是客服災難的來源,所以這個錯誤必須跟 InsufficientInventory 分開。
+
+    注意不能簡化成「最大連號長度」:只剩一段 5 連號時 4 張是配不出來的(會留下孤兒),
+    回報 max_contiguous=5 然後拒絕 4 張正是誤導。
+    """
+    def __init__(self, *, event_id: int, zone_id: int, quantity: int, feasible: list[int]):
+        self.event_id = event_id
+        self.zone_id = zone_id
+        self.quantity = quantity
+        self.feasible = feasible
+        super().__init__(
+            f"Zone {zone_id} cannot seat {quantity} together; feasible: {feasible}"
+        )
+
+
+class SeatContention(InventoryError):
+    """配位的 CAS 連續撞太多次 —— 暫時性的,重送即可。
+
+    正常流量下出現就是訊號:讀-算-CAS 的時間窗 T 變長了(Redis 飽和、網路變慢),
+    而同時看到同一份快照的請求數 N = QPS × T 跟著上升。該做的是查 T,不是調高重試。
+    """
+    def __init__(self, *, event_id: int, zone_id: int, attempts: int):
+        self.event_id = event_id
+        self.zone_id = zone_id
+        self.attempts = attempts
+        super().__init__(f"Zone {zone_id}: seat allocation contended after {attempts} attempts")
+
+
 class AdmissionDenied(DomainError):
     """Order attempted without a valid waiting-room admission token."""
     def __init__(self, reason: str = "admission required"):

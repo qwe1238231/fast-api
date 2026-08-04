@@ -21,6 +21,8 @@ from app.core.exceptions import (
     BuyerInfoAlreadyExists,
     BuyerInfoNotFound,
     NationalIdAlreadyRegistered,
+    NoSeatsAvailable,
+    SeatContention,
     ZoneNotForEvent,
     ZoneRequired,
 )
@@ -111,6 +113,32 @@ def register_exception_handlers(app: FastAPI) -> None:
             },
         )
     
+    @app.exception_handler(NoSeatsAvailable)
+    async def _no_seats_available(request: Request, exc: NoSeatsAvailable):
+        # 409 而非 sold-out:這個區還有位子,只是湊不出這個張數的連號。回可行張數
+        # 讓前端能給出「改成 2 張?」而不是一句售完 —— 明明看得到空位卻被告知
+        # 售完是客服災難的來源。
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": str(exc),
+                "event_id": exc.event_id,
+                "zone_id": exc.zone_id,
+                "requested": exc.quantity,
+                "available_quantities": exc.feasible,
+            },
+        )
+
+    @app.exception_handler(SeatContention)
+    async def _seat_contention(request: Request, exc: SeatContention):
+        # 503 + Retry-After:純暫時性,原樣重送就會成功。用 409 會讓客戶端誤以為
+        # 是業務衝突而不重試。
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": str(exc), "event_id": exc.event_id, "zone_id": exc.zone_id},
+            headers={"Retry-After": "1"},
+        )
+
     @app.exception_handler(BuyerInfoNotFound)
     async def _buyer_info_not_found(request: Request, exc: BuyerInfoNotFound):
         return JSONResponse(

@@ -19,6 +19,7 @@ from app.core.config import get_settings
 from app.core.redis import create_redis_client
 from app.db.session import AsyncSessionLocal
 from app.models.order import Order, OrderStatus
+from app.models.seating import SeatHold
 from app.services.orders import expire_order, release_order_seat
 from app.crud.order import create_order, get_order_by_idempotency_key
 from app.crud.refresh_token import purge_expired
@@ -30,6 +31,7 @@ from app.services.inventory import (
     ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY,queue_depth,
 )
 from app.services.idempotency import mark_claim_failed
+from app.services.seat_runs import release_seats
 from app.services.waiting_room import set_admission_paused
 
 _settings = get_settings()
@@ -88,7 +90,7 @@ async def expire_pending_orders(ctx: dict) -> None:
             # committed EXPIRED — return the seat post-commit (idempotent, own step).
             # order.* stays readable after commit because expire_on_commit=False.
             try:
-                await release_order_seat(redis, order)
+                await release_order_seat(db, redis, order)
             except Exception as exc:
                 print(f"Order {order_id} expired but seat release failed (reconcile recovers): {exc}")
 
@@ -200,10 +202,11 @@ async def _persist_intent(fields: dict) -> str:
     """
     async with AsyncSessionLocal() as db:
         try:
-            # zone_id 是空字串或缺欄位時代表無座位圖的場次 → NULL。缺欄位的
-            # 情況是為了相容:升級前就躺在 stream 裡的舊 intent 沒有這個欄位。
+            # zone_id / block_id 是空字串或缺欄位時代表無座位圖的場次。缺欄位的
+            # 情況是為了相容:升級前就躺在 stream 裡的舊 intent 沒有這些欄位。
             zone_id = fields.get("zone_id") or None
-            await create_order(
+            block_id = fields.get("block_id") or None
+            order = await create_order(
                 db,
                 user_id=int(fields["user_id"]),
                 event_id=int(fields["event_id"]),
@@ -212,6 +215,18 @@ async def _persist_intent(fields: dict) -> str:
                 total_price_cents=int(fields["total_price_cents"]),
                 idempotency_key=UUID(fields["idempotency_key"]),
             )
+            if block_id:
+                # 與 order 同一個 txn。seat_holds 的 GiST EXCLUDE 會在這裡擋下任何
+                # 區間重疊 —— 那代表 Redis 的空段結構已經損壞,整個 txn 回滾、
+                # 這筆 intent 走既有的 dead-letter 流程,而復原方式是
+                # rebuild_zone_runs(絕不是「退還」那段區間,見該函式的說明)。
+                db.add(SeatHold(
+                    event_id=int(fields["event_id"]),
+                    block_id=int(block_id),
+                    order_id=order.id,
+                    start_pos=int(fields["start_pos"]),
+                    length=int(fields["quantity"]),
+                ))
             await db.commit()
             return "ok"
         except IntegrityError:
@@ -301,12 +316,26 @@ async def _dead_letter_intent(redis, entry_id: str, fields: dict) -> None:
 
     await redis.xadd(ORDER_DEAD_LETTER_KEY, {**fields, "original_id": entry_id})
     if not already_persisted:
-        await release(
-            redis,
-            event_id=int(fields["event_id"]),
-            quantity=int(fields["quantity"]),
-            marker=f"dl:{idem}",
-        )
+        block_id = fields.get("block_id") or None
+        if block_id:
+            # 座位場次:要還的是一段具體區間,不是一個數量。intent 從未落帳所以
+            # DB 沒有對應的 hold 列可刪 —— 直接把區間還回 Redis 就好。
+            await release_seats(
+                redis,
+                event_id=int(fields["event_id"]),
+                zone_id=int(fields["zone_id"]),
+                block_id=int(block_id),
+                start_pos=int(fields["start_pos"]),
+                length=int(fields["quantity"]),
+                marker=f"dl:{idem}",
+            )
+        else:
+            await release(
+                redis,
+                event_id=int(fields["event_id"]),
+                quantity=int(fields["quantity"]),
+                marker=f"dl:{idem}",
+            )
     await mark_claim_failed(redis, idempotency_key=idem)
     print(f"DEAD-LETTER order intent {entry_id} (persisted={already_persisted}): {dict(fields)}")
 

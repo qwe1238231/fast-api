@@ -37,6 +37,7 @@ from redis.commands.core import AsyncScript
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exceptions import NoSeatsAvailable, SeatContention
 from app.models.seating import Seat, SeatBlock, SeatHold
 from app.services.idempotency import _key as _claim_key
 from app.services.inventory import ORDER_STREAM_KEY, _key as _event_available_key
@@ -350,35 +351,6 @@ class SeatReservation:
     zone_remaining: int
 
 
-class NoSeatsAvailable(Exception):
-    """這個張數在當下的空段分佈裡配不出來 —— **不等於賣完**。
-
-    `feasible` 帶著「現在配得出來的張數」,呼叫端才能給出可行的替代方案而不是
-    一句「售完」;明明看得到空位卻被告知售完是客服災難的來源。
-    """
-
-    def __init__(self, *, zone_id: int, quantity: int, feasible: list[int]):
-        self.zone_id = zone_id
-        self.quantity = quantity
-        self.feasible = feasible
-        super().__init__(
-            f"Zone {zone_id} cannot seat {quantity} together; feasible: {feasible}"
-        )
-
-
-class SeatContention(Exception):
-    """CAS 連續失敗 MAX_CAS_ATTEMPTS 次 —— 暫時性的,重送即可。
-
-    這個例外出現在正常流量下就是訊號:時間窗 T 變長了(Redis 飽和、網路變慢),
-    N = QPS × T 跟著上升。該做的是查 T,而不是調高重試次數。
-    """
-
-    def __init__(self, *, zone_id: int, attempts: int):
-        self.zone_id = zone_id
-        self.attempts = attempts
-        super().__init__(f"Zone {zone_id}: seat CAS failed after {attempts} attempts")
-
-
 async def reserve_seats_and_enqueue(
     redis: Redis,
     *,
@@ -408,6 +380,7 @@ async def reserve_seats_and_enqueue(
         anchors = legal_anchors(state.runs, quantity, state.geometry, policy)
         if not anchors:
             raise NoSeatsAvailable(
+                event_id=event_id,
                 zone_id=zone_id,
                 quantity=quantity,
                 feasible=_feasible(state, policy),
@@ -455,7 +428,9 @@ async def reserve_seats_and_enqueue(
             zone_remaining=zone_remaining,
         )
 
-    raise SeatContention(zone_id=zone_id, attempts=MAX_CAS_ATTEMPTS)
+    raise SeatContention(
+        event_id=event_id, zone_id=zone_id, attempts=MAX_CAS_ATTEMPTS
+    )
 
 
 def _feasible(state: ZoneState, policy: Policy) -> list[int]:

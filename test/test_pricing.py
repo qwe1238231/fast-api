@@ -187,31 +187,42 @@ async def test_cached_zone_prices_keep_integer_keys(db, redis) -> None:
 async def test_seated_order_persists_zone_and_zone_price(
     client, db, redis, drain_orders
 ) -> None:
-    """有座位圖的場次:金額按 zone 價、`orders.zone_id` 要真的落到 DB。"""
-    venue = Venue(name="E2E Arena")
-    db.add(venue)
-    await db.flush()
-    front = Zone(venue_id=venue.id, name="前區", display_order=0)
-    back = Zone(venue_id=venue.id, name="後區", display_order=1)
-    db.add_all([front, back])
-    await db.flush()
+    """有座位圖的場次:金額按 zone 價、`orders.zone_id` 與 seat_holds 都要落到 DB。"""
+    from app.models.seating import SeatHold
+    from app.scripts.seed_venue import RowSpec, VenueSpec, ZoneSpec, seed_venue
+    from app.services.publish_event import publish_event
+
+    spec = VenueSpec(
+        name="E2E Arena",
+        zones=(
+            ZoneSpec(name="前區", display_order=0, rows=(RowSpec("A", (10,)),)),
+            ZoneSpec(name="後區", display_order=1, rows=(RowSpec("B", (10,)),)),
+        ),
+    )
+    venue = await seed_venue(db, spec)
+    zones = {
+        name: zone_id
+        for name, zone_id in (
+            await db.execute(select(Zone.name, Zone.id).where(Zone.venue_id == venue.id))
+        ).all()
+    }
 
     now = datetime.now(timezone.utc)
     event = Event(
         name="E2E Show", venue="E2E Arena", venue_id=venue.id,
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
-        total_seats=10, price_cents=100, status=EventStatus.PUBLISHED,
+        total_seats=20, price_cents=100, status=EventStatus.DRAFT,
     )
     db.add(event)
     await db.flush()
     db.add_all([
-        EventZonePrice(event_id=event.id, zone_id=front.id, price_cents=6000),
-        EventZonePrice(event_id=event.id, zone_id=back.id, price_cents=2000),
+        EventZonePrice(event_id=event.id, zone_id=zones["前區"], price_cents=6000),
+        EventZonePrice(event_id=event.id, zone_id=zones["後區"], price_cents=2000),
     ])
+    # publish 負責灌庫存 + 每個 zone 的空段結構。
+    await publish_event(db, redis, event)
     await db.commit()
-    await set_initial_stock(redis, event_id=event.id, total_seats=event.total_seats)
-    await invalidate_event_meta(redis, event_id=event.id)
 
     await client.post("/v1/users/", json={"username": "zoner", "password": "secret123"})
     token = await client.post(
@@ -240,7 +251,7 @@ async def test_seated_order_persists_zone_and_zone_price(
     # 帶後區 → 202,金額按後區價
     accepted = await client.post(
         "/v1/orders/",
-        json={"event_id": event.id, "quantity": 2, "zone_id": back.id},
+        json={"event_id": event.id, "quantity": 2, "zone_id": zones["後區"]},
         headers=headers(),
     )
     assert accepted.status_code == 202, accepted.text
@@ -248,8 +259,13 @@ async def test_seated_order_persists_zone_and_zone_price(
     await drain_orders()
     order = await db.scalar(select(Order).where(Order.event_id == event.id))
     assert order is not None
-    assert order.zone_id == back.id, "zone_id 必須穿過 Lua 的 XADD 落到 DB"
+    assert order.zone_id == zones["後區"], "zone_id 必須穿過 Lua 的 XADD 落到 DB"
     assert order.total_price_cents == 2 * 2000
+
+    hold = await db.scalar(select(SeatHold).where(SeatHold.order_id == order.id))
+    assert hold is not None, "worker 必須在同一個 txn 建出 seat_holds"
+    assert hold.length == 2
+    assert hold.event_id == event.id
 
 
 @pytest.mark.asyncio

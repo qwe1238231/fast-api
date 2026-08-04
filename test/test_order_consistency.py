@@ -82,9 +82,9 @@ async def test_release_order_seat_is_idempotent(db, redis, published_event):
     order = await _persist_pending_order(db, published_event, quantity=2)
     await reserve(redis, event_id=published_event.id, quantity=2)   # 5 -> 3
 
-    assert await release_order_seat(redis, order) is True           # 3 -> 5
+    assert await release_order_seat(db, redis, order) is True           # 3 -> 5
     assert await get_available(redis, event_id=published_event.id) == 5
-    assert await release_order_seat(redis, order) is False          # replay = no-op
+    assert await release_order_seat(db, redis, order) is False          # replay = no-op
     assert await get_available(redis, event_id=published_event.id) == 5
 
 

@@ -209,8 +209,12 @@ async def test_seeded_blocks_drive_the_allocator(db) -> None:
 
     placed = allocate(runs, 4, geometry)
     assert placed is not None
-    # 最好的位子必須落在容量 12 的中央 block(側邊 block 有 side_penalty 折扣)
-    assert geometry[placed.block_id].capacity == 12
+    # 最好的位子必須落在前排。(不再斷言落在容量 12 的中央 block —— 中切預設關閉
+    # 之後只能從兩端切,而小 block 的端點反而更靠近它自己的中心。)
+    chosen_row = await db.scalar(
+        select(SeatBlock.row_label).where(SeatBlock.id == placed.block_id)
+    )
+    assert chosen_row == "A", "前排的品質較高,配位應該優先"
 
     # 配出來的 4 個座位在 DB 裡真的存在,而且門牌不必連號。
     labels = (

@@ -215,7 +215,12 @@ async def cancel_order(
     try:
         await release_order_seat(db, redis, order)
     except Exception as exc:
-        print(f"Order {order_id} cancelled but seat release failed (reconcile recovers): {exc}")
+        print(
+                    f"ALERT order {order_id} cancelled but seat release failed: {exc} "
+                    f"— for a SEATED order nothing repairs this automatically "
+                    f"(reconcile_inventory only fixes the event counter); run "
+                    f"`python -m app.scripts.rebuild_seat_runs <event_id>` once the stream drains"
+                )
 
 @router.post("/{order_id}/payment-intent", response_model=PaymentIntentResponse)
 async def create_order_payment_intent(

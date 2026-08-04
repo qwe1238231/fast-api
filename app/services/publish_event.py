@@ -2,9 +2,9 @@ from redis.asyncio import Redis as RedisClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.exceptions import EventError, SeatMapMismatch
+from app.core.exceptions import EventError, SeatMapMismatch, ZonePricesIncomplete
 from app.models.event import Event, EventStatus
-from app.models.seating import SeatBlock, Zone
+from app.models.seating import EventZonePrice, SeatBlock, Zone
 from app.services.inventory import set_initial_stock
 from app.services.event_cache import invalidate_event_meta
 from app.services.seat_runs import rebuild_zone_runs
@@ -31,6 +31,29 @@ async def publish_event(
         )
         if capacity != event.total_seats:
             raise SeatMapMismatch(event.id, event.total_seats, capacity)
+
+        # 每個 zone 都必須有票價。少一個的話它的容量算進 total_seats(上面那條
+        # 檢查強制的)但永遠賣不掉 —— event:available 的下限就永遠 > 0,等候室的
+        # sold_out 永不觸發,而漂移偵測因為內部自洽也不會叫。
+        unpriced = list(
+            (
+                await db.scalars(
+                    select(Zone.id)
+                    .outerjoin(
+                        EventZonePrice,
+                        (EventZonePrice.zone_id == Zone.id)
+                        & (EventZonePrice.event_id == event.id),
+                    )
+                    .where(
+                        Zone.venue_id == event.venue_id,
+                        EventZonePrice.price_cents.is_(None),
+                    )
+                    .order_by(Zone.id)
+                )
+            ).all()
+        )
+        if unpriced:
+            raise ZonePricesIncomplete(event.id, unpriced)
 
     event.status = EventStatus.PUBLISHED
     await db.flush()

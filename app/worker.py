@@ -96,7 +96,12 @@ async def expire_pending_orders(ctx: dict) -> None:
             try:
                 await release_order_seat(db, redis, order)
             except Exception as exc:
-                print(f"Order {order_id} expired but seat release failed (reconcile recovers): {exc}")
+                print(
+                    f"ALERT order {order_id} expired but seat release failed: {exc} "
+                    f"— for a SEATED order nothing repairs this automatically "
+                    f"(reconcile_inventory only fixes the event counter); run "
+                    f"`python -m app.scripts.rebuild_seat_runs <event_id>` once the stream drains"
+                )
 
 async def purge_expired_refresh_tokens(ctx: dict) -> None:
     """Cron job: purge expired refresh tokens."""
@@ -210,6 +215,15 @@ async def _persist_intent(fields: dict) -> str:
             # 情況是為了相容:升級前就躺在 stream 裡的舊 intent 沒有這些欄位。
             zone_id = fields.get("zone_id") or None
             block_id = fields.get("block_id") or None
+            if bool(zone_id) != bool(block_id):
+                # 兩個判別式必須同步:建 hold 看 block_id,而 release_order_seat
+                # 分流看 order.zone_id。只有一個有值的話會建出 hold 卻走計數器
+                # 釋放路徑 —— 區間永遠不還,而且沒有任何警報。當成 poison 處理。
+                print(
+                    f"ALERT order intent has zone_id={zone_id!r} but block_id={block_id!r} "
+                    f"— must be both or neither; refusing to persist: {dict(fields)}"
+                )
+                return "failed"
             order = await create_order(
                 db,
                 user_id=int(fields["user_id"]),
@@ -584,6 +598,7 @@ async def detect_seat_structure_drift(ctx: dict) -> list[dict]:
     redis = ctx["redis_client"]
     backlog, _ = await queue_depth(redis)
     drifts: list[dict] = []
+    zone_totals: dict[int, int] = {}     # event_id → Σ zone available
 
     async with AsyncSessionLocal() as db:
         rows = (
@@ -614,6 +629,7 @@ async def detect_seat_structure_drift(ctx: dict) -> list[dict]:
 
             total = sum(int(length) for length in runs_raw.values())
             counter = await redis.get(_zone_available_key(event_id, zone_id))
+            zone_totals[event_id] = zone_totals.get(event_id, 0) + int(counter or 0)
             if counter is not None and int(counter) != total:
                 drifts.append({
                     "kind": "counter", "event_id": event_id, "zone_id": zone_id,
@@ -658,8 +674,25 @@ async def detect_seat_structure_drift(ctx: dict) -> list[dict]:
                 })
                 print(
                     f"ALERT seat structure drift event={event_id} zone={zone_id} "
-                    f"— Redis 空段不等於 DB 佔用的補集,需要 rebuild_zone_runs"
+                    f"— Redis 空段不等於 DB 佔用的補集;修復:"
+                    f"python -m app.scripts.rebuild_seat_runs {event_id} --zone {zone_id}"
                 )
+
+    # 座位訂單的每一次配位都同時扣 zone 與 event 兩個計數器,所以這條必須成立。
+    # 它抓的是「reconcile_inventory 只修了 event 計數器」之後的不一致 —— 那種
+    # 不一致三條 per-zone 檢查都看不到(counter 只比對單一 zone 內部)。
+    for event_id, zone_sum in zone_totals.items():
+        event_counter = await redis.get(_event_available_key(event_id))
+        if event_counter is None or int(event_counter) == zone_sum:
+            continue
+        drifts.append({
+            "kind": "event_total", "event_id": event_id,
+            "expected": zone_sum, "actual": int(event_counter),
+        })
+        print(
+            f"ALERT seat event-total drift event={event_id} "
+            f"event_counter={event_counter} sum_of_zones={zone_sum}"
+        )
 
     return drifts
 

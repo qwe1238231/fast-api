@@ -25,13 +25,16 @@ pytestmark = pytest.mark.asyncio
 
 @pytest_asyncio.fixture
 async def arena(db, redis):
-    """前區 6 席 / 後區 5 席 / 未定價區 4 席。後區刻意是奇數以便測可行張數。"""
+    """前區 6 席 / 後區 5 席,兩區都定價(publish 現在要求每個 zone 都有票價)。
+
+    另外在**發佈之後**塞一個未定價的 zone —— 那是「蓋了新看台區」的真實情境,
+    也是 `list_zone_availability` 那道過濾唯一還會被觸發的路徑。
+    """
     spec = VenueSpec(
         name="Zones Arena",
         zones=(
             ZoneSpec(name="前區", display_order=0, rows=(RowSpec("A", (6,)),)),
             ZoneSpec(name="後區", display_order=1, rows=(RowSpec("B", (5,)),)),
-            ZoneSpec(name="未定價區", display_order=2, rows=(RowSpec("C", (4,)),)),
         ),
     )
     venue = await seed_venue(db, spec)
@@ -46,16 +49,21 @@ async def arena(db, redis):
         name="Zoned Show", venue=spec.name, venue_id=venue.id,
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
-        total_seats=15, price_cents=100, status=EventStatus.DRAFT,
+        total_seats=11, price_cents=100, status=EventStatus.DRAFT,
     )
     db.add(event)
     await db.flush()
     db.add_all([
         EventZonePrice(event_id=event.id, zone_id=zones["前區"], price_cents=6000),
         EventZonePrice(event_id=event.id, zone_id=zones["後區"], price_cents=2000),
-        # 「未定價區」刻意不設價 —— 不可賣,不該出現在選單上。
     ])
     await publish_event(db, redis, event)
+
+    # 發佈之後才蓋好的新區:對這個場次沒有票價,所以不可賣。
+    late = Zone(venue_id=venue.id, name="未定價區", display_order=2)
+    db.add(late)
+    await db.flush()
+    zones["未定價區"] = late.id
     await db.commit()
     return {"event_id": event.id, "zones": zones}
 
@@ -95,7 +103,11 @@ async def test_zone_list_is_ordered_and_priced(client, arena) -> None:
 
 
 async def test_unpriced_zone_is_not_offered(client, arena) -> None:
-    """這場沒設票價的區不可賣,就別出現在選單上 —— 否則使用者選了只會拿到 422。"""
+    """發佈後才新增的 zone 對這個場次沒有票價,不可賣,就別出現在選單上。
+
+    publish 現在會擋下「發佈時就有未定價 zone」的情況(那會讓場次永遠賣不完),
+    所以這道過濾剩下的用途就是這個 —— 場館後來擴建。
+    """
     body = (await client.get(f"/v1/events/{arena['event_id']}/zones")).json()
     assert "未定價區" not in [z["name"] for z in body]
 

@@ -304,3 +304,41 @@ async def test_publish_refuses_a_mismatched_total_seats(db, redis) -> None:
     assert excinfo.value.total_seats == 100
     # 擋在改狀態之前 —— 失敗的發佈不該留下半途的狀態。
     assert event.status == EventStatus.DRAFT
+
+
+async def test_publish_refuses_an_unpriced_zone(db, redis) -> None:
+    """未定價的 zone 會讓場次**永遠賣不完**:它的容量算進 total_seats(上面那條
+    檢查強制的)但下單會被拒,於是 event:available 的下限永遠 > 0、等候室的
+    sold_out 永不觸發。而漂移偵測因為內部自洽也不會叫 —— 沒有警報的錯誤最貴。
+    """
+    from app.core.exceptions import ZonePricesIncomplete
+
+    spec = VenueSpec(
+        name="Unpriced Arena",
+        zones=(
+            ZoneSpec(name="有價區", display_order=0, rows=(RowSpec("A", (6,)),)),
+            ZoneSpec(name="無價區", display_order=1, rows=(RowSpec("B", (6,)),)),
+        ),
+    )
+    venue = await seed_venue(db, spec)
+    zones = {
+        name: zid
+        for name, zid in (
+            await db.execute(select(Zone.name, Zone.id).where(Zone.venue_id == venue.id))
+        ).all()
+    }
+    now = datetime.now(timezone.utc)
+    event = Event(
+        name="Unpriced Show", venue=spec.name, venue_id=venue.id,
+        starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
+        sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
+        total_seats=12, price_cents=100, status=EventStatus.DRAFT,
+    )
+    db.add(event)
+    await db.flush()
+    db.add(EventZonePrice(event_id=event.id, zone_id=zones["有價區"], price_cents=1000))
+
+    with pytest.raises(ZonePricesIncomplete) as excinfo:
+        await publish_event(db, redis, event)
+    assert excinfo.value.zone_ids == [zones["無價區"]]
+    assert event.status == EventStatus.DRAFT, "擋在改狀態之前"

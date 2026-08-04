@@ -150,3 +150,23 @@ async def test_redis_internal_checks_run_even_with_a_backlog(redis, seated) -> N
 async def test_unseated_events_are_not_inspected(redis, published_event) -> None:
     """純計數器的舊場次沒有座位結構可查 —— 它由 detect_inventory_drift 顧。"""
     assert await _drift(redis) == []
+
+
+# ─ A4:event 計數器必須等於各 zone 計數器之和
+
+async def test_event_total_must_equal_the_sum_of_zone_counters(redis, seated) -> None:
+    """座位訂單的每次配位都同時扣 zone 與 event 兩個計數器,所以這條必須成立。
+
+    它抓的是「`reconcile_inventory` 只修了 event 計數器」之後留下的不一致 ——
+    那種不一致三條 per-zone 檢查都看不到(`counter` 只比對單一 zone 內部)。
+    """
+    from app.services.inventory import _key as _event_available_key
+
+    event_id, zone_id = seated["event_id"], seated["zone_id"]
+    assert await _drift(redis) == []
+
+    await redis.set(_event_available_key(event_id), 99)
+    drifts = await _drift(redis)
+    assert {
+        "kind": "event_total", "event_id": event_id, "expected": 12, "actual": 99,
+    } in drifts

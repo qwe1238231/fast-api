@@ -41,6 +41,7 @@ from app.core.exceptions import (
     InventoryNotReconcilable,
     NoSeatsAvailable,
     SeatContention,
+    SeatReleaseOverlap,
 )
 from app.models.seating import Seat, SeatBlock, SeatHold
 from app.services.idempotency import _key as _claim_key
@@ -362,21 +363,57 @@ _claim_script: AsyncScript | None = None
 # 歸還一個區間並與左右**緊鄰**的空段合併(boundary tags,全 O(1))。
 #
 # KEYS[1]=runs  KEYS[2]=ends  KEYS[3]=released marker
-# KEYS[4]=zone available  KEYS[5]=event available
+# KEYS[4]=zone available  KEYS[5]=event available  KEYS[6]=geom
 # ARGV[1]=block  ARGV[2]=start  ARGV[3]=length  ARGV[4]=marker TTL
-# 回傳:{'DUP'} | {'OK', merged_start, merged_length, zone_remaining}
+# 回傳:{'DUP'} | {'OVERLAP', run_start, run_length} | {'OOB', capacity}
+#      | {'OK', merged_start, merged_length, zone_remaining}
 _RELEASE_SEATS_LUA = """
 local function f(block, pos) return block .. ':' .. string.format('%d', pos) end
 
--- SETNX 讓重放變成 no-op。這裡它防的不只是多算幾個座位:重複插入同一段會讓
--- 下一次合併把兩個 run 併成宣稱同一批座位的一個 —— 直接導致重複售出。
-if not redis.call('SET', KEYS[3], '1', 'NX', 'EX', tonumber(ARGV[4])) then
+-- 1) 重放檢查必須在驗證之前。第一次釋放成功之後那個區間就是空的,所以一個合法的
+--    重放若先跑驗證會被誤判成 OVERLAP。marker 讓重放成為 no-op,而它防的不只是
+--    多算幾個座位:重複插入同一段會讓下一次合併把兩個 run 併成宣稱同一批座位的
+--    一個 —— 直接導致重複售出。
+if redis.call('EXISTS', KEYS[3]) == 1 then
     return {'DUP'}
 end
 
 local block = ARGV[1]
 local lo = tonumber(ARGV[2])
 local hi = lo + tonumber(ARGV[3])
+
+-- 2a) 上界:區間必須落在 block 裡面。落在外面的話它不與任何空段相交,所以下面
+--     那道重疊檢查放它過去 —— 然後寫出一段超出容量的假空段,那些「座位」會被
+--     配給真實的訂單。geom 存了容量,所以這是一次 HGET 的事。
+local geom = redis.call('HGET', KEYS[6], block)
+if geom then
+    local capacity = tonumber(string.match(geom, '^(%d+):'))
+    if lo < 0 or hi > capacity then
+        return {'OOB', tostring(capacity)}
+    end
+end
+
+-- 2b) 驗證:歸還的區間必須完全是「已佔用」的,即不與任何既有空段相交。
+--    刻意用 O(R) 掃描而不是 O(1) 邊界查詢 —— 一個被既有空段**完整包含**的區間
+--    (例如空段 [0,10) 裡的 [2,4))用邊界比對永遠找不到,而那正是最危險的情況:
+--    它會寫出兩段互相重疊的空段,而 runs/ends 一致性檢查抓不到(重疊 runs 推導出
+--    的 ends 剛好就是實際的 ends)。release 不在搶票熱路徑上(過期掃描、取消、
+--    dead-letter),付得起這個掃描;配位那支 Lua 仍然是 O(1)。
+local all = redis.call('HGETALL', KEYS[1])
+for i = 1, #all, 2 do
+    local sep = string.find(all[i], ':')
+    if string.sub(all[i], 1, sep - 1) == block then
+        local run_lo = tonumber(string.sub(all[i], sep + 1))
+        local run_hi = run_lo + tonumber(all[i + 1])
+        if run_lo < hi and lo < run_hi then
+            return {'OVERLAP', tostring(run_lo), tostring(run_hi - run_lo)}
+        end
+    end
+end
+
+-- 3) 通過驗證才寫 marker。反過來的話,一次拿錯區間的呼叫會燒掉 marker,使後續
+--    正確的釋放變成 DUP no-op —— 座位就永遠回不來了。
+redis.call('SET', KEYS[3], '1', 'EX', tonumber(ARGV[4]))
 
 -- 左鄰:它的 end 等於我的 start(靠 ends 反向索引才查得到)。
 local left_start = redis.call('HGET', KEYS[2], f(block, lo))
@@ -549,12 +586,19 @@ async def release_seats(
             _released_key(marker),
             _zone_available_key(event_id, zone_id),
             _event_available_key(event_id),
+            _geom_key(event_id, zone_id),
         ],
         args=[block_id, start_pos, length, ttl_seconds],
         client=redis,
     )
     if result[0] == "DUP":
         return False
+    if result[0] in ("OVERLAP", "OOB"):
+        raise SeatReleaseOverlap(
+            event_id=event_id, zone_id=zone_id,
+            block_id=block_id, start=start_pos, length=length,
+            reason="out of block bounds" if result[0] == "OOB" else "intersects a free run",
+        )
     zone_remaining = int(result[3])
     if zone_remaining - length <= 0 < zone_remaining:   # 從售完回到有票
         await publish_event_poke(redis, event_id)

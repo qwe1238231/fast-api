@@ -18,7 +18,11 @@ from app.models.user import User
 from app.models.order import Order, OrderStatus
 from app.scripts.seed_venue import RowSpec, VenueSpec, ZoneSpec, odd_even_labels, seed_venue
 from app.services.inventory import ORDER_STREAM_KEY, _key as _event_available_key
-from app.core.exceptions import InventoryNotReconcilable, NoSeatsAvailable
+from app.core.exceptions import (
+    InventoryNotReconcilable,
+    NoSeatsAvailable,
+    SeatReleaseOverlap,
+)
 from app.services.seat_runs import (
     MAX_TICKETS_PER_ORDER,
     STRICT_MISS_THRESHOLD,
@@ -561,3 +565,92 @@ async def test_the_miss_counter_expires(db, redis) -> None:
         await _try(redis, event, zone_id, 4)
     ttl = await redis.ttl(_misses_key(event.id, zone_id))
     assert 0 < ttl <= STRICT_MISS_TTL_SECONDS
+
+
+# ─ A1:release 的區間驗證
+
+async def test_release_of_a_free_interval_is_rejected(db, redis, zone_fixture) -> None:
+    """歸還一個「本來就是空的」區間會寫出兩段互相重疊的空段 —— 同一批座位賣第二次。
+
+    而 runs/ends 一致性檢查**抓不到**它(重疊 runs 推導出的 ends 剛好就是實際的
+    ends),counter 檢查也抓不到(兩者由同一支 Lua 一起改)。只有跟 DB 比對的
+    complement 看得見,而那條需要 stream 排空 —— 也就是尖峰期正好抓不到。
+    所以必須在寫入前擋。
+    """
+    event, zone_id = zone_fixture["event"], zone_fixture["zone_id"]
+    run = (await _redis_runs(redis, event.id, zone_id))[0]
+    before = await _redis_runs(redis, event.id, zone_id)
+
+    with pytest.raises(SeatReleaseOverlap):
+        await release_seats(
+            redis, event_id=event.id, zone_id=zone_id, block_id=run.block_id,
+            start_pos=run.start + 2, length=2, marker="wrong-interval",
+        )
+    assert await _redis_runs(redis, event.id, zone_id) == before, "結構不得被動到"
+    await _assert_indexes_agree(redis, event.id, zone_id)
+
+
+async def test_a_rejected_release_does_not_burn_the_marker(db, redis, zone_fixture) -> None:
+    """驗證失敗不能寫 marker —— 否則之後帶同一個 marker 的正確釋放會變成 DUP
+    no-op,那些座位就永遠回不來了。"""
+    event, zone_id = zone_fixture["event"], zone_fixture["zone_id"]
+    reserved = await reserve_seats_and_enqueue(
+        redis, event_id=event.id, zone_id=zone_id, user_id=1, quantity=2,
+        total_price_cents=200, idempotency_key=str(uuid4()),
+    )
+    assert reserved is not None
+
+    # 先用一個確定是空的(且在 block 內)的區間帶著 marker 打一次
+    free = next(
+        r for r in await _redis_runs(redis, event.id, zone_id)
+        if r.block_id == reserved.block_id and r.length >= 2
+    )
+    with pytest.raises(SeatReleaseOverlap):
+        await release_seats(
+            redis, event_id=event.id, zone_id=zone_id, block_id=free.block_id,
+            start_pos=free.start, length=2, marker="order:9",
+        )
+    # 再用正確的區間 + 同一個 marker → 必須成功
+    assert await release_seats(
+        redis, event_id=event.id, zone_id=zone_id, block_id=reserved.block_id,
+        start_pos=reserved.start_pos, length=reserved.length, marker="order:9",
+    )
+    assert int(await redis.get(_zone_available_key(event.id, zone_id))) == 48
+
+
+async def test_a_legitimate_replay_is_still_a_dup_not_an_overlap(
+    db, redis, zone_fixture
+) -> None:
+    """重放檢查必須在區間驗證之前:第一次釋放成功後那段就是空的,先驗證會把
+    合法的重放誤判成 OVERLAP。"""
+    event, zone_id = zone_fixture["event"], zone_fixture["zone_id"]
+    reserved = await reserve_seats_and_enqueue(
+        redis, event_id=event.id, zone_id=zone_id, user_id=1, quantity=2,
+        total_price_cents=200, idempotency_key=str(uuid4()),
+    )
+    assert reserved is not None
+    args = dict(
+        event_id=event.id, zone_id=zone_id, block_id=reserved.block_id,
+        start_pos=reserved.start_pos, length=reserved.length, marker="order:11",
+    )
+    assert await release_seats(redis, **args) is True
+    assert await release_seats(redis, **args) is False    # DUP,不是 OVERLAP
+
+
+async def test_release_beyond_the_block_is_rejected(db, redis, zone_fixture) -> None:
+    """落在 block 外面的區間不與任何空段相交,所以重疊檢查放它過去 —— 然後寫出
+    一段超出容量的假空段,那些不存在的「座位」會被配給真實訂單。
+
+    這個洞是上面那條 marker 測試在寫的時候意外撞出來的:原本的測試用
+    `start + length` 當「空的區間」,而當配位落在 run 右端時那就正好越界。
+    """
+    event, zone_id = zone_fixture["event"], zone_fixture["zone_id"]
+    run = max(await _redis_runs(redis, event.id, zone_id), key=lambda r: r.length)
+    before = await _redis_runs(redis, event.id, zone_id)
+
+    with pytest.raises(SeatReleaseOverlap, match="out of block bounds"):
+        await release_seats(
+            redis, event_id=event.id, zone_id=zone_id, block_id=run.block_id,
+            start_pos=run.start + run.length, length=2, marker="oob",
+        )
+    assert await _redis_runs(redis, event.id, zone_id) == before

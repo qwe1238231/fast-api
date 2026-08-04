@@ -45,6 +45,26 @@ class ZoneNotForEvent(EventError):
         self.reason = reason
         super().__init__(f"Zone {zone_id} is not sellable for event {event_id}: {reason}")
 
+class ZonePricesIncomplete(EventError):
+    """座位場次有 zone 沒設票價。
+
+    後果不是「那一區賣不掉」而已 —— `total_seats` 包含它的容量(SeatMapMismatch
+    強制的),但 `list_zone_availability` 不會列出它、下單也會被 ZoneNotForEvent
+    拒絕。於是那些席位永遠賣不掉、`event:available` 的下限永遠 > 0,等候室的
+    sold_out 因此**永不觸發**,使用者一直排隊等一批買不到的票。
+
+    而漂移偵測**不會叫**:expected = total_seats − SUM(quantity) 跟 actual 完全
+    一致,系統內部自洽,只是賣不完。沒有警報的錯誤最貴,所以在 publish 擋。
+    """
+    def __init__(self, event_id: int, zone_ids: list[int]):
+        self.event_id = event_id
+        self.zone_ids = zone_ids
+        super().__init__(
+            f"Event {event_id}: zones {zone_ids} have no price — every zone of a seated "
+            f"event must be priced, or its seats can never be sold"
+        )
+
+
 class SeatMapMismatch(EventError):
     """`events.total_seats` 與座位圖的實際容量不符。
 
@@ -139,6 +159,30 @@ class SeatContention(InventoryError):
         self.zone_id = zone_id
         self.attempts = attempts
         super().__init__(f"Zone {zone_id}: seat allocation contended after {attempts} attempts")
+
+
+class SeatReleaseOverlap(InventoryError):
+    """要歸還的區間跟既有空段相交 —— 呼叫端拿錯了區間。
+
+    這不是競爭而是 bug,而且是最危險的一種:硬寫下去會產生兩段互相重疊的空段,
+    於是同一批座位被賣第二次。而 `runs`/`ends` 一致性檢查**抓不到**它(重疊的 runs
+    推導出的 ends 剛好就是實際的 ends),只有跟 DB 比對的 complement 檢查看得見,
+    而那條需要 stream 排空。所以必須在寫入前擋。
+    """
+    def __init__(
+        self, *, event_id: int, zone_id: int, block_id: int,
+        start: int, length: int, reason: str = "intersects a free run",
+    ):
+        self.event_id = event_id
+        self.zone_id = zone_id
+        self.block_id = block_id
+        self.start = start
+        self.length = length
+        self.reason = reason
+        super().__init__(
+            f"Release of block {block_id} [{start}, {start + length}) in zone {zone_id} "
+            f"rejected ({reason}) — the caller has the wrong interval"
+        )
 
 
 class SeatsNotAssigned(OrderError):

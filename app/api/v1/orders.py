@@ -157,14 +157,22 @@ async def get_order_seats(
 ) -> SeatedOrderDetail:
     """已確認訂單的座號。
 
-    確認之前刻意 409 而不是回空值:座號在那之前還可能被 compaction 移動,吐出去
-    就等於凍結它。回一個明確的「尚未公開」比回 null 好 —— 後者跟「這場沒有座位圖」
-    分不出來。
+    兩種情況必須分開:
+      404 —— 這場沒有座位圖,座號這個資源**永遠不會**存在
+      409 —— 有座位圖但還沒確認,**稍後**會有
+
+    以前兩者都回 409,而 409 隱含「重試會有結果」—— 一個「輪詢到 200 才顯示座號」
+    的客戶端對無座位圖的訂單會永遠輪詢下去。
     """
     order = await get_order_by_id(db, order_id)
     if order is None or order.user_id != current_user.id:
         raise OrderNotFound(order_id=order_id)
-    if order.zone_id is None or order.status != OrderStatus.CONFIRMED:
+    if order.zone_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This event has no seat map; the order has no seat numbers",
+        )
+    if order.status != OrderStatus.CONFIRMED:
         raise SeatsNotAssigned(order_id=order_id)
     return await describe_order_seats(db, order)
 

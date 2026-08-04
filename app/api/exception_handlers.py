@@ -23,6 +23,7 @@ from app.core.exceptions import (
     NationalIdAlreadyRegistered,
     NoSeatsAvailable,
     SeatContention,
+    SeatPlacementOutOfRun,
     SeatsNotAssigned,
     ZoneNotForEvent,
     ZoneRequired,
@@ -138,6 +139,17 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"detail": str(exc), "event_id": exc.event_id, "zone_id": exc.zone_id},
             headers={"Retry-After": "1"},
+        )
+
+    @app.exception_handler(SeatPlacementOutOfRun)
+    async def _seat_placement_out_of_run(request: Request, exc: SeatPlacementOutOfRun):
+        # 這是我們的 bug,所以 500(不是 409/503 —— 那會讓客戶端以為重送有用)。
+        # 但它仍是 DomainError,所以下單端點會把單次入場券退還:使用者不該為我們的
+        # bug 重新排隊。
+        print(f"ALERT allocator bug: {exc}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "seat allocation failed unexpectedly"},
         )
 
     @app.exception_handler(SeatsNotAssigned)

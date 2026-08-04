@@ -19,6 +19,7 @@ from app.models.order import Order, OrderStatus
 from app.scripts.seed_venue import RowSpec, VenueSpec, ZoneSpec, odd_even_labels, seed_venue
 from app.services.inventory import ORDER_STREAM_KEY, _key as _event_available_key
 from app.core.exceptions import (
+    InsufficientInventory,
     InventoryNotReconcilable,
     NoSeatsAvailable,
     SeatReleaseOverlap,
@@ -407,11 +408,13 @@ async def test_no_orphan_survives_the_random_sequence(db, redis, zone_fixture) -
 
 # ─ 收尾期 ratchet
 
-async def _tiny_zone(db, redis, capacity: int):
-    """單一 block 的 zone,方便構造「結構性卡住」。"""
+async def _tiny_zone(db, redis, *blocks: int):
+    """小 zone,方便構造「結構性卡住」。多個 block 用來在席數仍充足的前提下製造
+    「湊不出連號」—— 席數不足現在是 InsufficientInventory,不再算 ratchet 訊號。"""
+    capacity = sum(blocks)
     spec = VenueSpec(
-        name=f"Ratchet {capacity}",
-        zones=(ZoneSpec(name="小區", display_order=0, rows=(RowSpec("A", (capacity,)),)),),
+        name=f"Ratchet {blocks}",
+        zones=(ZoneSpec(name="小區", display_order=0, rows=(RowSpec("A", blocks),)),),
     )
     venue = await seed_venue(db, spec)
     zone_id = await db.scalar(select(Zone.id).where(Zone.venue_id == venue.id))
@@ -454,8 +457,11 @@ async def test_a_success_resets_the_miss_counter(db, redis) -> None:
 
     這是為什麼混合需求下 ratchet 永遠不觸發:3 席空段拒絕了兩人票,但下一筆
     三人票馬上用掉它,計數器歸零。
+
+    用兩個 5 席 block:每段配 4 張都會留下孤兒(tail=1)所以被拒,但總席數 10
+    始終 >= 4 —— 否則會落進「席數不足」那條分支,而那條刻意不記 ratchet 訊號。
     """
-    event, zone_id = await _tiny_zone(db, redis, 5)
+    event, zone_id = await _tiny_zone(db, redis, 5, 5)
 
     for _ in range(STRICT_MISS_THRESHOLD - 1):
         with pytest.raises(NoSeatsAvailable):
@@ -494,15 +500,18 @@ async def test_ratchet_recovers_the_seats_uniform_demand_would_strand(db, redis)
     while misses <= STRICT_MISS_THRESHOLD + 1:
         try:
             reserved = await _try(redis, event, zone_id, 2)
-        except NoSeatsAvailable:
+        except NoSeatsAvailable:          # 席數夠但湊不出連號 → ratchet 的訊號
             misses += 1
             continue
+        except InsufficientInventory:     # 真的沒席位了 → 收工
+            break
         assert reserved is not None
         misses = 0
         sold += 2
         assert sold <= 8
 
-    # 9 → 7 → 5 → 3(嚴格策略到此為止,擱淺 3 席)→ 放寬 → 3 賣掉 2 → 剩 1 席。
+    # 9 → 7 → 5 → 3(嚴格策略到此為止,擱淺 3 席)→ 放寬 → 3 賣掉 2 → 剩 1 席,
+    # 之後 1 < 2 走「席數不足」那條分支。
     assert sold == 8, "應該賣到只剩 1 席(算術下限),不是剩 3 席"
     assert await is_relaxed(redis, event_id=event.id, zone_id=zone_id)
     assert int(await redis.get(_zone_available_key(event.id, zone_id))) == 1
@@ -654,3 +663,44 @@ async def test_release_beyond_the_block_is_rejected(db, redis, zone_fixture) -> 
             start_pos=run.start + run.length, length=2, marker="oob",
         )
     assert await _redis_runs(redis, event.id, zone_id) == before
+
+
+# ─ B6:「席數不足」與「湊不出連號」必須分開
+
+async def test_insufficient_seats_is_not_reported_as_a_fragmentation_problem(
+    db, redis
+) -> None:
+    """剩 3 席卻要 4 張是**沒票了**,不是「湊不出連號」。
+
+    以前兩者都回 NoSeatsAvailable,於是真正賣完的 zone 被告知「湊不出連號」,而且
+    跟無座位圖路徑的 InsufficientInventory 不一致。
+    """
+    event, zone_id = await _tiny_zone(db, redis, 5)
+    assert await _try(redis, event, zone_id, 2) is not None      # 5 → 3
+
+    with pytest.raises(InsufficientInventory) as excinfo:
+        await _try(redis, event, zone_id, 4)
+    assert excinfo.value.available == 3
+    assert excinfo.value.requested == 4
+
+
+async def test_enough_seats_but_not_together_is_a_fragmentation_problem(
+    db, redis
+) -> None:
+    """兩個 5 席 block:總共 10 席,但 4 張在任一段都會留下孤兒。"""
+    event, zone_id = await _tiny_zone(db, redis, 5, 5)
+    with pytest.raises(NoSeatsAvailable) as excinfo:
+        await _try(redis, event, zone_id, 4)
+    assert excinfo.value.feasible == [1, 2, 3, 5]
+
+
+async def test_a_sold_out_zone_does_not_record_a_ratchet_signal(db, redis) -> None:
+    """賣完的 zone 記連拒次數是沒意義的(放寬也配不出來),還會污染 ratchet 訊號。"""
+    event, zone_id = await _tiny_zone(db, redis, 4)
+    assert await _try(redis, event, zone_id, 4) is not None      # 剛好賣光
+
+    for _ in range(STRICT_MISS_THRESHOLD + 2):
+        with pytest.raises(InsufficientInventory):
+            await _try(redis, event, zone_id, 2)
+    assert not await redis.exists(_misses_key(event.id, zone_id))
+    assert not await is_relaxed(redis, event_id=event.id, zone_id=zone_id)

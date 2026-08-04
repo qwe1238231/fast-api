@@ -38,9 +38,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
+    InsufficientInventory,
     InventoryNotReconcilable,
     NoSeatsAvailable,
     SeatContention,
+    SeatPlacementOutOfRun,
     SeatReleaseOverlap,
 )
 from app.models.seating import Seat, SeatBlock, SeatHold
@@ -244,8 +246,12 @@ async def read_zone_state(redis: Redis, *, event_id: int, zone_id: int) -> ZoneS
 
     唯讀,所以**不進 Lua**:座位圖瀏覽量遠大於下單量,快照過時是可接受的(race
     拒絕使用者能理解,約束拒絕不能),沒必要拿瀏覽流量去佔 Redis 的原子區。
+
+    但兩個 HGETALL 之間**必須**原子(MULTI/EXEC,成本一樣是一趟往返):否則它們
+    可能夾著 rebuild_zone_runs 的 EXEC,讀到「新的 runs + 舊的 geom」。如果那次
+    rebuild 改變了 block 集合,`geometry[run.block_id]` 就會 KeyError —— 熱路徑 500。
     """
-    async with redis.pipeline(transaction=False) as pipe:
+    async with redis.pipeline(transaction=True) as pipe:
         pipe.hgetall(_runs_key(event_id, zone_id))
         pipe.hgetall(_geom_key(event_id, zone_id))
         raw_runs, raw_geom = await pipe.execute()
@@ -299,7 +305,7 @@ async def seat_labels(
 # ARGV[4]=start  ARGV[5]=length
 # ARGV[6]=claim TTL  ARGV[7]=user_id  ARGV[8]=event_id
 # ARGV[9]=total_price_cents  ARGV[10]=idempotency_key  ARGV[11]=zone_id
-# 回傳:{'DUP'} | {'RETRY'} | {'OK', stream_id, zone_remaining}
+# 回傳:{'DUP'} | {'RETRY'} | {'BOUNDS'} | {'OK', stream_id, zone_remaining}
 _CLAIM_SEATS_LUA = """
 local function f(block, pos) return block .. ':' .. string.format('%d', pos) end
 
@@ -319,8 +325,10 @@ local current = redis.call('HGET', KEYS[1], f(block, run_start))
 if not current or tonumber(current) ~= run_len then
     return {'RETRY'}
 end
+-- 界外是**呼叫端的 bug**(配位算出的區間不在它取材的空段裡),不是競爭。回 RETRY
+-- 會讓它重試到變成 SeatContention(503),於是客戶端一直重送同一個壞請求。
 if start_pos < run_start or (start_pos + length) > (run_start + run_len) then
-    return {'RETRY'}
+    return {'BOUNDS'}
 end
 
 -- 3) 切下去:整段先移除,再寫回 0~2 段殘餘(中切會產生兩段)。
@@ -485,6 +493,14 @@ async def reserve_seats_and_enqueue(
         state = await read_zone_state(redis, event_id=event_id, zone_id=zone_id)
         anchors = legal_anchors(state.runs, quantity, state.geometry, effective)
         if not anchors:
+            # 先分清「沒票了」與「湊不出連號」。以前兩者都回 NoSeatsAvailable,於是
+            # 真正賣完的 zone 被告知「湊不出連號」,而且跟無座位圖路徑的
+            # InsufficientInventory 不一致。順序也重要:賣完的 zone 記連拒次數是
+            # 沒意義的(放寬也配不出來),還會污染 ratchet 的訊號。
+            if state.remaining < quantity:
+                raise InsufficientInventory(
+                    event_id=event_id, requested=quantity, available=state.remaining,
+                )
             if not relaxed and await _record_strict_miss(
                 redis, event_id=event_id, zone_id=zone_id
             ):
@@ -529,6 +545,11 @@ async def reserve_seats_and_enqueue(
         )
         if result[0] == "DUP":
             return None
+        if result[0] == "BOUNDS":
+            raise SeatPlacementOutOfRun(
+                event_id=event_id, zone_id=zone_id, block_id=pick.block_id,
+                start=pick.start, length=pick.length,
+            )
         if result[0] == "RETRY":
             continue                       # 空段被搶走了 —— 重讀一份快照再算
 

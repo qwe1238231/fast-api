@@ -161,6 +161,26 @@ class SeatContention(InventoryError):
         super().__init__(f"Zone {zone_id}: seat allocation contended after {attempts} attempts")
 
 
+class SeatPlacementOutOfRun(InventoryError):
+    """配位算出的區間不在它宣稱的空段裡 —— 這是**我們的 bug**,不是競爭。
+
+    以前這個情況回 RETRY,於是重試 5 次之後變成 SeatContention(503 + Retry-After)
+    —— 一個程式錯誤被偽裝成暫時性壅塞,而 503 會讓客戶端一直重送同一個壞請求。
+    分開之後它是 500 並發出告警,但仍然是 DomainError,所以單次入場券會被退還
+    (使用者不該為我們的 bug 重新排隊)。
+    """
+    def __init__(self, *, event_id: int, zone_id: int, block_id: int, start: int, length: int):
+        self.event_id = event_id
+        self.zone_id = zone_id
+        self.block_id = block_id
+        self.start = start
+        self.length = length
+        super().__init__(
+            f"Placement block {block_id} [{start}, {start + length}) is not inside the "
+            f"run it was derived from (event {event_id} zone {zone_id}) — allocator bug"
+        )
+
+
 class SeatReleaseOverlap(InventoryError):
     """要歸還的區間跟既有空段相交 —— 呼叫端拿錯了區間。
 

@@ -237,7 +237,12 @@ async def test_seats_of_another_users_order_are_404(client, db, arena, buyer, dr
 async def test_unseated_order_has_no_seats_resource(
     client, db, published_event, drain_orders
 ) -> None:
-    """無座位圖的場次:座號這個資源根本不存在。"""
+    """無座位圖的場次:座號這個資源根本不存在 → 404,不是 409。
+
+    409 隱含「重試會有結果」。一個「輪詢到 200 才顯示座號」的客戶端,對無座位圖的
+    訂單會永遠輪詢下去 —— 這條測試以前的名稱說 404、斷言卻寫 409,是我當時沒想
+    清楚的痕跡。
+    """
     await client.post("/v1/users/", json={"username": "flat", "password": "secret123"})
     r = await client.post(
         "/v1/auth/token", data={"username": "flat", "password": "secret123"}
@@ -262,4 +267,4 @@ async def test_unseated_order_has_no_seats_resource(
 
     assert (
         await client.get(f"/v1/orders/{order_id}/seats", headers=bearer)
-    ).status_code == 409
+    ).status_code == 404

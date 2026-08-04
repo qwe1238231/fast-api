@@ -43,6 +43,7 @@ from app.services.idempotency import _key as _claim_key
 from app.services.inventory import ORDER_STREAM_KEY, _key as _event_available_key
 from app.services.queue_events import publish_event_poke
 from app.services.seating import (
+    ENDGAME_POLICY,
     NORMAL_POLICY,
     BlockGeometry,
     Placement,
@@ -61,6 +62,17 @@ MAX_CAS_ATTEMPTS = 5
 #: 單筆訂單張數上限。必須與 OrderCreate.quantity 的 le= 一致。
 MAX_TICKETS_PER_ORDER = 10
 
+#: 連續幾筆被嚴格策略拒絕之後,這個 zone 就切換到收尾期策略(允許在邊緣留下孤兒)。
+#:
+#: 這是**偵測器不是旋鈕**:實測 3 / 10 / 30 三個數量級的結果完全相同,因為它偵測的
+#: 是「結構性卡住」這個二元狀態 —— 只要還有任何訂單配得出來,計數器就被歸零。
+#: 對照之下「剩餘率低於 X% 就放寬」的門檻依賴需求分布:0.05 對兩人票永遠不觸發
+#: (銷售卡在 6% 就停了),三人票要 0.20 才夠 —— 而那是事前不知道的東西。
+#:
+#: 取 3 是因為切換前那幾筆會吃到 409,越小越好(達標的那一筆會在同一個請求內
+#: 立刻用放寬策略重試,所以實際上只有 2 個人看到拒絕)。
+STRICT_MISS_THRESHOLD = 3
+
 
 def _runs_key(event_id: int, zone_id: int) -> str:
     return f"event:{event_id}:zone:{zone_id}:runs"
@@ -78,8 +90,34 @@ def _zone_available_key(event_id: int, zone_id: int) -> str:
     return f"event:{event_id}:zone:{zone_id}:available"
 
 
+def _misses_key(event_id: int, zone_id: int) -> str:
+    return f"event:{event_id}:zone:{zone_id}:strict_misses"
+
+
+def _relaxed_key(event_id: int, zone_id: int) -> str:
+    return f"event:{event_id}:zone:{zone_id}:relaxed"
+
+
 def _released_key(marker: str) -> str:
     return f"released:{marker}"
+
+
+async def is_relaxed(redis: Redis, *, event_id: int, zone_id: int) -> bool:
+    """這個 zone 是否已經切進收尾期策略。單向 —— 一旦切了就不回頭。"""
+    return bool(await redis.exists(_relaxed_key(event_id, zone_id)))
+
+
+async def _record_strict_miss(redis: Redis, *, event_id: int, zone_id: int) -> bool:
+    """記一次「嚴格策略配不出來」。回傳 True 表示該切到收尾期了。
+
+    不做原子化:INCR 與 SET 之間的競態最多讓兩個請求同時把 ratchet 打開,而 SET
+    本來就是冪等的。為了一個單向的布林旗標開 Lua 不划算。
+    """
+    misses = await redis.incr(_misses_key(event_id, zone_id))
+    if misses < STRICT_MISS_THRESHOLD:
+        return False
+    await redis.set(_relaxed_key(event_id, zone_id), "1")
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,15 +413,28 @@ async def reserve_seats_and_enqueue(
         _claim_script = redis.register_script(_CLAIM_SEATS_LUA)
     picker = rng or random
 
+    # 收尾期一旦切過就不回頭,所以只在進來時讀一次。
+    relaxed = await is_relaxed(redis, event_id=event_id, zone_id=zone_id)
+    effective = ENDGAME_POLICY if relaxed else policy
+
     for attempt in range(1, MAX_CAS_ATTEMPTS + 1):
         state = await read_zone_state(redis, event_id=event_id, zone_id=zone_id)
-        anchors = legal_anchors(state.runs, quantity, state.geometry, policy)
+        anchors = legal_anchors(state.runs, quantity, state.geometry, effective)
         if not anchors:
+            if not relaxed and await _record_strict_miss(
+                redis, event_id=event_id, zone_id=zone_id
+            ):
+                # 這個 zone 結構性卡住了(奇偶陷阱:空段都變成 3,兩人票配了會留
+                # 孤兒所以被禁,於是 3 席死掉)。切到收尾期並**在同一個請求內**
+                # 立刻重試,切換點上就不會有人吃到 409。
+                relaxed = True
+                effective = ENDGAME_POLICY
+                continue
             raise NoSeatsAvailable(
                 event_id=event_id,
                 zone_id=zone_id,
                 quantity=quantity,
-                feasible=_feasible(state, policy),
+                feasible=_feasible(state, effective),
             )
 
         pick: Placement = anchors[picker.randrange(min(top_k, len(anchors)))]
@@ -417,6 +468,8 @@ async def reserve_seats_and_enqueue(
         if result[0] == "RETRY":
             continue                       # 空段被搶走了 —— 重讀一份快照再算
 
+        # 配得出來 ⇒ 這個 zone 沒卡住,連拒計數歸零。
+        await redis.delete(_misses_key(event_id, zone_id))
         zone_remaining = int(result[2])
         if zone_remaining == 0:
             await publish_event_poke(redis, event_id)   # 喚醒等候中的人重讀狀態

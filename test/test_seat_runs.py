@@ -21,6 +21,8 @@ from app.services.inventory import ORDER_STREAM_KEY, _key as _event_available_ke
 from app.core.exceptions import NoSeatsAvailable
 from app.services.seat_runs import (
     MAX_TICKETS_PER_ORDER,
+    STRICT_MISS_THRESHOLD,
+    is_relaxed,
     _CLAIM_SEATS_LUA,
     _ends_key,
     _geom_key,
@@ -395,3 +397,106 @@ async def test_no_orphan_survives_the_random_sequence(db, redis, zone_fixture) -
         for run in await _redis_runs(redis, event.id, zone_id):
             assert run.length != 1, f"出現孤兒段 {run}"
     assert NORMAL_POLICY.min_run == 2
+
+
+# ─ 收尾期 ratchet
+
+async def _tiny_zone(db, redis, capacity: int):
+    """單一 block 的 zone,方便構造「結構性卡住」。"""
+    spec = VenueSpec(
+        name=f"Ratchet {capacity}",
+        zones=(ZoneSpec(name="小區", display_order=0, rows=(RowSpec("A", (capacity,)),)),),
+    )
+    venue = await seed_venue(db, spec)
+    zone_id = await db.scalar(select(Zone.id).where(Zone.venue_id == venue.id))
+    event = await _make_event(db, venue.id, capacity)
+    await db.commit()
+    await redis.set(_event_available_key(event.id), capacity)
+    await rebuild_zone_runs(db, redis, event_id=event.id, zone_id=zone_id)
+    return event, zone_id
+
+
+async def _try(redis, event, zone_id, quantity: int):
+    return await reserve_seats_and_enqueue(
+        redis, event_id=event.id, zone_id=zone_id, user_id=1, quantity=quantity,
+        total_price_cents=100 * quantity, idempotency_key=str(uuid4()),
+    )
+
+
+async def test_ratchet_trips_after_consecutive_strict_misses(db, redis) -> None:
+    """5 席的 block 配 4 張:嚴格策略下會留孤兒所以被禁,連拒到門檻就切收尾期。
+
+    達標的那一筆會**在同一個請求內**用放寬策略重試,所以它不該吐 NoSeatsAvailable
+    —— 切換點上只有前 STRICT_MISS_THRESHOLD - 1 個人看到拒絕。
+    """
+    event, zone_id = await _tiny_zone(db, redis, 5)
+
+    for _ in range(STRICT_MISS_THRESHOLD - 1):
+        with pytest.raises(NoSeatsAvailable):
+            await _try(redis, event, zone_id, 4)
+        assert not await is_relaxed(redis, event_id=event.id, zone_id=zone_id)
+
+    reserved = await _try(redis, event, zone_id, 4)          # 第 threshold 筆:當場成功
+    assert reserved is not None and reserved.length == 4
+    assert await is_relaxed(redis, event_id=event.id, zone_id=zone_id)
+    # 放寬之後留下一個孤兒 —— 這正是拿回那 4% 的代價。
+    assert [r.length for r in await _redis_runs(redis, event.id, zone_id)] == [1]
+
+
+async def test_a_success_resets_the_miss_counter(db, redis) -> None:
+    """只要還有任何訂單配得出來,這個 zone 就沒卡住,不該放寬。
+
+    這是為什麼混合需求下 ratchet 永遠不觸發:3 席空段拒絕了兩人票,但下一筆
+    三人票馬上用掉它,計數器歸零。
+    """
+    event, zone_id = await _tiny_zone(db, redis, 5)
+
+    for _ in range(STRICT_MISS_THRESHOLD - 1):
+        with pytest.raises(NoSeatsAvailable):
+            await _try(redis, event, zone_id, 4)
+
+    assert await _try(redis, event, zone_id, 2) is not None   # 成功 → 歸零
+    for _ in range(STRICT_MISS_THRESHOLD - 1):
+        with pytest.raises(NoSeatsAvailable):
+            await _try(redis, event, zone_id, 4)
+    assert not await is_relaxed(redis, event_id=event.id, zone_id=zone_id)
+
+
+async def test_the_ratchet_is_one_way(db, redis) -> None:
+    """釋放讓空段回復完整之後也不回頭 —— 避免抖動振盪,而且孤兒已經造出來了。"""
+    event, zone_id = await _tiny_zone(db, redis, 5)
+    for _ in range(STRICT_MISS_THRESHOLD - 1):
+        with pytest.raises(NoSeatsAvailable):
+            await _try(redis, event, zone_id, 4)
+    reserved = await _try(redis, event, zone_id, 4)
+    assert reserved is not None
+
+    assert await release_seats(
+        redis, event_id=event.id, zone_id=zone_id, block_id=reserved.block_id,
+        start_pos=reserved.start_pos, length=reserved.length, marker="order:1",
+    )
+    assert [r.length for r in await _redis_runs(redis, event.id, zone_id)] == [5]
+    assert await is_relaxed(redis, event_id=event.id, zone_id=zone_id)
+
+
+async def test_ratchet_recovers_the_seats_uniform_demand_would_strand(db, redis) -> None:
+    """奇數 block + 只有兩人票:嚴格策略擱淺 3 席,放寬後只擱淺 1 席(算術下限)。"""
+    event, zone_id = await _tiny_zone(db, redis, 9)
+    sold, misses = 0, 0
+    # 被拒之後真實客戶會重送(入場券現在會退還),所以模擬要繼續試而不是放棄 ——
+    # ratchet 本來就需要連續幾筆被拒才認得出「結構性卡住」。
+    while misses <= STRICT_MISS_THRESHOLD + 1:
+        try:
+            reserved = await _try(redis, event, zone_id, 2)
+        except NoSeatsAvailable:
+            misses += 1
+            continue
+        assert reserved is not None
+        misses = 0
+        sold += 2
+        assert sold <= 8
+
+    # 9 → 7 → 5 → 3(嚴格策略到此為止,擱淺 3 席)→ 放寬 → 3 賣掉 2 → 剩 1 席。
+    assert sold == 8, "應該賣到只剩 1 席(算術下限),不是剩 3 席"
+    assert await is_relaxed(redis, event_id=event.id, zone_id=zone_id)
+    assert int(await redis.get(_zone_available_key(event.id, zone_id))) == 1

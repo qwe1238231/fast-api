@@ -21,6 +21,7 @@ from app.services.seating import (
     Policy,
     Run,
     allocate,
+    legal_anchors,
     occupy,
     release,
 )
@@ -70,8 +71,14 @@ def simulate(
     cancel_rate: float = 0.0,
     rounds: int = 4000,
     seed: int = 20260803,
+    top_k: int = 1,
 ) -> SimResult:
-    """跑一段訂單流(含取消),回傳最終的裝箱指標。"""
+    """跑一段訂單流(含取消),回傳最終的裝箱指標。
+
+    `top_k > 1` 表示不取最佳、而是從前 K 個候選隨機挑 —— 那是「讀-算-CAS」
+    架構下用來壓低樂觀鎖衝突的手段(見 simulate_cas_contention)。放在這裡是為了
+    量測它對裝箱的副作用:隨機化若讓售出率掉下來,省下的 Lua 就不划算。
+    """
     rng = random.Random(seed)
     geometry = {block.block_id: block for block in blocks}
     runs = [Run(block.block_id, 0, block.capacity) for block in blocks]
@@ -91,7 +98,11 @@ def simulate(
             continue
 
         quantity = rng.choices(quantities, weights=weights, k=1)[0]
-        placed = allocate(runs, quantity, geometry, policy)
+        if top_k == 1:
+            placed = allocate(runs, quantity, geometry, policy)
+        else:
+            options = legal_anchors(runs, quantity, geometry, policy)
+            placed = options[rng.randrange(min(top_k, len(options)))] if options else None
         if placed is None:
             no_fit[quantity] += 1
             continue
@@ -132,9 +143,13 @@ def aggregate(
     *,
     cancel_rate: float = 0.0,
     seeds: Sequence[int] = SEEDS,
+    top_k: int = 1,
 ) -> Aggregate:
     results = [
-        simulate(blocks, demand, policy, cancel_rate=cancel_rate, seed=seed)
+        simulate(
+            blocks, demand, policy,
+            cancel_rate=cancel_rate, seed=seed, top_k=top_k,
+        )
         for seed in seeds
     ]
     n = len(results)
@@ -204,6 +219,16 @@ def main() -> None:
                     Policy(fragmentation_weight=weight),
                     cancel_rate=0.3,
                 ),
+            )
+        )
+
+    print("\n=== top-K 隨機化對裝箱的副作用(取消率 30%)===")
+    print(_HEADER)
+    for top_k in (1, 4, 16, 64):
+        print(
+            _row(
+                f"K={top_k}",
+                aggregate(blocks, TYPICAL_DEMAND, cancel_rate=0.3, top_k=top_k),
             )
         )
 

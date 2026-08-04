@@ -19,7 +19,7 @@ from app.core.config import get_settings
 from app.core.redis import create_redis_client
 from app.db.session import AsyncSessionLocal
 from app.models.order import Order, OrderStatus
-from app.models.seating import SeatHold
+from app.models.seating import SeatBlock, SeatHold, Zone
 from app.services.orders import expire_order, release_order_seat
 from app.crud.order import create_order, get_order_by_idempotency_key
 from app.crud.refresh_token import purge_expired
@@ -31,7 +31,9 @@ from app.services.inventory import (
     ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY,queue_depth,
 )
 from app.services.idempotency import mark_claim_failed
-from app.services.seat_runs import release_seats
+from app.services.seat_runs import (
+    release_seats, _ends_key, _runs_key, _zone_available_key,
+)
 from app.services.waiting_room import set_admission_paused
 
 _settings = get_settings()
@@ -229,8 +231,17 @@ async def _persist_intent(fields: dict) -> str:
                 ))
             await db.commit()
             return "ok"
-        except IntegrityError:
+        except IntegrityError as exc:
             await db.rollback()
+            if "ex_seat_holds_no_overlap" in str(exc):
+                # 座位區間重疊 —— Redis 的空段結構已經損壞,而且它把重疊的座位發給了
+                # 兩個買家。這個訊息**非零就是 bug**,沒有可容忍的常態值。復原方式是
+                # rebuild_zone_runs(絕不能退還這段區間:無法判斷重疊的哪一段是誰的,
+                # 盲目退還會把別人持有的座位標回可賣)。
+                print(
+                    f"ALERT seat hold conflict — overlapping interval rejected by the DB; "
+                    f"the zone's run structure is corrupt and needs rebuild_zone_runs: {dict(fields)}"
+                )
             existing = await get_order_by_idempotency_key(db, UUID(fields["idempotency_key"]))
             return "duplicate" if existing is not None else "failed"
 
@@ -483,6 +494,107 @@ async def detect_inventory_drift(ctx: dict) -> list[dict]:
 
     return drifts
         
+async def detect_seat_structure_drift(ctx: dict) -> list[dict]:
+    """檢查座位 free-run 結構的三條不變式。**預防勝於復原**。
+
+    結構一旦損壞,最終會表現成 worker 落帳時撞上 seat_holds 的 EXCLUDE —— 但那已經
+    太晚了:那時 Redis 已經把重疊的座位發給兩個買家,而復原只能整個 zone 重建
+    (絕不能「退還」那段區間,因為無法判斷重疊的哪一段是誰的)。這三條檢查是同一件事
+    的早期訊號。
+
+    三條的性質不同,所以 backlog 的門檻也不同:
+
+      index    runs 與 ends 必須互為索引。純 Redis 內部,跟 DB 無關,所以 backlog
+               再多也照查 —— 而且它是最早的訊號(ends 壞掉時 runs 還看起來正常,
+               要等下一次合併才會把兩個 run 併成宣稱同一批座位的一個)。
+      counter  zone available 必須等於各空段長度之和。同樣純 Redis(同一支 Lua 裡
+               一起改的),照查。
+      complement  runs 必須是 DB 已佔用區間的補集。**這條要等 stream 排空** ——
+               in-flight 的 intent 持有 Redis 認定的區間但 DB 還沒有,不等就會誤報。
+    """
+    redis = ctx["redis_client"]
+    backlog, _ = await queue_depth(redis)
+    drifts: list[dict] = []
+
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(Event.id, Zone.id)
+                .join(Zone, Zone.venue_id == Event.venue_id)
+                .where(Event.status == EventStatus.PUBLISHED, Event.venue_id.is_not(None))
+            )
+        ).all()
+
+        for event_id, zone_id in rows:
+            runs_raw = await redis.hgetall(_runs_key(event_id, zone_id))
+            ends_raw = await redis.hgetall(_ends_key(event_id, zone_id))
+
+            expected_ends = {
+                f"{field.split(':')[0]}:{int(field.split(':')[1]) + int(length)}":
+                    field.split(":")[1]
+                for field, length in runs_raw.items()
+            }
+            if ends_raw != expected_ends:
+                drifts.append({
+                    "kind": "index", "event_id": event_id, "zone_id": zone_id,
+                })
+                print(
+                    f"ALERT seat index drift event={event_id} zone={zone_id} "
+                    f"— runs/ends 不一致,結構已損壞,需要 rebuild_zone_runs"
+                )
+
+            total = sum(int(length) for length in runs_raw.values())
+            counter = await redis.get(_zone_available_key(event_id, zone_id))
+            if counter is not None and int(counter) != total:
+                drifts.append({
+                    "kind": "counter", "event_id": event_id, "zone_id": zone_id,
+                    "expected": total, "actual": int(counter),
+                })
+                print(
+                    f"ALERT seat counter drift event={event_id} zone={zone_id} "
+                    f"redis={counter} sum_of_runs={total}"
+                )
+
+            if backlog:
+                continue        # 補集檢查會誤報,跳過(上面兩條已經查完了)
+
+            blocks = (
+                await db.scalars(select(SeatBlock).where(SeatBlock.zone_id == zone_id))
+            ).all()
+            held = (
+                await db.execute(
+                    select(SeatHold.block_id, SeatHold.start_pos, SeatHold.length).where(
+                        SeatHold.event_id == event_id,
+                        SeatHold.block_id.in_([b.id for b in blocks]),
+                    )
+                )
+            ).all()
+            occupied: dict[int, list[tuple[int, int]]] = {b.id: [] for b in blocks}
+            for block_id, start, length in held:
+                occupied[block_id].append((start, start + length))
+
+            expected_runs: dict[str, str] = {}
+            for block in blocks:
+                cursor = 0
+                for lo, hi in sorted(occupied[block.id]):
+                    if lo > cursor:
+                        expected_runs[f"{block.id}:{cursor}"] = str(lo - cursor)
+                    cursor = max(cursor, hi)
+                if cursor < block.capacity:
+                    expected_runs[f"{block.id}:{cursor}"] = str(block.capacity - cursor)
+
+            if runs_raw != expected_runs:
+                drifts.append({
+                    "kind": "complement", "event_id": event_id, "zone_id": zone_id,
+                })
+                print(
+                    f"ALERT seat structure drift event={event_id} zone={zone_id} "
+                    f"— Redis 空段不等於 DB 佔用的補集,需要 rebuild_zone_runs"
+                )
+
+    return drifts
+
+
 class WorkerSettings:
     """ARQ worker config. Launch: `arq app.worker.WorkerSettings`"""
 
@@ -501,6 +613,7 @@ class WorkerSettings:
         cron(report_queue_depth, minute={i for i in range(60)}),
         cron(purge_old_audit_logs, hour={2}, minute={30}),
         cron(detect_inventory_drift, minute=set(range(0, 60, 5))),
+        cron(detect_seat_structure_drift, minute=set(range(0, 60, 5))),
 
     ]
 

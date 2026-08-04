@@ -268,3 +268,41 @@ async def test_unseated_order_has_no_seats_resource(
     assert (
         await client.get(f"/v1/orders/{order_id}/seats", headers=bearer)
     ).status_code == 404
+
+
+# ─ C11:選區畫面的快取
+
+async def test_zone_list_is_cached_briefly(client, db, arena, buyer, redis) -> None:
+    """2 秒快取:開賣前後這個端點會被瘋狂刷新,而每次真實計算是「每 zone 讀
+    runs+geom + 跑 feasible_quantities」。使用者感覺不到 2 秒,而「快照過時可接受」
+    本來就是這條唯讀路徑的前提。
+    """
+    from app.services.zones import _zones_cache_key
+
+    event_id, zone_id = arena["event_id"], arena["zones"]["前區"]
+    first = (await client.get(f"/v1/events/{event_id}/zones")).json()
+    assert await redis.exists(_zones_cache_key(event_id)), "第一次應該回填快取"
+
+    accepted = await client.post(
+        "/v1/orders/",
+        json={"event_id": event_id, "quantity": 2, "zone_id": zone_id},
+        headers=_order_headers(buyer, event_id),
+    )
+    assert accepted.status_code == 202
+    # 快取還在有效期內 → 仍回舊值(刻意的取捨)
+    assert (await client.get(f"/v1/events/{event_id}/zones")).json() == first
+
+    await redis.delete(_zones_cache_key(event_id))     # 模擬快取到期
+    fresh = (await client.get(f"/v1/events/{event_id}/zones")).json()
+    assert next(z for z in fresh if z["name"] == "前區")["available"] == 4
+
+
+async def test_zone_list_is_rate_limited(client, arena) -> None:
+    """無認證端點,而且每次 cache miss 都有實質計算成本 —— 必須限流。"""
+    from app.core.config import get_settings
+
+    limit = get_settings().ZONES_LIST_LIMIT_PER_MINUTE
+    event_id = arena["event_id"]
+    for _ in range(limit):
+        assert (await client.get(f"/v1/events/{event_id}/zones")).status_code == 200
+    assert (await client.get(f"/v1/events/{event_id}/zones")).status_code == 429

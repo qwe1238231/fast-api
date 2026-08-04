@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     # Virtual waiting room (admission control). queue_opens/closes_at on an event
     # override these; otherwise they fall back to sale_starts_at minus the leads below.
     QUEUE_LEAD_TIME_SECONDS: int = 600          # registration opens this long before sale_starts_at
+    ZONES_LIST_LIMIT_PER_MINUTE: int = 120   # 選區畫面的每 IP 每分鐘上限(無認證端點)
     QUEUE_ADMISSION_BUFFER_SECONDS: int = 30    # registration closes / admission begins this long before sale
     QUEUE_ADMISSION_RATE: int = 500             # users admitted per second (the gatekeeper throttle)
     QUEUE_ADMISSION_TOKEN_TTL_SECONDS: int = 120  # admitted buyers must complete within this window

@@ -170,3 +170,27 @@ async def test_event_total_must_equal_the_sum_of_zone_counters(redis, seated) ->
     assert {
         "kind": "event_total", "event_id": event_id, "expected": 12, "actual": 99,
     } in drifts
+
+
+# ─ C13:只檢查「key 還應該存在」的場次
+
+async def test_long_finished_events_are_not_inspected(db, redis, seated) -> None:
+    """少了這個過濾,兩年前結束的場次會永遠每 5 分鐘被檢查一次 —— 成本隨歷史無界。
+
+    檢查窗口刻意跟 purge_finished_event_keys 的保留期一致:我們只在 key 還應該
+    存在的期間內檢查它。
+    """
+    from datetime import timedelta
+
+    from app.worker import EVENT_KEY_RETENTION_DAYS
+
+    event_id, zone_id = seated["event_id"], seated["zone_id"]
+    await redis.set(_zone_available_key(event_id, zone_id), 42)   # 故意弄壞
+    assert any(d["kind"] == "counter" for d in await _drift(redis))
+
+    event = await db.get(Event, event_id)
+    event.ends_at = datetime.now(timezone.utc) - timedelta(
+        days=EVENT_KEY_RETENTION_DAYS + 1
+    )
+    await db.commit()
+    assert await _drift(redis) == [], "已過保留期的場次不該再被檢查"

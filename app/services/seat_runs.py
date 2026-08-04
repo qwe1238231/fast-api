@@ -30,6 +30,7 @@ Key schema(每個 zone 一組,zone 是分片單位):
 左右鄰合併都變 O(1)。這是 memory allocator 的 boundary tags。
 """
 import random
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from redis.asyncio import Redis
@@ -134,6 +135,18 @@ async def _record_strict_miss(redis: Redis, *, event_id: int, zone_id: int) -> b
     await redis.set(_relaxed_key(event_id, zone_id), "1")
     await redis.delete(key)          # 已經切了,這個計數器不再有意義
     return True
+
+
+@dataclass(frozen=True, slots=True)
+class ZoneSnapshot:
+    """一個 zone 的空段、幾何、以及它是否已切進收尾期策略。
+
+    三者一起讀是因為呼叫端(選區畫面)三個都要,而分開讀就是每個 zone 三次序列
+    往返 —— 100 個 zone 的場館 300 次。見 `read_zone_snapshots`。
+    """
+
+    state: "ZoneState"
+    relaxed: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,19 +268,48 @@ async def read_zone_state(redis: Redis, *, event_id: int, zone_id: int) -> ZoneS
         pipe.hgetall(_runs_key(event_id, zone_id))
         pipe.hgetall(_geom_key(event_id, zone_id))
         raw_runs, raw_geom = await pipe.execute()
+    return _parse_state(raw_runs, raw_geom)
 
+
+def _parse_state(raw_runs: dict, raw_geom: dict) -> ZoneState:
     geometry: dict[int, BlockGeometry] = {}
     for block_id, packed in raw_geom.items():
         capacity, base, edge = packed.split(":")
         geometry[int(block_id)] = BlockGeometry.calibrated(
             int(block_id), int(capacity), base=float(base), edge=float(edge)
         )
-
     runs: list[Run] = []
     for field, length in raw_runs.items():
         block_id, start = field.split(":")
         runs.append(Run(int(block_id), int(start), int(length)))
     return ZoneState(runs=runs, geometry=geometry)
+
+
+async def read_zone_snapshots(
+    redis: Redis, *, event_id: int, zone_ids: Sequence[int]
+) -> dict[int, ZoneSnapshot]:
+    """一趟 pipeline 讀出多個 zone 的完整狀態 —— 選區畫面用。
+
+    對每個 zone 發三個指令(runs / geom / relaxed),但**全部在同一趟往返**裡。
+    逐個 zone 呼叫 `read_zone_state` + `is_relaxed` 的話是 3N 次序列往返:100 個
+    zone 的場館就是 300 次,而這是整個系統最常被瀏覽的端點。
+    """
+    if not zone_ids:
+        return {}
+    async with redis.pipeline(transaction=True) as pipe:
+        for zone_id in zone_ids:
+            pipe.hgetall(_runs_key(event_id, zone_id))
+            pipe.hgetall(_geom_key(event_id, zone_id))
+            pipe.exists(_relaxed_key(event_id, zone_id))
+        results = await pipe.execute()
+
+    out: dict[int, ZoneSnapshot] = {}
+    for index, zone_id in enumerate(zone_ids):
+        raw_runs, raw_geom, relaxed = results[index * 3 : index * 3 + 3]
+        out[zone_id] = ZoneSnapshot(
+            state=_parse_state(raw_runs, raw_geom), relaxed=bool(relaxed)
+        )
+    return out
 
 
 async def seat_labels(

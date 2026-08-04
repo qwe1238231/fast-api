@@ -571,47 +571,103 @@ async def purge_finished_event_keys(
     # event:{e}:meta 不在清單裡 —— 它本來就有 60 秒 TTL,早就自己走了。
     if not keys:
         return 0
-    deleted = await redis.delete(*set(keys))
+    # 分批:一次 DEL 幾千個 key 會阻塞 Redis 的單執行緒。
+    unique = sorted(set(keys))
+    deleted = 0
+    for offset in range(0, len(unique), 500):
+        deleted += await redis.delete(*unique[offset : offset + 500])
     if deleted:
         print(f"purged {deleted} Redis keys for events finished before {upper.date()}")
     return deleted
 
 
 async def detect_seat_structure_drift(ctx: dict) -> list[dict]:
-    """檢查座位 free-run 結構的三條不變式。**預防勝於復原**。
+    """檢查座位 free-run 結構的四條不變式。**預防勝於復原**。
 
     結構一旦損壞,最終會表現成 worker 落帳時撞上 seat_holds 的 EXCLUDE —— 但那已經
-    太晚了:那時 Redis 已經把重疊的座位發給兩個買家,而復原只能整個 zone 重建
-    (絕不能「退還」那段區間,因為無法判斷重疊的哪一段是誰的)。這三條檢查是同一件事
-    的早期訊號。
+    太晚:那時 Redis 已經把重疊的座位發給兩個買家,而復原只能整個 zone 重建
+    (`python -m app.scripts.rebuild_seat_runs`)。這些檢查是同一件事的早期訊號。
 
-    三條的性質不同,所以 backlog 的門檻也不同:
+    四條的性質不同,所以 backlog 的門檻也不同:
 
-      index    runs 與 ends 必須互為索引。純 Redis 內部,跟 DB 無關,所以 backlog
-               再多也照查 —— 而且它是最早的訊號(ends 壞掉時 runs 還看起來正常,
-               要等下一次合併才會把兩個 run 併成宣稱同一批座位的一個)。
-      counter  zone available 必須等於各空段長度之和。同樣純 Redis(同一支 Lua 裡
-               一起改的),照查。
-      complement  runs 必須是 DB 已佔用區間的補集。**這條要等 stream 排空** ——
-               in-flight 的 intent 持有 Redis 認定的區間但 DB 還沒有,不等就會誤報。
+      index       runs 與 ends 必須互為索引。純 Redis 內部,backlog 再多也照查 ——
+                  而且它是最早的訊號(ends 壞掉時 runs 還看起來完全正常,要等下一次
+                  合併才會把兩個 run 併成宣稱同一批座位的一個)。
+      counter     zone available 必須等於各空段長度之和。同樣純 Redis,照查。
+      event_total event available 必須等於各 zone available 之和。三條 per-zone 檢查
+                  都看不到它(counter 只比對單一 zone 內部),而 reconcile_inventory
+                  只修 event 計數器,跑完就會製造這種不一致。
+      complement  runs 必須是 DB 已佔用區間的補集。**要等 stream 排空** ——
+                  in-flight 的 intent 持有 Redis 認定的區間但 DB 還沒有,不等就誤報。
+
+    **DB session 刻意不跨越 Redis 往返。** 每個場次開一次短 session 把要比對的資料
+    撈完就關,之後才碰 Redis —— 一條 pooled 連線被抓著幾分鐘會把 vacuum 的 xmin
+    horizon 一起釘住(見 webhook 裡同一條規則)。
+
+    也只檢查「key 還應該存在」的場次,也就是 purge_finished_event_keys 的保留窗口
+    之內。少了這個過濾,兩年前結束的場次會永遠每 5 分鐘被檢查一次,成本隨歷史無界。
     """
     redis = ctx["redis_client"]
     backlog, _ = await queue_depth(redis)
+    horizon = datetime.now(timezone.utc) - timedelta(days=EVENT_KEY_RETENTION_DAYS)
     drifts: list[dict] = []
-    zone_totals: dict[int, int] = {}     # event_id → Σ zone available
 
     async with AsyncSessionLocal() as db:
-        rows = (
-            await db.execute(
-                select(Event.id, Zone.id)
-                .join(Zone, Zone.venue_id == Event.venue_id)
-                .where(Event.status == EventStatus.PUBLISHED, Event.venue_id.is_not(None))
-            )
-        ).all()
+        event_ids = list(
+            (
+                await db.scalars(
+                    select(Event.id).where(
+                        Event.status == EventStatus.PUBLISHED,
+                        Event.venue_id.is_not(None),
+                        Event.ends_at >= horizon,
+                    )
+                )
+            ).all()
+        )
 
-        for event_id, zone_id in rows:
-            runs_raw = await redis.hgetall(_runs_key(event_id, zone_id))
-            ends_raw = await redis.hgetall(_ends_key(event_id, zone_id))
+    for event_id in event_ids:
+        # 一個場次一次短 session:三個查詢撈完就關,不跨 Redis 往返。
+        async with AsyncSessionLocal() as db:
+            venue_id = await db.scalar(select(Event.venue_id).where(Event.id == event_id))
+            blocks = (
+                await db.execute(
+                    select(SeatBlock.id, SeatBlock.zone_id, SeatBlock.capacity)
+                    .join(Zone, Zone.id == SeatBlock.zone_id)
+                    .where(Zone.venue_id == venue_id)
+                )
+            ).all()
+            zone_ids = list(
+                (
+                    await db.scalars(select(Zone.id).where(Zone.venue_id == venue_id))
+                ).all()
+            )
+            held = (
+                await db.execute(
+                    select(SeatHold.block_id, SeatHold.start_pos, SeatHold.length)
+                    .where(SeatHold.event_id == event_id)
+                )
+            ).all()
+
+        blocks_by_zone: dict[int, list[tuple[int, int]]] = {zid: [] for zid in zone_ids}
+        for block_id, zone_id, capacity in blocks:
+            blocks_by_zone[zone_id].append((block_id, capacity))
+        occupied: dict[int, list[tuple[int, int]]] = {}
+        for block_id, start, length in held:
+            occupied.setdefault(block_id, []).append((start, start + length))
+
+        # 一趟 pipeline 讀完這個場次所有 zone 的三個 key。
+        async with redis.pipeline(transaction=True) as pipe:
+            for zone_id in zone_ids:
+                pipe.hgetall(_runs_key(event_id, zone_id))
+                pipe.hgetall(_ends_key(event_id, zone_id))
+                pipe.get(_zone_available_key(event_id, zone_id))
+            pipe.get(_event_available_key(event_id))
+            results = await pipe.execute()
+        event_counter = results[-1]
+
+        zone_sum = 0
+        for index, zone_id in enumerate(zone_ids):
+            runs_raw, ends_raw, counter = results[index * 3 : index * 3 + 3]
 
             expected_ends = {
                 f"{field.split(':')[0]}:{int(field.split(':')[1]) + int(length)}":
@@ -619,17 +675,15 @@ async def detect_seat_structure_drift(ctx: dict) -> list[dict]:
                 for field, length in runs_raw.items()
             }
             if ends_raw != expected_ends:
-                drifts.append({
-                    "kind": "index", "event_id": event_id, "zone_id": zone_id,
-                })
+                drifts.append({"kind": "index", "event_id": event_id, "zone_id": zone_id})
                 print(
                     f"ALERT seat index drift event={event_id} zone={zone_id} "
-                    f"— runs/ends 不一致,結構已損壞,需要 rebuild_zone_runs"
+                    f"— runs/ends 不一致,結構已損壞;修復:"
+                    f"python -m app.scripts.rebuild_seat_runs {event_id} --zone {zone_id}"
                 )
 
             total = sum(int(length) for length in runs_raw.values())
-            counter = await redis.get(_zone_available_key(event_id, zone_id))
-            zone_totals[event_id] = zone_totals.get(event_id, 0) + int(counter or 0)
+            zone_sum += int(counter or 0)
             if counter is not None and int(counter) != total:
                 drifts.append({
                     "kind": "counter", "event_id": event_id, "zone_id": zone_id,
@@ -643,30 +697,15 @@ async def detect_seat_structure_drift(ctx: dict) -> list[dict]:
             if backlog:
                 continue        # 補集檢查會誤報,跳過(上面兩條已經查完了)
 
-            blocks = (
-                await db.scalars(select(SeatBlock).where(SeatBlock.zone_id == zone_id))
-            ).all()
-            held = (
-                await db.execute(
-                    select(SeatHold.block_id, SeatHold.start_pos, SeatHold.length).where(
-                        SeatHold.event_id == event_id,
-                        SeatHold.block_id.in_([b.id for b in blocks]),
-                    )
-                )
-            ).all()
-            occupied: dict[int, list[tuple[int, int]]] = {b.id: [] for b in blocks}
-            for block_id, start, length in held:
-                occupied[block_id].append((start, start + length))
-
             expected_runs: dict[str, str] = {}
-            for block in blocks:
+            for block_id, capacity in blocks_by_zone[zone_id]:
                 cursor = 0
-                for lo, hi in sorted(occupied[block.id]):
+                for lo, hi in sorted(occupied.get(block_id, [])):
                     if lo > cursor:
-                        expected_runs[f"{block.id}:{cursor}"] = str(lo - cursor)
+                        expected_runs[f"{block_id}:{cursor}"] = str(lo - cursor)
                     cursor = max(cursor, hi)
-                if cursor < block.capacity:
-                    expected_runs[f"{block.id}:{cursor}"] = str(block.capacity - cursor)
+                if cursor < capacity:
+                    expected_runs[f"{block_id}:{cursor}"] = str(capacity - cursor)
 
             if runs_raw != expected_runs:
                 drifts.append({
@@ -678,21 +717,15 @@ async def detect_seat_structure_drift(ctx: dict) -> list[dict]:
                     f"python -m app.scripts.rebuild_seat_runs {event_id} --zone {zone_id}"
                 )
 
-    # 座位訂單的每一次配位都同時扣 zone 與 event 兩個計數器,所以這條必須成立。
-    # 它抓的是「reconcile_inventory 只修了 event 計數器」之後的不一致 —— 那種
-    # 不一致三條 per-zone 檢查都看不到(counter 只比對單一 zone 內部)。
-    for event_id, zone_sum in zone_totals.items():
-        event_counter = await redis.get(_event_available_key(event_id))
-        if event_counter is None or int(event_counter) == zone_sum:
-            continue
-        drifts.append({
-            "kind": "event_total", "event_id": event_id,
-            "expected": zone_sum, "actual": int(event_counter),
-        })
-        print(
-            f"ALERT seat event-total drift event={event_id} "
-            f"event_counter={event_counter} sum_of_zones={zone_sum}"
-        )
+        if event_counter is not None and int(event_counter) != zone_sum:
+            drifts.append({
+                "kind": "event_total", "event_id": event_id,
+                "expected": zone_sum, "actual": int(event_counter),
+            })
+            print(
+                f"ALERT seat event-total drift event={event_id} "
+                f"event_counter={event_counter} sum_of_zones={zone_sum}"
+            )
 
     return drifts
 

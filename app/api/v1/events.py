@@ -61,6 +61,7 @@ async def list_published_endpoint(
 @router.get("/{event_id}/zones", response_model=list[ZoneAvailability])
 async def list_zones_endpoint(
     event_id: int,
+    request: Request,
     db: DbSession,
     redis: Redis,
 ) -> list[ZoneAvailability]:
@@ -70,8 +71,16 @@ async def list_zones_endpoint(
     使用者就不會送出一個註定失敗的請求。剩下的拒絕只有 race(「這個位置剛被買走」),
     那種使用者能理解;「你不能買這裡因為會留下一個空位」則不能。
 
-    唯讀,不進 Lua:瀏覽量遠大於下單量,快照過時是可接受的。
+    唯讀,不進 Lua:瀏覽量遠大於下單量,快照過時是可接受的。結果有 2 秒快取 ——
+    開賣前後這裡會被瘋狂刷新,而每次真實計算是「每個 zone 讀 runs+geom + 跑
+    feasible_quantities」。無認證的端點更需要限流。
     """
+    await enforce_rate_limit(
+        redis,
+        f"zones:{event_id}:{request.client.host if request.client else 'unknown'}",
+        limit=get_settings().ZONES_LIST_LIMIT_PER_MINUTE,
+        window_seconds=60,
+    )
     return await list_zone_availability(db, redis, event_id=event_id)
 
 

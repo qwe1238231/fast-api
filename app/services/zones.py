@@ -3,6 +3,8 @@
 刻意跟 seat_runs 分開:那邊是下單熱路徑(要進 Lua、要 CAS),這邊是瀏覽路徑
 (純讀、可過時、絕不佔用 Redis 的原子區)。兩者目標相反,不要共用同一套機制。
 """
+import json
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,17 +17,41 @@ from app.schemas.seating import SeatedOrderDetail, ZoneAvailability
 from app.services.pricing import load_zone_prices
 from app.services.seat_runs import (
     MAX_TICKETS_PER_ORDER,
-    is_relaxed,
-    read_zone_state,
+    read_zone_snapshots,
     seat_labels,
 )
 from app.services.seating import ENDGAME_POLICY, NORMAL_POLICY, feasible_quantities
+
+
+#: 選區畫面的快取秒數。刻意很短:剩餘席數每筆訂單都在變,但開賣前後這個端點會被
+#: 瘋狂刷新,2 秒的合併就能把 thundering herd 壓成每 2 秒一次真實計算。使用者感覺
+#: 不到 2 秒的延遲,而「快照過時可接受」本來就是這條唯讀路徑的前提。
+_ZONES_CACHE_SECONDS = 2
+
+
+def _zones_cache_key(event_id: int) -> str:
+    return f"event:{event_id}:zones:cache"
 
 
 async def list_zone_availability(
     db: AsyncSession, redis: Redis, *, event_id: int
 ) -> list[ZoneAvailability]:
     """每一區的票價、剩餘席數與可行張數。無座位圖的場次回空清單。"""
+    cached = await redis.get(_zones_cache_key(event_id))
+    if cached is not None:
+        return [ZoneAvailability(**row) for row in json.loads(cached)]
+    fresh = await _compute_zone_availability(db, redis, event_id=event_id)
+    await redis.set(
+        _zones_cache_key(event_id),
+        json.dumps([row.model_dump() for row in fresh]),
+        ex=_ZONES_CACHE_SECONDS,
+    )
+    return fresh
+
+
+async def _compute_zone_availability(
+    db: AsyncSession, redis: Redis, *, event_id: int
+) -> list[ZoneAvailability]:
     venue_id = await db.scalar(select(Event.venue_id).where(Event.id == event_id))
     if venue_id is None:
         # 場次不存在,或它沒有座位圖(舊的純計數器路徑)。前者要明確報錯,
@@ -41,28 +67,30 @@ async def list_zone_availability(
     ).all()
     prices = await load_zone_prices(db, event_id=event_id, venue_id=venue_id)
 
+    # 只有定價的 zone 才可賣,所以先篩再讀 —— 沒必要為不會列出的 zone 打 Redis。
+    sellable = [zone for zone in zones if zone.id in prices]
+    snapshots = await read_zone_snapshots(
+        redis, event_id=event_id, zone_ids=[zone.id for zone in sellable]
+    )
+
     out: list[ZoneAvailability] = []
-    for zone in zones:
-        price = prices.get(zone.id)
-        if price is None:
-            continue        # 這場沒設這一區的票價 → 不可賣,就別出現在選單上
-        state = await read_zone_state(redis, event_id=event_id, zone_id=zone.id)
+    for zone in sellable:
+        snapshot = snapshots[zone.id]
         # 可行張數必須用**這個 zone 當下實際生效的策略**算,否則收尾期放寬之後
         # 前端會繼續 disable 掉其實已經買得到的張數。
-        policy = (
-            ENDGAME_POLICY
-            if await is_relaxed(redis, event_id=event_id, zone_id=zone.id)
-            else NORMAL_POLICY
-        )
+        policy = ENDGAME_POLICY if snapshot.relaxed else NORMAL_POLICY
         out.append(
             ZoneAvailability(
                 zone_id=zone.id,
                 name=zone.name,
                 display_order=zone.display_order,
-                price_cents=price,
-                available=state.remaining,
+                price_cents=prices[zone.id],
+                available=snapshot.state.remaining,
                 available_quantities=feasible_quantities(
-                    state.runs, state.geometry, MAX_TICKETS_PER_ORDER, policy
+                    snapshot.state.runs,
+                    snapshot.state.geometry,
+                    MAX_TICKETS_PER_ORDER,
+                    policy,
                 ),
             )
         )

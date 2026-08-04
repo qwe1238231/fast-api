@@ -66,6 +66,10 @@ class Order(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)  # covered by ix_orders_user_created
     event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)  # covered by ix_orders_active (event_id, status)
+    # 買的是哪一區。分區票價下這是必要的來源資訊,但金額本身仍以
+    # total_price_cents 的快照為準(所以之後改價動不到已成立的訂單,
+    # webhook 的金額驗證也不必重算)。nullable:無座位圖的場次留空。
+    zone_id: Mapped[int | None] = mapped_column(ForeignKey("zones.id"), nullable=True)
     quantity: Mapped[int] = mapped_column(nullable=False)
     total_price_cents: Mapped[int] = mapped_column(nullable=False)
     status: Mapped[OrderStatus] = mapped_column(

@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum 
 
-from sqlalchemy import CheckConstraint, DateTime, String
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from sqlalchemy import Enum as SAEnum
@@ -23,6 +23,13 @@ class Event(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     venue: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 座位圖要掛在正規化的場館上,自由字串沒地方掛 block/seat。刻意先做成
+    # nullable 的加法:沒有座位圖的舊場次(以及只用 total_seats 計數的路徑)
+    # 照常運作,座位功能只對 venue_id 有值的場次生效。等座位流程完整上線、
+    # 舊資料回填完成,才把 venue 字串下架。
+    venue_id: Mapped[int | None] = mapped_column(
+        ForeignKey("venues.id"), nullable=True, index=True
+    )
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     sale_starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

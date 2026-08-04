@@ -11,7 +11,7 @@ from app.models.seating import Seat, SeatBlock, Venue, Zone
 from app.scripts.seed_venue import (
     DEMO_ARENA,
     EDGE_RATIO,
-    SUPERSTITIOUS_SKIPS,
+    is_superstitious,
     RowSpec,
     VenueSpec,
     ZoneSpec,
@@ -29,10 +29,12 @@ def test_sequential_labels_run_across_the_whole_row() -> None:
 
 
 def test_skipping_labels_omit_the_unlucky_numbers() -> None:
-    labels = [label for group in skipping_labels()((20,)) for label in group]
-    assert not (set(labels) & {str(n) for n in SUPERSTITIOUS_SKIPS})
-    assert len(labels) == 20
-    assert len(set(labels)) == 20
+    labels = [label for group in skipping_labels()((60,)) for label in group]
+    assert not any(is_superstitious(int(label)) for label in labels)
+    # 60 席的排必須跳過 54 —— 舊版用有限集合 {4,13,14,24,34,44},54 會漏掉。
+    assert "54" not in labels
+    assert "40" not in labels and "41" not in labels
+    assert len(labels) == len(set(labels)) == 60
 
 
 def test_skipping_labels_break_label_based_adjacency() -> None:

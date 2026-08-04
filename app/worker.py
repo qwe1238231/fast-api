@@ -36,7 +36,10 @@ from app.services.seat_runs import (
     release_seats,
     _ends_key, _geom_key, _relaxed_key, _runs_key, _zone_available_key,
 )
-from app.services.waiting_room import set_admission_paused
+from app.services.waiting_room import (
+    set_admission_paused,
+    _admit_start_key, _draw_key, _salt_key,
+)
 
 _settings = get_settings()
 
@@ -243,6 +246,10 @@ async def _persist_intent(fields: dict) -> str:
                     block_id=int(block_id),
                     order_id=order.id,
                     start_pos=int(fields["start_pos"]),
+                    # stream 的 `quantity` 欄位同時是「張數」與「區間長度」——
+                    # 配位 Lua 的 ARGV[5] 就是 length,而它被 XADD 成 quantity。
+                    # 兩者今天恆等,但這是隱含耦合:若哪天出現「買 2 送 1 個座位」
+                    # 之類的規則,這裡會靜默錯掉。
                     length=int(fields["quantity"]),
                 ))
             await db.commit()
@@ -347,10 +354,18 @@ async def _dead_letter_intent(redis, entry_id: str, fields: dict) -> None:
         if block_id:
             # 座位場次:要還的是一段具體區間,不是一個數量。intent 從未落帳所以
             # DB 沒有對應的 hold 列可刪 —— 直接把區間還回 Redis 就好。
+            zone_id = fields.get("zone_id")
+            if not zone_id:
+                # _persist_intent 會把「只有一個」當 poison 拒絕,所以到不了這裡;
+                # 但 dead-letter 是獨立路徑,不該用 fields["zone_id"] 直接索引而
+                # 在收尾流程裡炸出 KeyError。
+                print(f"ALERT dead-letter intent has block_id but no zone_id: {dict(fields)}")
+                await mark_claim_failed(redis, idempotency_key=idem)
+                return
             await release_seats(
                 redis,
                 event_id=int(fields["event_id"]),
-                zone_id=int(fields["zone_id"]),
+                zone_id=int(zone_id),
                 block_id=int(block_id),
                 start_pos=int(fields["start_pos"]),
                 length=int(fields["quantity"]),
@@ -554,10 +569,13 @@ async def purge_finished_event_keys(
         ).all()
 
         for event_id, zone_id in rows:
+            # 用 waiting_room 自己的 helper 而不是重打字串:上一版漏掉了
+            # queue:{e}:admit_start,而漏掉的原因正是憑印象打 key 格式。
             keys += [
                 _event_available_key(event_id),
-                f"queue:{event_id}:salt",
-                f"queue:{event_id}:draw",
+                _salt_key(event_id),
+                _draw_key(event_id),
+                _admit_start_key(event_id),
             ]
             if zone_id is not None:
                 keys += [

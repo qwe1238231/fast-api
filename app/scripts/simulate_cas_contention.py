@@ -24,7 +24,7 @@ import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from app.scripts.seed_venue import DEMO_ARENA, EDGE_RATIO, ZoneSpec
+from app.scripts.seed_venue import DEMO_ARENA, EDGE_RATIO, ZoneSpec, quality_base
 from app.services.seating import (
     NORMAL_POLICY,
     BlockGeometry,
@@ -46,13 +46,11 @@ SEEDS = tuple(range(4242, 4242 + 12))
 def _geometry_from_zone(zone: ZoneSpec, zone_index: int) -> dict[int, BlockGeometry]:
     """把一個 ZoneSpec 攤平成 BlockGeometry —— 配位一律限制在單一 zone 內
     (票價已經編碼了跨 zone 的品質差異)。"""
-    from app.scripts.seed_venue import _quality_base
-
     geometry: dict[int, BlockGeometry] = {}
     block_id = zone_index * 10_000
     for row_index, row in enumerate(zone.rows):
         for block_index, size in enumerate(row.blocks):
-            base = _quality_base(
+            base = quality_base(
                 zone, row_index=row_index, block_index=block_index, blocks=row.blocks
             )
             geometry[block_id] = BlockGeometry.calibrated(

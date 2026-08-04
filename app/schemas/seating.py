@@ -32,5 +32,15 @@ class SeatedOrderDetail(BaseModel):
 
     zone_name: str
     row_label: str
+    block_index: int
+    """同一排被走道切出的第幾段(0 起算)。
+
+    少了它,「A 排 3、5、7 號」在一排被走道切成三段的場館裡**指不出實體位置** ——
+    而門牌只在 block 內唯一(`uq_seats_block_label`),跨 block 撞號是允許的。
+    目前的三種 labeller 都不會撞(連號或單雙分邊),但那是 labeller 的性質、
+    不是約束保證的,所以票面必須帶著段號。
+    """
+
     labels: list[str]
-    """實際門牌。可能不連號(場館會跳過 4、13,或單雙號分邊),但 pos 一定連續。"""
+    """實際門牌。可能不連號(場館會跳過含 4 的號碼與 13,或單雙號分邊),
+    但 pos 一定連續 —— 那才是「坐在一起」的判準。"""

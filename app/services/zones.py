@@ -105,8 +105,8 @@ async def describe_order_seats(db: AsyncSession, order) -> SeatedOrderDetail:
     """
     row = (
         await db.execute(
-            select(Zone.name, SeatBlock.row_label, SeatHold.block_id,
-                   SeatHold.start_pos, SeatHold.length)
+            select(Zone.name, SeatBlock.row_label, SeatBlock.block_index,
+                   SeatHold.block_id, SeatHold.start_pos, SeatHold.length)
             .join(SeatBlock, SeatBlock.id == SeatHold.block_id)
             .join(Zone, Zone.id == SeatBlock.zone_id)
             .where(SeatHold.order_id == order.id)
@@ -114,10 +114,11 @@ async def describe_order_seats(db: AsyncSession, order) -> SeatedOrderDetail:
     ).one_or_none()
     if row is None:
         raise SeatsNotAssigned(order_id=order.id)
-    zone_name, row_label, block_id, start_pos, length = row
+    zone_name, row_label, block_index, block_id, start_pos, length = row
     return SeatedOrderDetail(
         zone_name=zone_name,
         row_label=row_label,
+        block_index=block_index,
         labels=await seat_labels(
             db, block_id=block_id, start_pos=start_pos, length=length
         ),

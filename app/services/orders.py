@@ -13,6 +13,7 @@ from uuid import UUID
 
 from app.core.exceptions import (
     EventCancelled, EventNotOnSale, EventNotFound, InsufficientInventory,
+    ZoneRequired,
 )
 from app.crud.order import transition_order_status
 from app.models.order import Order, OrderStatus
@@ -144,8 +145,10 @@ async def submit_order(
 
     if event.venue_id is not None:
         # 座位場次:配一段連續座位。zone_id 一定不是 None —— total_for 已經在上面
-        # 用 ZoneRequired 擋掉了,所以這裡不需要再檢查一次。
-        assert zone_id is not None
+        # 用 ZoneRequired 擋掉了。不用 assert:那在 python -O 下會被整行移除,而這
+        # 是金額路徑,寧可留一個永遠不觸發的明確檢查。
+        if zone_id is None:                              # pragma: no cover
+            raise ZoneRequired(event_id=event_id)
         reservation = await reserve_seats_and_enqueue(
             redis,
             event_id=event_id,

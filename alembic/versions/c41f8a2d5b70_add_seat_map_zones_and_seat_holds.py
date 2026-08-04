@@ -82,7 +82,6 @@ def upgrade() -> None:
             "zone_id", "row_label", "block_index", name="uq_seat_blocks_pos"
         ),
     )
-    op.create_index("ix_seat_blocks_zone_id", "seat_blocks", ["zone_id"])
 
     op.create_table(
         "seats",
@@ -154,7 +153,6 @@ def downgrade() -> None:
 
     op.drop_table("seat_holds")
     op.drop_table("seats")
-    op.drop_index("ix_seat_blocks_zone_id", table_name="seat_blocks")
     op.drop_table("seat_blocks")
     op.drop_table("event_zone_prices")
     op.drop_index("ix_zones_venue_order", table_name="zones")

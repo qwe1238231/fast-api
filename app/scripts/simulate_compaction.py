@@ -197,7 +197,10 @@ def simulate(
                     if scope == "block"
                     else list(pending)
                 )
-                frozen_rest = [h for h in pending if h not in movable]
+                # 用 id() 而不是值相等:Placement 是 frozen dataclass,值相等在
+                # score 碰巧相同時會誤判(區間互斥所以今天不會,但別依賴那個)。
+                movable_ids = {id(h) for h in movable}
+                frozen_rest = [h for h in pending if id(h) not in movable_ids]
                 if not movable:
                     continue
                 result = _compact(

@@ -64,6 +64,7 @@ async def make_event(db, redis):
 def _all_keys(event_id: int, zone_id: int) -> list[str]:
     return [
         _event_available_key(event_id),
+        f"queue:{event_id}:admit_start",
         f"queue:{event_id}:salt",
         _runs_key(event_id, zone_id),
         _ends_key(event_id, zone_id),
@@ -154,3 +155,29 @@ async def test_unseated_event_keys_are_purged_too(db, redis, published_event) ->
 
     assert await purge_finished_event_keys({"redis_client": redis}) > 0
     assert not await redis.exists(key)
+
+
+async def test_every_per_event_key_is_covered(redis, make_event) -> None:
+    """清單漏一個 key 就等於永久洩漏。上一版漏掉 queue:{e}:admit_start,而漏掉的
+    原因是在 worker 裡**重打** key 格式而不是 import waiting_room 的 helper ——
+    這條測試枚舉 waiting_room 與 seat_runs 自己宣告的所有 per-event key。
+    """
+    from app.services.seat_runs import (
+        _ends_key, _geom_key, _relaxed_key, _runs_key, _zone_available_key,
+    )
+    from app.services.waiting_room import _admit_start_key, _draw_key, _salt_key
+
+    event_id, zone_id = await make_event(ends_days_ago=EVENT_KEY_RETENTION_DAYS + 1)
+    declared = [
+        _event_available_key(event_id),
+        _salt_key(event_id), _draw_key(event_id), _admit_start_key(event_id),
+        _runs_key(event_id, zone_id), _ends_key(event_id, zone_id),
+        _geom_key(event_id, zone_id), _zone_available_key(event_id, zone_id),
+        _relaxed_key(event_id, zone_id),
+    ]
+    for key in declared:                       # relaxed 平常不存在,補上才測得到
+        if not await redis.exists(key):
+            await redis.set(key, "1")
+
+    assert await purge_finished_event_keys({"redis_client": redis}) > 0
+    assert await _present(redis, declared) == []

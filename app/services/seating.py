@@ -84,7 +84,9 @@ class Policy:
 
 
 NORMAL_POLICY: Final = Policy()
-ENDGAME_POLICY: Final = Policy(min_run=1, mid_cut_guard=1)
+#: 收尾期:只放寬「端點切可以留下孤兒」。不動 mid_cut_guard —— allow_mid_cut
+#: 預設關閉,所以那個欄位在這裡完全不生效,寫上去只會讓人以為中切也放寬了。
+ENDGAME_POLICY: Final = Policy(min_run=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,9 +245,9 @@ def candidates(
     geo: BlockGeometry,
     policy: Policy,
 ) -> Iterator[Placement]:
-    """一個 run 最多產生 3 個候選,每個 O(1)。
+    """一個 run 產生 2 個候選(靠左端、靠右端),每個 O(1)。
 
-    預設只有兩個候選(靠左端、靠右端)。`allow_mid_cut` 打開時多一個中切點:
+    `allow_mid_cut` 打開時才有第三個。`allow_mid_cut` 打開時多一個中切點:
     中切窗口是連續區間、且窗口內 cut_cost 恆為常數,所以「品質對位置單峰」
     保證 clamp 取到的就是窗口內最佳 —— 不必枚舉 tail + 1 個位置。
     (單峰性正是 BlockGeometry 擋掉 decay < 0 的原因。)

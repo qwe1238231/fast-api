@@ -177,6 +177,7 @@ async def test_seats_are_hidden_until_the_order_is_confirmed(
     body = revealed.json()
     assert body["zone_name"] == "前區"
     assert body["row_label"] == "A"
+    assert body["block_index"] == 0
     assert len(body["labels"]) == 2
 
 

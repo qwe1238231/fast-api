@@ -115,7 +115,10 @@ class SeatBlock(Base):
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    zone_id: Mapped[int] = mapped_column(ForeignKey("zones.id"), nullable=False, index=True)
+    # 不加 index:uq_seat_blocks_pos (zone_id, row_label, block_index) 的索引已經
+    # 以 zone_id 開頭,完全覆蓋「按 zone 查 block」。這個 repo 有兩個 commit 專門在
+    # 刪這種冗餘(drop redundant ix_orders_event_id / ix_orders_user_id)。
+    zone_id: Mapped[int] = mapped_column(ForeignKey("zones.id"), nullable=False)
     row_label: Mapped[str] = mapped_column(String(8), nullable=False)
     block_index: Mapped[int] = mapped_column(nullable=False)
     """同一排被走道切出的第幾段,0 起算。"""

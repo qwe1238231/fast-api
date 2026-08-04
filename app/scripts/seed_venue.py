@@ -23,8 +23,13 @@ from app.models.seating import Seat, SeatBlock, Venue, Zone
 #: 內部的落差蓋掉(若 edge 一律為 0,所有 block 的邊緣座位都同分)。
 EDGE_RATIO = 0.5
 
-#: 台灣/華語場館常見的忌諱號碼。
-SUPERSTITIOUS_SKIPS = frozenset({4, 13, 14, 24, 34, 44})
+def is_superstitious(number: int) -> bool:
+    """台灣/華語場館常見的忌諱號碼:任何含 4 的、以及 13。
+
+    刻意是**謂詞**而不是集合。集合版寫過 {4,13,14,24,34,44},60 席的排就會出現
+    54 —— 有限枚舉在長排上必然漏,而漏掉的後果是門牌印錯、現場的票跟椅子對不上。
+    """
+    return "4" in str(number) or number == 13
 
 #: 每個 block 一組門牌。輸入是「這一排被走道切出的各段座位數」。
 Labeller = Callable[[Sequence[int]], list[list[str]]]
@@ -36,7 +41,7 @@ def sequential_labels(blocks: Sequence[int]) -> list[list[str]]:
     return [[str(next(counter)) for _ in range(size)] for size in blocks]
 
 
-def skipping_labels(skip: frozenset[int] = SUPERSTITIOUS_SKIPS) -> Labeller:
+def skipping_labels(skip: Callable[[int], bool] = is_superstitious) -> Labeller:
     """連號但跳過忌諱號碼 —— 於是門牌之差不再等於座位之差。"""
 
     def labeller(blocks: Sequence[int]) -> list[list[str]]:
@@ -45,7 +50,7 @@ def skipping_labels(skip: frozenset[int] = SUPERSTITIOUS_SKIPS) -> Labeller:
         for size in blocks:
             labels: list[str] = []
             while len(labels) < size:
-                while number in skip:
+                while skip(number):
                     number += 1
                 labels.append(str(number))
                 number += 1
@@ -114,7 +119,7 @@ class VenueSpec:
         )
 
 
-def _quality_base(
+def quality_base(
     zone: ZoneSpec, *, row_index: int, block_index: int, blocks: Sequence[int]
 ) -> float:
     """一個 block 的整體品質:排的遠近 × 水平偏離中線的程度。
@@ -165,7 +170,7 @@ async def seed_venue(db: AsyncSession, spec: VenueSpec) -> Venue:
             for block_index, (size, labels) in enumerate(
                 zip(row.blocks, label_groups, strict=True)
             ):
-                base = _quality_base(
+                base = quality_base(
                     zone_spec,
                     row_index=row_index,
                     block_index=block_index,

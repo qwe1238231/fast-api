@@ -62,6 +62,7 @@ from app.services.seating import (
     Placement,
     Policy,
     Run,
+    feasible_quantities,
     legal_anchors,
 )
 
@@ -616,8 +617,6 @@ async def reserve_seats_and_enqueue(
 def _feasible(state: ZoneState, policy: Policy) -> list[int]:
     """當下配得出來的張數。注意這不能簡化成「最大連號長度」—— 只剩一段 5 連號時
     4 張是配不出來的(會留下孤兒),回 max_contiguous=5 然後拒絕 4 張正是誤導。"""
-    from app.services.seating import feasible_quantities
-
     return feasible_quantities(
         state.runs, state.geometry, MAX_TICKETS_PER_ORDER, policy
     )

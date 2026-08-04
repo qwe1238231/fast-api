@@ -28,11 +28,13 @@ from app.services.audit import AUDIT_STREAM_KEY
 from app.models.event import Event, EventStatus
 from app.services.inventory import (
     compute_expected_available, get_available, release,
-    ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY,queue_depth,
+    ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY, queue_depth,
+    _key as _event_available_key,
 )
 from app.services.idempotency import mark_claim_failed
 from app.services.seat_runs import (
-    release_seats, _ends_key, _runs_key, _zone_available_key,
+    release_seats,
+    _ends_key, _geom_key, _relaxed_key, _runs_key, _zone_available_key,
 )
 from app.services.waiting_room import set_admission_paused
 
@@ -494,6 +496,73 @@ async def detect_inventory_drift(ctx: dict) -> list[dict]:
 
     return drifts
         
+#: 活動結束後保留 Redis key 的天數。退款/取消到這時都走完了,留一週給事後對帳。
+EVENT_KEY_RETENTION_DAYS = 7
+
+#: 只清「結束於 [now − WINDOW, now − RETENTION]」之間的場次。更舊的已經被前幾天的
+#: 排程清掉了,所以這個上界讓每天的工作量有界(而不是每天重掃整個 events 表)。
+#: 代價:worker 停機超過 (WINDOW − RETENTION) 天的話,那段期間的 key 會永久留下 ——
+#: 屆時手動放大 retention_days 的下界重跑一次即可。
+EVENT_KEY_PURGE_WINDOW_DAYS = 30
+
+
+async def purge_finished_event_keys(
+    ctx: dict,
+    *,
+    retention_days: int = EVENT_KEY_RETENTION_DAYS,
+    window_days: int = EVENT_KEY_PURGE_WINDOW_DAYS,
+) -> int:
+    """清掉已結束場次的 Redis key。回傳刪掉幾個 key。
+
+    這些 key 全部沒有 TTL,因為它們在銷售期間必須一直存在:給 `available` 設 TTL
+    會讓庫存在開賣中途消失。所以只能靠排程清。
+
+    **不用 SCAN。** key 的集合完全可以從 Postgres 推導(event id × zone id × 固定
+    後綴),所以枚舉 DB 就好 —— SCAN 在大 keyspace 上是 O(全部 key),而且會跟熱路徑
+    搶 Redis 的時間。
+
+    `queue:{e}:salt` 也在清單裡但要小心:重新產生它會讓抽籤順序重排。場次結束
+    七天後不可能還有人在排隊,所以安全。
+    """
+    redis = ctx["redis_client"]
+    now = datetime.now(timezone.utc)
+    upper = now - timedelta(days=retention_days)
+    lower = now - timedelta(days=window_days)
+
+    keys: list[str] = []
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                select(Event.id, Zone.id)
+                .outerjoin(Zone, Zone.venue_id == Event.venue_id)
+                .where(Event.ends_at < upper, Event.ends_at >= lower)
+            )
+        ).all()
+
+        for event_id, zone_id in rows:
+            keys += [
+                _event_available_key(event_id),
+                f"queue:{event_id}:salt",
+                f"queue:{event_id}:draw",
+            ]
+            if zone_id is not None:
+                keys += [
+                    _runs_key(event_id, zone_id),
+                    _ends_key(event_id, zone_id),
+                    _geom_key(event_id, zone_id),
+                    _zone_available_key(event_id, zone_id),
+                    _relaxed_key(event_id, zone_id),
+                ]
+
+    # event:{e}:meta 不在清單裡 —— 它本來就有 60 秒 TTL,早就自己走了。
+    if not keys:
+        return 0
+    deleted = await redis.delete(*set(keys))
+    if deleted:
+        print(f"purged {deleted} Redis keys for events finished before {upper.date()}")
+    return deleted
+
+
 async def detect_seat_structure_drift(ctx: dict) -> list[dict]:
     """檢查座位 free-run 結構的三條不變式。**預防勝於復原**。
 
@@ -614,6 +683,7 @@ class WorkerSettings:
         cron(purge_old_audit_logs, hour={2}, minute={30}),
         cron(detect_inventory_drift, minute=set(range(0, 60, 5))),
         cron(detect_seat_structure_drift, minute=set(range(0, 60, 5))),
+        cron(purge_finished_event_keys, hour={3}, minute={30}),
 
     ]
 

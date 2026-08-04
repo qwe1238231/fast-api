@@ -11,11 +11,11 @@ from app.schemas.order import OrderCreate, OrderResponse, OrderAcceptedResponse,
 from app.services.orders import submit_order, cancel_order as cancel_order_service, mark_confirmed, mark_paid, release_order_seat
 from app.services.idempotency import get_claim_state, CLAIM_PENDING, CLAIM_FAILED
 from app.core.config import get_settings
-from app.core.exceptions import OrderNotFound, InvalidOrderTransition
+from app.core.exceptions import DomainError, OrderNotFound, InvalidOrderTransition
 from app.crud.order import get_order_by_id, get_order_by_idempotency_key, list_orders_for_user
 from app.schemas.payment import PaymentIntentResponse
 from app.services.stripe_client import create_payment_intent
-from app.services.waiting_room import verify_admission
+from app.services.waiting_room import refund_admission, verify_admission
 
 
 router = APIRouter(prefix="/orders", tags=["orders"])
@@ -42,19 +42,31 @@ async def create_endpoint(
     """
     # Bypass is guarded in Settings (only honoured under DEBUG); in prod this
     # branch is dead and every order goes through admission verification.
+    jti: str | None = None
     if not get_settings().LOADTEST_BYPASS_ADMISSION:
-        await verify_admission(
+        jti = await verify_admission(
             redis, admission_token, user_id=current_user.id, event_id=order_in.event_id
         )
-    await submit_order(
-        db,
-        redis,
-        user_id=current_user.id,
-        event_id=order_in.event_id,
-        quantity=order_in.quantity,
-        zone_id=order_in.zone_id,
-        idempotency_key=idempotency_key,
-    )
+    try:
+        await submit_order(
+            db,
+            redis,
+            user_id=current_user.id,
+            event_id=order_in.event_id,
+            quantity=order_in.quantity,
+            zone_id=order_in.zone_id,
+            idempotency_key=idempotency_key,
+        )
+    except DomainError:
+        # 沒有任何訂單意圖成立 → 把單次入場券還回去,讓使用者能改張數/改區重試,
+        # 而不是被迫重新排隊。不變式是「入場券被消耗 ⟺ 訂單意圖已受理」。
+        #
+        # 只攔 DomainError:那些都是在 reserve 之前(或 reserve 回報 SOLD_OUT 而
+        # 沒有實際扣庫存時)拋出的。非預期的例外有可能發生在 reserve 成功之後,
+        # 那時退還 token 就會讓一張券換到兩張票 —— 寧可弄丟一張券,也不要重複售出。
+        if jti is not None:
+            await refund_admission(redis, jti)
+        raise
     return OrderAcceptedResponse(idempotency_key=idempotency_key)
 
 def _encode_cursor(order: Order) -> str:

@@ -158,3 +158,62 @@ async def test_order_rejects_replayed_token(client, db, published_event):
                            headers={**common, "Idempotency-Key": str(uuid4())})
     assert r1.status_code == 202
     assert r2.status_code == 403                               # single-use: same token reused
+
+
+# --- admission token 的退還 ----------------------------------------------
+# SETNX 必須在扣庫存之前(否則同一張 token 的兩個並發請求都會通過,一票變兩票),
+# 所以下單失敗會連帶燒掉入場券。售完是終局的所以以前看不出問題,但「配不出這個
+# 張數」本質上可重試,而在讀-算-CAS 的配位架構下重試是常態路徑。不變式必須是
+# 「入場券被消耗 ⟺ 訂單意圖已受理」。
+
+@pytest.mark.asyncio
+async def test_sold_out_refunds_the_admission_token(client, db, published_event, redis):
+    """庫存不足被拒之後,同一張入場券必須還能改張數再試 —— 不必重新排隊。"""
+    bearer, uid = await _authed(client, db)
+    token = create_admission_token(user_id=uid, event_id=published_event.id, ttl_seconds=120)
+    common = {**bearer, "Admission-Token": token}
+
+    too_many = await client.post(
+        "/v1/orders/",
+        json={"event_id": published_event.id, "quantity": 6},   # 只有 5 席
+        headers={**common, "Idempotency-Key": str(uuid4())},
+    )
+    assert too_many.status_code == 409, too_many.text
+
+    retry = await client.post(
+        "/v1/orders/",
+        json={"event_id": published_event.id, "quantity": 5},
+        headers={**common, "Idempotency-Key": str(uuid4())},
+    )
+    assert retry.status_code == 202, retry.text
+    assert await get_available(redis, event_id=published_event.id) == 0
+
+
+@pytest.mark.asyncio
+async def test_client_error_refunds_the_admission_token(client, db, published_event):
+    """無座位圖的場次帶了 zone_id → 422,入場券必須退還讓使用者改正重送。"""
+    bearer, uid = await _authed(client, db)
+    token = create_admission_token(user_id=uid, event_id=published_event.id, ttl_seconds=120)
+    common = {**bearer, "Admission-Token": token}
+
+    bad_zone = await client.post(
+        "/v1/orders/",
+        json={"event_id": published_event.id, "quantity": 1, "zone_id": 999},
+        headers={**common, "Idempotency-Key": str(uuid4())},
+    )
+    assert bad_zone.status_code == 422, bad_zone.text
+
+    fixed = await client.post(
+        "/v1/orders/",
+        json={"event_id": published_event.id, "quantity": 1},
+        headers={**common, "Idempotency-Key": str(uuid4())},
+    )
+    assert fixed.status_code == 202, fixed.text
+
+
+@pytest.mark.asyncio
+async def test_refund_admission_is_idempotent(redis):
+    from app.services.waiting_room import refund_admission
+
+    await refund_admission(redis, "never-issued")     # DEL 不存在的 key 是 no-op
+    await refund_admission(redis, "never-issued")

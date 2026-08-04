@@ -156,11 +156,38 @@ async def admit_deadline(redis: Redis, *, event_id: int, user_id: int) -> float 
     return float(start) + (rank + 1) / rate
 
 
-async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: int) -> None:
+def _used_key(jti: str) -> str:
+    """Single-use marker for one admission token."""
+    return f"admission_used:{jti}"
+
+
+async def refund_admission(redis: Redis, jti: str) -> None:
+    """把單次入場券還回去。**只在確定沒有任何訂單意圖成立時**呼叫。
+
+    為什麼需要這個:SETNX 必須發生在扣庫存之前 —— 否則同一張 token 的兩個並發
+    請求都會通過檢查,一張入場券換到兩張票。但這樣一來,凡是下單失敗(售完、
+    配不出座位、活動不在販售窗、帶錯 zone)都會連帶燒掉入場券,使用者得回去
+    重新排隊才能改個張數再試。
+
+    售完是終局的所以以前看不出問題,但「配不出這個張數」本質上是可重試的
+    (改成 2 張就成立),而在讀-算-CAS 的配位架構下重試更是常態路徑。所以失敗
+    必須把券還回去。
+
+    冪等:DEL 不存在的 key 是 no-op。
+    """
+    await redis.delete(_used_key(jti))
+
+
+async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: int) -> str:
     """Raise AdmissionDenied unless `token` is a valid, in-scope, unused admission pass.
 
     Checks signature/expiry (jwt), type, that it was issued for this event and this
     user, and that it hasn't been used before (single-use via SETNX on the jti).
+
+    回傳 jti,讓呼叫端能在訂單最終沒有成立時用 `refund_admission` 還回去。
+    SETNX 留在這裡而不是搬到下單成功之後,是為了保住單次性的原子性:改成
+    「先 EXISTS 檢查、成功後才 SETNX」會開一個窗口讓同一張 token 的兩個並發
+    請求都通過。
     """
     settings = get_settings()
     try:
@@ -176,6 +203,7 @@ async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: 
 
     jti = payload.get("jti")
     ttl = max(1, int(payload["exp"] - datetime.now(timezone.utc).timestamp()))
-    first_use = await redis.set(f"admission_used:{jti}", "1", nx=True, ex=ttl)
+    first_use = await redis.set(_used_key(jti), "1", nx=True, ex=ttl)
     if not first_use:
         raise AdmissionDenied("admission token already used")
+    return jti

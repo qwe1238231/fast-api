@@ -123,6 +123,17 @@ class SeatContention(InventoryError):
         super().__init__(f"Zone {zone_id}: seat allocation contended after {attempts} attempts")
 
 
+class SeatsNotAssigned(OrderError):
+    """這筆訂單還沒有可以公開的座號。
+
+    確認之前刻意不公開:那是 pending hold 能被 compaction 滑動的唯一前提 ——
+    使用者看過的座號就不能再偷偷改。
+    """
+    def __init__(self, order_id: int):
+        self.order_id = order_id
+        super().__init__(f"Order {order_id} has no seats to disclose yet")
+
+
 class AdmissionDenied(DomainError):
     """Order attempted without a valid waiting-room admission token."""
     def __init__(self, reason: str = "admission required"):

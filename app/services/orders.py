@@ -7,7 +7,7 @@ This layer orchestrates the side effects each transition entails
 """
 from datetime import datetime, timezone
 from redis.asyncio import Redis as RedisClient
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 
@@ -29,8 +29,21 @@ async def mark_paid(db: AsyncSession, order: Order) -> bool:
 
 
 async def mark_confirmed(db: AsyncSession, order: Order) -> bool:
-    """CAS PAID -> CONFIRMED. Returns True iff applied."""
-    return await transition_order_status(db, order, OrderStatus.CONFIRMED)
+    """CAS PAID -> CONFIRMED. Returns True iff applied.
+
+    確認即凍結座位:座號從這一刻起才對外公開,所以此後不得再被 compaction 滑動。
+    凍結跟狀態轉換放在同一個 txn,免得有人忘了配對呼叫 —— 一個「已確認但沒凍結」
+    的 hold 會讓 compaction 去搬一個使用者已經看過的座位。
+    """
+    if not await transition_order_status(db, order, OrderStatus.CONFIRMED):
+        return False
+    if order.zone_id is not None:
+        await db.execute(
+            update(SeatHold)
+            .where(SeatHold.order_id == order.id, SeatHold.confirmed_at.is_(None))
+            .values(confirmed_at=func.now())
+        )
+    return True
 
 
 async def cancel_order(db: AsyncSession, order: Order) -> bool:

@@ -23,6 +23,7 @@ from app.core.exceptions import (
     NationalIdAlreadyRegistered,
     NoSeatsAvailable,
     SeatContention,
+    SeatsNotAssigned,
     ZoneNotForEvent,
     ZoneRequired,
 )
@@ -137,6 +138,13 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={"detail": str(exc), "event_id": exc.event_id, "zone_id": exc.zone_id},
             headers={"Retry-After": "1"},
+        )
+
+    @app.exception_handler(SeatsNotAssigned)
+    async def _seats_not_assigned(request: Request, exc: SeatsNotAssigned):
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": str(exc), "order_id": exc.order_id},
         )
 
     @app.exception_handler(BuyerInfoNotFound)

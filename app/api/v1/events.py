@@ -12,6 +12,8 @@ from app.core.security import create_admission_token
 from app.crud.event import create_event, get_event, list_published_events
 from app.models.event import Event
 from app.schemas.event import EventCreate, EventResponse, QueueStatusResponse
+from app.schemas.seating import ZoneAvailability
+from app.services.zones import list_zone_availability
 from app.services.publish_event import publish_event
 from app.services.queue_events import register as sse_register, unregister as sse_unregister
 from app.services.waiting_room import (
@@ -55,6 +57,23 @@ async def list_published_endpoint(
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
 ) -> list[Event]:
     return await list_published_events(db, offset=offset, limit=limit)
+
+@router.get("/{event_id}/zones", response_model=list[ZoneAvailability])
+async def list_zones_endpoint(
+    event_id: int,
+    db: DbSession,
+    redis: Redis,
+) -> list[ZoneAvailability]:
+    """選區畫面:每一區的票價、剩餘席數,以及**現在配得出來的張數**。
+
+    回可行張數集合而不是「最大連號長度」,是為了把約束編碼進前端的可選集合 ——
+    使用者就不會送出一個註定失敗的請求。剩下的拒絕只有 race(「這個位置剛被買走」),
+    那種使用者能理解;「你不能買這裡因為會留下一個空位」則不能。
+
+    唯讀,不進 Lua:瀏覽量遠大於下單量,快照過時是可接受的。
+    """
+    return await list_zone_availability(db, redis, event_id=event_id)
+
 
 @router.get("/{event_id}", response_model=EventResponse)
 async def get_event_endpoint(event_id: int, db: DbSession) -> Event:

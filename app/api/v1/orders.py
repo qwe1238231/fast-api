@@ -11,9 +11,11 @@ from app.schemas.order import OrderCreate, OrderResponse, OrderAcceptedResponse,
 from app.services.orders import submit_order, cancel_order as cancel_order_service, mark_confirmed, mark_paid, release_order_seat
 from app.services.idempotency import get_claim_state, CLAIM_PENDING, CLAIM_FAILED
 from app.core.config import get_settings
-from app.core.exceptions import DomainError, OrderNotFound, InvalidOrderTransition
+from app.core.exceptions import DomainError, OrderNotFound, InvalidOrderTransition, SeatsNotAssigned
 from app.crud.order import get_order_by_id, get_order_by_idempotency_key, list_orders_for_user
 from app.schemas.payment import PaymentIntentResponse
+from app.schemas.seating import SeatedOrderDetail
+from app.services.zones import describe_order_seats
 from app.services.stripe_client import create_payment_intent
 from app.services.waiting_room import refund_admission, verify_admission
 
@@ -146,6 +148,26 @@ async def get_order(
     if order is None or order.user_id != current_user.id:
         raise OrderNotFound(order_id=order_id)
     return order
+
+@router.get("/{order_id}/seats", response_model=SeatedOrderDetail)
+async def get_order_seats(
+    order_id: int,
+    current_user: CurrentUser,
+    db: DbSession,
+) -> SeatedOrderDetail:
+    """已確認訂單的座號。
+
+    確認之前刻意 409 而不是回空值:座號在那之前還可能被 compaction 移動,吐出去
+    就等於凍結它。回一個明確的「尚未公開」比回 null 好 —— 後者跟「這場沒有座位圖」
+    分不出來。
+    """
+    order = await get_order_by_id(db, order_id)
+    if order is None or order.user_id != current_user.id:
+        raise OrderNotFound(order_id=order_id)
+    if order.zone_id is None or order.status != OrderStatus.CONFIRMED:
+        raise SeatsNotAssigned(order_id=order_id)
+    return await describe_order_seats(db, order)
+
 
 @router.post("/{order_id}/pay", status_code=status.HTTP_204_NO_CONTENT)
 async def pay_order(

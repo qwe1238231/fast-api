@@ -34,11 +34,13 @@ async def create_order(
         quantity: int,
         total_price_cents: int,
         idempotency_key: UUID,
+        zone_id: int | None = None,
 ) -> Order:
     """Insert a new pending order. Caller must commit."""
     order= Order(
         user_id=user_id,
         event_id=event_id,
+        zone_id=zone_id,
         quantity=quantity,
         total_price_cents=total_price_cents,
         idempotency_key=idempotency_key,

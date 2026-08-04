@@ -21,6 +21,8 @@ from app.core.exceptions import (
     BuyerInfoAlreadyExists,
     BuyerInfoNotFound,
     NationalIdAlreadyRegistered,
+    ZoneNotForEvent,
+    ZoneRequired,
 )
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -39,6 +41,26 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc), "event_id": exc.event_id},
         )
+    # 兩種 zone 錯誤都是「請求帶錯了」而不是「狀態衝突」,所以 422 而非 409。
+    @app.exception_handler(ZoneRequired)
+    async def _zone_required(request: Request, exc: ZoneRequired):
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": str(exc), "event_id": exc.event_id},
+        )
+
+    @app.exception_handler(ZoneNotForEvent)
+    async def _zone_not_for_event(request: Request, exc: ZoneNotForEvent):
+        # 只回泛用訊息,不回 exc.reason —— 別讓外部藉由錯誤差異探測場館結構。
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={
+                "detail": f"Zone {exc.zone_id} is not available for event {exc.event_id}",
+                "event_id": exc.event_id,
+                "zone_id": exc.zone_id,
+            },
+        )
+
     @app.exception_handler(EventNotOnSale)
     async def _event_not_on_sale(request: Request, exc: EventNotOnSale):
         return JSONResponse(

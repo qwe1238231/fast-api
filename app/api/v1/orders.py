@@ -52,6 +52,7 @@ async def create_endpoint(
         user_id=current_user.id,
         event_id=order_in.event_id,
         quantity=order_in.quantity,
+        zone_id=order_in.zone_id,
         idempotency_key=idempotency_key,
     )
     return OrderAcceptedResponse(idempotency_key=idempotency_key)

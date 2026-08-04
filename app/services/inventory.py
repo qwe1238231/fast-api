@@ -61,6 +61,7 @@ async def get_available(
 # KEYS[1]=stock key   KEYS[2]=claim key   KEYS[3]=stream key
 # ARGV[1]=quantity  ARGV[2]=claim TTL seconds  ARGV[3]=user_id
 # ARGV[4]=event_id  ARGV[5]=total_price_cents  ARGV[6]=idempotency_key
+# ARGV[7]=zone_id ('' = 無座位圖的場次)
 # Returns (a list on the Python side):
 #   {'DUP'}                            -> this idempotency_key was already processed
 #   {'SOLD_OUT', remaining}            -> not enough stock
@@ -84,12 +85,15 @@ end
 redis.call('DECRBY', KEYS[1], qty)
 
 -- 4) Push the order intent into the stream, capture the auto-generated message id.
+--    zone_id 傳 '' 代表無座位圖的場次(worker 會還原成 NULL)。Redis stream 的
+--    欄位值只能是字串,沒有 nil,所以用空字串當哨兵。
 local stream_id = redis.call('XADD', KEYS[3], '*',
     'user_id', ARGV[3],
     'event_id', ARGV[4],
     'quantity', ARGV[1],
     'total_price_cents', ARGV[5],
-    'idempotency_key', ARGV[6])
+    'idempotency_key', ARGV[6],
+    'zone_id', ARGV[7])
 
 -- 5) Write the claim (with TTL) so the next request with the same key is blocked at step 1.
 redis.call('SET', KEYS[2], 'PENDING', 'EX', tonumber(ARGV[2]))
@@ -247,6 +251,7 @@ async def reserve_and_enqueue(
         quantity: int,
         total_price_cents: int,
         idempotency_key: str,
+        zone_id: int | None = None,
         claim_ttl_seconds: int = 86400,
 ) -> ReserveResult:
     """Atomically: dedup + decrement stock + enqueue + write claim.
@@ -271,6 +276,7 @@ async def reserve_and_enqueue(
             event_id,                       # ARGV[4]
             total_price_cents,              # ARGV[5]
             idempotency_key,                # ARGV[6]
+            "" if zone_id is None else zone_id,   # ARGV[7]
         ],
         client=redis,                       # current client (app or test)
     )

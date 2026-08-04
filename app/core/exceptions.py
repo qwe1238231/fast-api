@@ -25,6 +25,26 @@ class EventCancelled(EventError):
         self.event_id = event_id
         super().__init__(f"Event {event_id} is cancelled")
 
+class ZoneRequired(EventError):
+    """有座位圖的場次必須指定要買哪一區 —— 票價與配位都以 zone 為單位。"""
+    def __init__(self, event_id: int):
+        self.event_id = event_id
+        super().__init__(f"Event {event_id} is seated; zone_id is required")
+
+class ZoneNotForEvent(EventError):
+    """這個 zone 不能用於這個場次。
+
+    涵蓋四種情況,對外一律同一個錯誤:zone 不存在、屬於別的場館、這個場次沒設
+    該區票價、或這個場次根本沒有座位圖。**別場館的 zone 是安全問題** —— 少了
+    這道檢查,使用者可以帶另一個場館的便宜 zone_id 來買這場,而且 webhook 的
+    金額驗證抓不到(total_price_cents 是照那個便宜價算的,前後一致)。
+    """
+    def __init__(self, event_id: int, zone_id: int, reason: str = "not sellable"):
+        self.event_id = event_id
+        self.zone_id = zone_id
+        self.reason = reason
+        super().__init__(f"Zone {zone_id} is not sellable for event {event_id}: {reason}")
+
 class OrderError(DomainError):
     """Base for Order-related errors."""
 

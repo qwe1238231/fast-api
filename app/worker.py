@@ -200,10 +200,14 @@ async def _persist_intent(fields: dict) -> str:
     """
     async with AsyncSessionLocal() as db:
         try:
+            # zone_id 是空字串或缺欄位時代表無座位圖的場次 → NULL。缺欄位的
+            # 情況是為了相容:升級前就躺在 stream 裡的舊 intent 沒有這個欄位。
+            zone_id = fields.get("zone_id") or None
             await create_order(
                 db,
                 user_id=int(fields["user_id"]),
                 event_id=int(fields["event_id"]),
+                zone_id=int(zone_id) if zone_id else None,
                 quantity=int(fields["quantity"]),
                 total_price_cents=int(fields["total_price_cents"]),
                 idempotency_key=UUID(fields["idempotency_key"]),

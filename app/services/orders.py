@@ -18,6 +18,7 @@ from app.models.order import Order, OrderStatus
 from app.services.inventory import release, reserve_and_enqueue, ReserveOutcome, ReserveResult
 from app.models.event import EventStatus
 from app.services.event_cache import get_event_meta
+from app.services.pricing import total_for
 
 async def mark_paid(db: AsyncSession, order: Order) -> bool:
     """CAS PENDING -> PAID. Returns True iff applied (False = order left PENDING)."""
@@ -72,6 +73,7 @@ async def submit_order(
         event_id: int,
         quantity: int,
         idempotency_key: UUID,
+        zone_id: int | None = None,
 ) -> ReserveResult:
     """Validate the event, then atomically reserve + enqueue the order intent.
 
@@ -92,13 +94,16 @@ async def submit_order(
     if not (event.sale_starts_at <= now <= event.sale_ends_at):
         raise EventNotOnSale(event_id=event_id)
 
+    # 金額一律走 pricing:分區票價與單一票價會長期共存(座位圖 migration 是純
+    # 加法),呼叫端不該知道差別。無座位圖的場次行為與改動前完全相同。
     result = await reserve_and_enqueue(
         redis,
         event_id=event_id,
         user_id=user_id,
         quantity=quantity,
-        total_price_cents=event.price_cents * quantity,
+        total_price_cents=total_for(event, zone_id=zone_id, quantity=quantity),
         idempotency_key=str(idempotency_key),
+        zone_id=zone_id,
     )
     if result.outcome == ReserveOutcome.SOLD_OUT:
         raise InsufficientInventory(

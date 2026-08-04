@@ -12,6 +12,9 @@ class OrderCreate(BaseModel):
 
     event_id: int
     quantity: Annotated[int, Field(ge=1, le=10)]
+    zone_id: int | None = None
+    """要買哪一區。有座位圖的場次必填(票價與配位都以 zone 為單位);
+    無座位圖的舊場次必須留空。"""
 
 
 class OrderAcceptedResponse(BaseModel):

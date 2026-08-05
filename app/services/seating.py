@@ -346,9 +346,18 @@ def occupy(runs: Sequence[Run], placement: Placement) -> list[Run]:
 
 
 def release(
-    runs: Sequence[Run], *, block_id: int, start: int, length: int
+    runs: Sequence[Run],
+    *,
+    block_id: int,
+    start: int,
+    length: int,
+    capacity: int | None = None,
 ) -> list[Run]:
     """歸還 [start, start + length) 的座位,並與左右**緊鄰**的空段合併。
+
+    `capacity` 給了才檢查上界。Redis 版一定檢查(geom 存了容量),所以差異測試要能
+    斷言「兩邊都拒絕」就得把容量傳進來 —— 少了這個參數,越界在純函式版會通過、
+    在 Lua 版被拒,oracle 的性質就破了。
 
     純函式版是 O(R) 掃描;Redis 版靠 end→start 的反向索引(boundary tags)做到
     O(1)。兩者行為必須逐位一致 —— 這個函式就是那邊的 oracle。
@@ -359,6 +368,10 @@ def release(
     """
     if length < 1:
         raise ValueError("length 至少為 1")
+    if start < 0 or (capacity is not None and start + length > capacity):
+        raise ValueError(
+            f"[{start}, {start + length}) 超出 block {block_id} 的容量 {capacity}"
+        )
     lo, hi = start, start + length
     out: list[Run] = []
     for run in runs:

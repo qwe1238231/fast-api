@@ -9,12 +9,7 @@ import random
 
 import pytest
 
-from app.scripts.simulate_seating import (
-    NO_SINGLES_DEMAND,
-    TYPICAL_DEMAND,
-    simulate,
-    typical_venue,
-)
+from app.scripts.simulate_seating import NO_SINGLES_DEMAND, TYPICAL_DEMAND, simulate
 from app.services.seating import (
     ENDGAME_POLICY,
     NORMAL_POLICY,
@@ -412,12 +407,25 @@ def test_policy_rejects_nonsense(kwargs: dict[str, float]) -> None:
 # 14 ─ 裝箱效率的回歸下限（模擬，不是單元測試）
 
 _SIM_SEEDS = (11, 22, 33, 44, 55, 66, 77, 88, 99, 110, 121, 132)
-_SIM_BLOCKS = 12
+
+
+def _regression_venue() -> list[BlockGeometry]:
+    """回歸測試自己的場館,**刻意不用 simulate_seating.typical_venue**。
+
+    那個是決策支援腳本的示範場館,調整它是那個腳本該做的事;但下面的下限數字是
+    綁在容量組合上的(奇數 block 的數量直接決定擱淺率),共用的話 CI 會為了完全
+    無關的理由變紅。這裡固定 12 個 block、其中 5 個奇數。
+    """
+    capacities = (18, 20, 21, 19, 22)
+    return [
+        BlockGeometry.calibrated(i, capacities[i % len(capacities)], base=1.0 - 0.02 * i)
+        for i in range(12)
+    ]
 
 
 def test_hard_constraint_costs_nothing_without_cancellations() -> None:
     """沒有棄單時,硬約束一張票都沒少賣、也沒留下任何孤兒。"""
-    blocks = typical_venue(_SIM_BLOCKS)
+    blocks = _regression_venue()
     for seed in _SIM_SEEDS:
         result = simulate(blocks, TYPICAL_DEMAND, cancel_rate=0.0, seed=seed)
         assert result.orphans == 0
@@ -430,7 +438,7 @@ def test_orphans_only_come_from_cancelled_singles() -> None:
     這是設計裡「孤兒的唯一來源是單人票取消」那句話的直接驗證:release 只會讓
     空段變長,所以新空段的長度下限就是訂單張數下限。
     """
-    blocks = typical_venue(_SIM_BLOCKS)
+    blocks = _regression_venue()
     for seed in _SIM_SEEDS:
         result = simulate(blocks, NO_SINGLES_DEMAND, cancel_rate=0.3, seed=seed)
         assert result.orphans == 0, (seed, result)
@@ -438,7 +446,7 @@ def test_orphans_only_come_from_cancelled_singles() -> None:
 
 def test_packing_stays_above_regression_floor() -> None:
     """混合需求下的售出率下限。純粹的煙霧測試 —— 擋的是徹底崩掉。"""
-    blocks = typical_venue(_SIM_BLOCKS)
+    blocks = _regression_venue()
     ratios = [
         simulate(blocks, TYPICAL_DEMAND, cancel_rate=0.3, seed=seed).sold_ratio
         for seed in _SIM_SEEDS
@@ -456,7 +464,7 @@ def test_uniform_demand_does_not_strand_seats() -> None:
     實測:中切開啟時這個場館掉到 0.8487,關閉時 0.9076。所以這條測試會擋下
     「有人把 allow_mid_cut 改回預設開啟」,而混合需求的那條不會。
     """
-    blocks = typical_venue(_SIM_BLOCKS)
+    blocks = _regression_venue()
     ratios = [
         simulate(blocks, {2: 1.0}, cancel_rate=0.3, seed=seed).sold_ratio
         for seed in _SIM_SEEDS

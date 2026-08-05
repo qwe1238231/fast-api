@@ -41,7 +41,15 @@ from app.services.seat_runs import (
     reserve_seats_and_enqueue,
     seat_labels,
 )
-from app.services.seating import NORMAL_POLICY, Placement, Run, occupy, release
+from app.services.seating import (
+    NORMAL_POLICY,
+    Placement,
+    Run,
+    allocate,
+    legal_anchors,
+    occupy,
+    release,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -155,9 +163,17 @@ async def test_read_zone_state_round_trips_geometry(db, redis, zone_fixture) -> 
     }
     assert set(state.geometry) == set(blocks)
     for block_id, geo in state.geometry.items():
-        assert geo.capacity == blocks[block_id].capacity
-        assert geo.seat_quality(0) == pytest.approx(blocks[block_id].quality_edge)
+        block = blocks[block_id]
+        assert geo.capacity == block.capacity
         assert geo.decay >= 0                     # 單峰性守衛沒被浮點往返破壞
+        if block.capacity >= 3:
+            assert geo.seat_quality(0) == pytest.approx(block.quality_edge)
+        else:
+            # cap <= 2 的 block 所有座位對稱,`calibrated` 讓它們同分(= base)。
+            # 存進 DB 的 quality_edge 對這種 block **不可實現** —— 不加這個分支的話,
+            # 哪天 fixture 出現一個 2 席 block,這條測試就會為了跟它想測的東西
+            # (浮點往返)完全無關的理由變紅。
+            assert geo.seat_quality(0) == pytest.approx(geo.base)
 
 
 # ─ CAS 佔位
@@ -704,3 +720,68 @@ async def test_a_sold_out_zone_does_not_record_a_ratchet_signal(db, redis) -> No
             await _try(redis, event, zone_id, 2)
     assert not await redis.exists(_misses_key(event.id, zone_id))
     assert not await is_relaxed(redis, event_id=event.id, zone_id=zone_id)
+
+
+# ─ E22:差異測試也要餵**非法**輸入
+
+async def test_lua_and_oracle_agree_on_rejecting_bad_releases(db, redis, zone_fixture) -> None:
+    """原本的差異測試只餵合法的釋放,所以它驗的是「合法輸入下兩者一致」——
+    純函式 raise、Lua 靜默接受的差異在合法輸入上永遠看不出來。
+
+    release 的 Lua 缺重疊檢查那個 bug 活過 120 步的差異測試,原因就是這個。
+    """
+    event, zone_id = zone_fixture["event"], zone_fixture["zone_id"]
+    pure = await _redis_runs(redis, event.id, zone_id)
+    run = max(pure, key=lambda r: r.length)
+    capacity = run.length                       # 全空的 block,容量 == run 長度
+
+    bad_cases = [
+        ("與既有空段重疊", run.start + 1, 2),
+        ("完整落在既有空段內", run.start + 2, 2),
+        ("越過 block 上界", run.start + capacity, 2),
+        ("跨越 block 上界", run.start + capacity - 1, 3),
+    ]
+    for label, start, length in bad_cases:
+        with pytest.raises(ValueError):         # 純函式(oracle)
+            release(pure, block_id=run.block_id, start=start,
+                    length=length, capacity=capacity)
+        with pytest.raises(SeatReleaseOverlap):  # Lua
+            await release_seats(
+                redis, event_id=event.id, zone_id=zone_id, block_id=run.block_id,
+                start_pos=start, length=length, marker=f"bad-{label}",
+            )
+        assert await _redis_runs(redis, event.id, zone_id) == pure, label
+        await _assert_indexes_agree(redis, event.id, zone_id)
+
+
+# ─ E23:allocate 與 legal_anchors 的 tiebreak 必須一致
+
+async def test_allocate_picks_exactly_the_top_legal_anchor(db, redis, zone_fixture) -> None:
+    """`allocate == legal_anchors()[0]` 這條性質原本只比**分數**。
+
+    兩邊的 tiebreak 哪天分岔,測試不會紅 —— 而後果是手動選位的清單第一名跟自動
+    配位配出來的位子不同,使用者會覺得系統在騙人。所以要比**位置**。
+    """
+    event, zone_id = zone_fixture["event"], zone_fixture["zone_id"]
+    state = await read_zone_state(redis, event_id=event.id, zone_id=zone_id)
+    for quantity in range(1, 7):
+        anchors = legal_anchors(state.runs, quantity, state.geometry, NORMAL_POLICY)
+        placed = allocate(state.runs, quantity, state.geometry, NORMAL_POLICY)
+        if not anchors:
+            assert placed is None
+            continue
+        assert placed == anchors[0], f"quantity={quantity}:位置也必須一致"
+
+
+async def test_tiny_blocks_cannot_honour_quality_edge(db, redis) -> None:
+    """把上面那個分支的理由變成明文:cap <= 2 的 block 兩座對稱,所以 calibrated
+    讓它們同分,而 DB 裡存的 quality_edge 永遠不會被實現。
+
+    這不是 bug(對稱的座位本來就該同分),但它是個容易讓人寫出脆弱斷言的陷阱。
+    """
+    from app.services.seating import BlockGeometry
+
+    for capacity in (1, 2):
+        geo = BlockGeometry.calibrated(1, capacity, base=0.8, edge=0.4)
+        assert {geo.seat_quality(p) for p in range(capacity)} == {0.8}
+    assert BlockGeometry.calibrated(1, 3, base=0.8, edge=0.4).seat_quality(0) == pytest.approx(0.4)

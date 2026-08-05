@@ -45,6 +45,52 @@ async def _clean_tables():
             text(f"TRUNCATE {table_names} RESTART IDENTITY CASCADE")
         )
 
+@pytest.fixture(autouse=True)
+def _fast_password_hashing(request):
+    """把密碼雜湊換成快速替身 —— 除非測試標了 `real_hashing`。
+
+    Argon2 是**刻意**慢的(實測每次雜湊 221ms、驗證 229ms),而整套測試有 69% 的
+    時間花在它上面(166 次呼叫 = 39 秒)。更糟的是它是純 CPU,所以主機一忙整套的
+    耗時就翻倍 —— 任何基於測試耗時的判斷都變得不可靠。
+
+    測試絕大多數需要的不是「KDF 真的很難暴力破解」,而是「雜湊會被呼叫、驗證會
+    通過或失敗」。真正的 Argon2 由 test_password_hashing.py 單獨驗證(標記
+    real_hashing),所以覆蓋率沒有洞。
+
+    patch 打在 `ticket_secrets` 而不是 `app.core.security`:後者的函式可能已被別的
+    模組 from-import 綁走,而 security.py 是用 `ticket_secrets.hash_password(...)`
+    的屬性查找 —— 在來源打 patch 才能全域生效。
+    """
+    if request.node.get_closest_marker("real_hashing"):
+        yield
+        return
+
+    import hashlib
+    import ticket_secrets
+
+    real_hash = ticket_secrets.hash_password
+    real_verify = ticket_secrets.verify_password
+    prefix = "faketest$"
+
+    def fake_hash(password: str) -> str:
+        return prefix + hashlib.sha256(password.encode()).hexdigest()
+
+    def fake_verify(password: str, hashed: str) -> bool:
+        # 沒有前綴的是真 hash(例如 fixture 直接塞的)—— 交回真函式,
+        # 免得替身把「這個 hash 我不認識」誤判成密碼錯誤。
+        if not hashed.startswith(prefix):
+            return real_verify(password, hashed)
+        return fake_hash(password) == hashed
+
+    ticket_secrets.hash_password = fake_hash
+    ticket_secrets.verify_password = fake_verify
+    try:
+        yield
+    finally:
+        ticket_secrets.hash_password = real_hash
+        ticket_secrets.verify_password = real_verify
+
+
 @pytest.fixture(scope="session")
 def anyio_backend():
     """Force pytest-anyio to use asyncio (not trio)."""

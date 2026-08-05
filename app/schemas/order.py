@@ -34,6 +34,9 @@ class OrderResponse(BaseModel):
     id: int
     user_id: int
     event_id: int
+    zone_id: int | None = None
+    """買的是哪一區。無座位圖的場次為 None。"""
+
     quantity: int
     total_price_cents: int
     status: OrderStatus

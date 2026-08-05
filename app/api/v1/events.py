@@ -9,7 +9,8 @@ from app.api.deps import CurrentAdmin, CurrentUser, DbSession, Redis, StreamUser
 from app.core.config import get_settings
 from app.core.exceptions import EventNotFound
 from app.core.security import create_admission_token
-from app.crud.event import create_event, get_event, list_published_events
+from app.crud.event import get_event, list_published_events
+from app.services.event_admin import create_event
 from app.models.event import Event
 from app.schemas.event import EventCreate, EventResponse, QueueStatusResponse
 from app.schemas.seating import ZoneAvailability

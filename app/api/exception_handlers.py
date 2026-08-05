@@ -25,7 +25,9 @@ from app.core.exceptions import (
     SeatContention,
     SeatPlacementOutOfRun,
     SeatsNotAssigned,
+    VenueNotFound,
     ZoneNotForEvent,
+    ZonePricesInvalid,
     ZoneRequired,
 )
 
@@ -45,6 +47,27 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc), "event_id": exc.event_id},
         )
+    @app.exception_handler(VenueNotFound)
+    async def _venue_not_found(request: Request, exc: VenueNotFound):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": str(exc), "venue_id": exc.venue_id},
+        )
+
+    @app.exception_handler(ZonePricesInvalid)
+    async def _zone_prices_invalid(request: Request, exc: ZonePricesInvalid):
+        # 回 missing / unknown 讓管理員知道要補哪一區 —— 這是後台錯誤,不是面向
+        # 終端使用者的,所以細節有用而非洩漏。
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={
+                "detail": str(exc),
+                "venue_id": exc.venue_id,
+                "missing_zone_ids": exc.missing,
+                "unknown_zone_ids": exc.unknown,
+            },
+        )
+
     # 兩種 zone 錯誤都是「請求帶錯了」而不是「狀態衝突」,所以 422 而非 409。
     @app.exception_handler(ZoneRequired)
     async def _zone_required(request: Request, exc: ZoneRequired):

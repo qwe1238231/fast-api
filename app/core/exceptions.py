@@ -45,6 +45,29 @@ class ZoneNotForEvent(EventError):
         self.reason = reason
         super().__init__(f"Zone {zone_id} is not sellable for event {event_id}: {reason}")
 
+class VenueNotFound(EventError):
+    def __init__(self, venue_id: int):
+        self.venue_id = venue_id
+        super().__init__(f"Venue {venue_id} not found")
+
+
+class ZonePricesInvalid(EventError):
+    """zone_prices 的 key 不等於該場館的 zone 集合。
+
+    多的(不屬於這個場館)是**安全問題**:少了這道檢查,建立時就能把別場館的 zone
+    綁進來、之後拿它的便宜票價下單。少的則會讓場次永遠賣不完(見
+    ZonePricesIncomplete),所以兩邊都要在建立時就擋 —— 而不是等到 publish。
+    """
+    def __init__(self, venue_id: int, missing: list[int], unknown: list[int]):
+        self.venue_id = venue_id
+        self.missing = missing
+        self.unknown = unknown
+        super().__init__(
+            f"zone_prices for venue {venue_id} is wrong: "
+            f"missing={missing} unknown={unknown}"
+        )
+
+
 class ZonePricesIncomplete(EventError):
     """座位場次有 zone 沒設票價。
 

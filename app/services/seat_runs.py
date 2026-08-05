@@ -30,6 +30,7 @@ Key schema(每個 zone 一組,zone 是分片單位):
 左右鄰合併都變 O(1)。這是 memory allocator 的 boundary tags。
 """
 import random
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -38,6 +39,12 @@ from redis.commands.core import AsyncScript
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.seat_metrics import (
+    SEAT_CAS_ATTEMPTS,
+    SEAT_CAS_ATTEMPTS_PER_RESERVATION,
+    SEAT_CAS_WINDOW,
+    SEAT_CONTENTION,
+)
 from app.core.exceptions import (
     InsufficientInventory,
     InventoryNotReconcilable,
@@ -533,6 +540,9 @@ async def reserve_seats_and_enqueue(
     effective = ENDGAME_POLICY if relaxed else policy
 
     for attempt in range(1, MAX_CAS_ATTEMPTS + 1):
+        # T 的定義:從讀快照開始,到 CAS 回來為止 —— 那正是「別人能讓我們這份
+        # 快照過時」的區間,也就是 N = λ × T 裡的那個 T。
+        window_started = time.perf_counter()
         state = await read_zone_state(redis, event_id=event_id, zone_id=zone_id)
         anchors = legal_anchors(state.runs, quantity, state.geometry, effective)
         if not anchors:
@@ -540,6 +550,9 @@ async def reserve_seats_and_enqueue(
             # 真正賣完的 zone 被告知「湊不出連號」,而且跟無座位圖路徑的
             # InsufficientInventory 不一致。順序也重要:賣完的 zone 記連拒次數是
             # 沒意義的(放寬也配不出來),還會污染 ratchet 的訊號。
+            # 這條路徑沒有做 CAS,所以**不是** T 的樣本:沒有人能讓一份從未被用來
+            # 佔位的快照過時。把它算進去只會用系統性較短的樣本把 p99 拉低 ——
+            # 那是安全指標最不該有的偏誤方向。
             if state.remaining < quantity:
                 raise InsufficientInventory(
                     event_id=event_id, requested=quantity, available=state.remaining,
@@ -586,6 +599,9 @@ async def reserve_seats_and_enqueue(
             ],
             client=redis,
         )
+        SEAT_CAS_WINDOW.observe(time.perf_counter() - window_started)
+        SEAT_CAS_ATTEMPTS.labels(outcome=result[0].lower()).inc()
+
         if result[0] == "DUP":
             return None
         if result[0] == "BOUNDS":
@@ -598,6 +614,7 @@ async def reserve_seats_and_enqueue(
 
         # 配得出來 ⇒ 這個 zone 沒卡住,連拒計數歸零。
         await redis.delete(_misses_key(event_id, zone_id))
+        SEAT_CAS_ATTEMPTS_PER_RESERVATION.observe(attempt)
         zone_remaining = int(result[2])
         if zone_remaining == 0:
             await publish_event_poke(redis, event_id)   # 喚醒等候中的人重讀狀態
@@ -609,6 +626,7 @@ async def reserve_seats_and_enqueue(
             zone_remaining=zone_remaining,
         )
 
+    SEAT_CONTENTION.inc()
     raise SeatContention(
         event_id=event_id, zone_id=zone_id, attempts=MAX_CAS_ATTEMPTS
     )

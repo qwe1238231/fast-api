@@ -1,0 +1,42 @@
+# 座位配位的告警。門檻的由來見 app/core/seat_metrics.py 的 docstring。
+#
+# 這些不是「效能調校」的告警,而是**架構決定的守衛**:配位刻意沒有移進 Lua,
+# 而那個決定掛在 N = λ × T 上。T 一旦偏離假設,決定的前提就不成立了。
+groups:
+  - name: seat-allocation
+    rules:
+      - alert: SeatCasWindowSlow
+        expr: histogram_quantile(0.99, rate(seat_cas_window_seconds_bucket[5m])) > 0.005
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "座位 CAS 時間窗 p99 > 5ms(假設是 1.1ms)"
+          description: >
+            N = λ × T 隨 T 線性成長。TOP_K=16 還撐得住,但要查為什麼慢
+            (Redis 飽和?跨 AZ 網路?事件迴圈壅塞?)。
+
+      - alert: SeatCasWindowCritical
+        expr: histogram_quantile(0.99, rate(seat_cas_window_seconds_bucket[5m])) > 0.010
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "座位 CAS 時間窗 p99 > 10ms —— 進入模擬中會出現重試放大的區間"
+          description: >
+            這是「把配位搬進 Lua」的訊號。app/services/seating.py 的純函式是現成的
+            oracle,差異測試骨架在 test_seat_runs.py。
+
+      - alert: SeatCasContentionRising
+        expr: >
+          sum(rate(seat_cas_attempts_total{outcome="retry"}[5m]))
+          / sum(rate(seat_cas_attempts_total[5m])) > 0.05
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "座位 CAS 重試率 > 5% —— 衝突已經真實發生"
+
+      - alert: SeatContentionExhausted
+        expr: increase(seat_contention_total[5m]) > 0
+        labels: { severity: critical }
+        annotations:
+          summary: "座位配位重試耗盡 —— 有使用者拿到 503"
+          description: "非零就不是可容忍的常態值。查 seat_cas_window_seconds 的 p99。"

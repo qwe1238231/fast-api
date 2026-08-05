@@ -14,8 +14,10 @@ from datetime import datetime
 from sqlalchemy import (
     DDL,
     CheckConstraint,
+    Computed,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     String,
     UniqueConstraint,
@@ -167,6 +169,21 @@ class SeatHold(Base):
         UniqueConstraint("order_id", name="uq_seat_holds_order"),
         CheckConstraint("length > 0", name="ck_seat_holds_length_pos"),
         CheckConstraint("start_pos >= 0", name="ck_seat_holds_start_nonneg"),
+        # 區間不得超出 block 的容量。這是**跨表**條件(capacity 在 seat_blocks),
+        # 所以 CHECK 表達不了 —— 但用「生成欄位 + 複合外鍵」可以純宣告地表達:
+        # 區間最後一個 pos 必須真的存在於這個 block 的 seats 裡。
+        #
+        # EXCLUDE 擋的是「兩個人同一張椅子」,這條擋的是另一種損壞:「賣出一張
+        # 根本沒有那個位子的票」。兩者都到不了(配位與釋放的 Lua 都做了上界檢查),
+        # 但那全是應用層的紀律,而這個 schema 的哲學是 DB 當最後一道網。
+        #
+        # 前提:pos 在 block 內是稠密的(0..capacity-1 無洞),那由 seeder 保證。
+        # 所以「最後一個存在」⇒「整段都存在」。
+        ForeignKeyConstraint(
+            ["block_id", "last_pos"],
+            ["seats.block_id", "seats.pos"],
+            name="fk_seat_holds_last_seat",
+        ),
         # 同場次同 block 內任兩筆 hold 的區間不得重疊 —— 由 Postgres 保證,
         # 不是由應用層保證。就算配位 Lua 有 bug、就算 stream 重放、就算之後
         # 有人改壞演算法,「兩個人拿到同一張椅子」在這裡物理上不可能發生。
@@ -190,6 +207,12 @@ class SeatHold(Base):
     order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
     start_pos: Mapped[int] = mapped_column(nullable=False)
     length: Mapped[int] = mapped_column(nullable=False)
+    last_pos: Mapped[int] = mapped_column(
+        Computed("start_pos + length - 1", persisted=True), nullable=False
+    )
+    """區間的最後一個 pos。生成欄位 —— 存在的唯一理由是讓上面那條複合外鍵
+    有東西可以指。不要手動寫入。"""
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

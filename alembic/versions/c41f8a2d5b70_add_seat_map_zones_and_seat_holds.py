@@ -104,6 +104,13 @@ def upgrade() -> None:
         sa.Column("order_id", sa.Integer(), nullable=False),
         sa.Column("start_pos", sa.Integer(), nullable=False),
         sa.Column("length", sa.Integer(), nullable=False),
+        # 生成欄位,唯一用途是給下面那條複合外鍵指。
+        sa.Column(
+            "last_pos",
+            sa.Integer(),
+            sa.Computed("start_pos + length - 1", persisted=True),
+            nullable=False,
+        ),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -116,6 +123,13 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["event_id"], ["events.id"]),
         sa.ForeignKeyConstraint(["block_id"], ["seat_blocks.id"]),
         sa.ForeignKeyConstraint(["order_id"], ["orders.id"]),
+        # 區間不得超出 block 容量 —— 跨表條件,CHECK 表達不了,但「生成欄位 +
+        # 指向 seats(block_id, pos) 的複合外鍵」可以:最後一個 pos 必須真的存在。
+        sa.ForeignKeyConstraint(
+            ["block_id", "last_pos"],
+            ["seats.block_id", "seats.pos"],
+            name="fk_seat_holds_last_seat",
+        ),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("order_id", name="uq_seat_holds_order"),
     )

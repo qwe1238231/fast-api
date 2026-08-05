@@ -230,3 +230,51 @@ async def test_seat_label_is_unique_per_block(db, seat_map) -> None:
     db.add(Seat(block_id=block_id, pos=99, label="1"))
     with pytest.raises(IntegrityError):
         await db.flush()
+
+
+# ─ 越界:區間不得超出 block 的容量
+
+@pytest.mark.parametrize(
+    ("start", "length"),
+    [
+        (8, 4),    # 尾巴越過上界
+        (10, 2),   # 整段在 block 外
+        (0, 11),   # 比整個 block 還長
+    ],
+)
+async def test_a_hold_beyond_the_block_is_impossible(db, seat_map, start, length) -> None:
+    """EXCLUDE 擋的是「兩個人同一張椅子」;這條擋另一種損壞 ——「賣出一張根本沒有
+    那個位子的票」。
+
+    capacity 在另一張表,所以 CHECK 表達不了。用「生成欄位 last_pos + 指向
+    seats(block_id, pos) 的複合外鍵」純宣告地表達:區間最後一個 pos 必須真的存在。
+    """
+    block = seat_map["blocks"][0]           # capacity = 10,pos 0..9
+    order = await _order(db, seat_map, quantity=length, zone_id=block.zone_id)
+    with pytest.raises(IntegrityError):
+        await _hold(db, seat_map, order, block, start_pos=start, length=length)
+
+
+async def test_a_hold_ending_on_the_last_seat_is_allowed(db, seat_map) -> None:
+    """邊界值:剛好用到最後一個座位必須通過 —— 差一格的檢查會讓每個 block 少賣一席。"""
+    block = seat_map["blocks"][0]
+    order = await _order(db, seat_map, quantity=2, zone_id=block.zone_id)
+    await _hold(db, seat_map, order, block, start_pos=8, length=2)   # pos 8,9
+    await db.commit()
+    assert await db.scalar(select(SeatHold.last_pos)) == 9
+
+
+async def test_last_pos_is_generated_not_writable(db, seat_map) -> None:
+    """生成欄位:寫進去的值會被忽略,由 DB 自己算 —— 否則它就只是另一個會漂移的
+    反正規化欄位,而那正是這個設計要避開的東西。"""
+    block = seat_map["blocks"][0]
+    order = await _order(db, seat_map, quantity=2, zone_id=block.zone_id)
+    hold = SeatHold(
+        event_id=seat_map["event"].id, block_id=block.id, order_id=order.id,
+        start_pos=2, length=2,
+    )
+    db.add(hold)
+    await db.commit()
+    assert await db.scalar(
+        select(SeatHold.last_pos).where(SeatHold.id == hold.id)
+    ) == 3

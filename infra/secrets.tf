@@ -20,6 +20,7 @@ resource "aws_secretsmanager_secret_version" "app" {
     PII_KEK_BASE64        = var.pii_kek_base64
     PII_LOOKUP_KEY_BASE64 = var.pii_lookup_key_base64
     STRIPE_SECRET_KEY     = var.stripe_secret_key
+    STRIPE_WEBHOOK_SECRET = var.stripe_webhook_secret
     # Built from the RDS resource — includes the generated master password.
     DATABASE_URL = "postgresql+asyncpg://${var.db_username}:${random_password.db.result}@${aws_db_instance.main.address}:${aws_db_instance.main.port}/${aws_db_instance.main.db_name}"
   })

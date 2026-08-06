@@ -11,6 +11,11 @@ os.environ.setdefault(
 
 os.environ.setdefault("REFRESH_TOKEN_REUSE_GRACE_SECONDS", "0")
 
+# 測試要用 /orders/{id}/pay 的模擬付款,所以顯式打開它 —— 生產預設是關的,
+# 而 Settings 的 validator 會拒絕在 DEBUG=False 下啟用。
+os.environ.setdefault("DEBUG", "True")
+os.environ.setdefault("ENABLE_MOCK_PAYMENT", "True")
+
 
 import pytest
 import pytest_asyncio

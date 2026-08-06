@@ -48,3 +48,18 @@ variable "stripe_secret_key" {
   type        = string
   sensitive   = true
 }
+
+# No default on purpose. An empty webhook secret is a KNOWN secret: Stripe's
+# signature check degenerates into "anyone who can reach /webhooks/stripe can
+# mark any order paid". The app refuses to boot without it (Settings guard), so
+# a missing value must fail at `terraform plan`, not at task start.
+variable "stripe_webhook_secret" {
+  description = "Stripe webhook signing secret, whsec_... (STRIPE_WEBHOOK_SECRET)."
+  type        = string
+  sensitive   = true
+
+  validation {
+    condition     = startswith(var.stripe_webhook_secret, "whsec_")
+    error_message = "Must be the signing secret from the Stripe webhook endpoint (starts with whsec_), not the API key."
+  }
+}

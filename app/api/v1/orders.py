@@ -183,7 +183,14 @@ async def pay_order(
     current_user: CurrentUser,
     db: DbSession,
 ) -> None:
-    """Mock payment: PENDING → PAID → CONFIRMED in one shot."""
+    """Mock payment: PENDING → PAID → CONFIRMED in one shot. **開發專用**。
+
+    這條路徑完全不經過 Stripe,所以在生產環境等於「任何登入使用者可以零元把自己的
+    訂單推成 CONFIRMED 並拿到座號」。回 404 而不是 403:不要讓外部知道有這個端點。
+    """
+    if not get_settings().ENABLE_MOCK_PAYMENT:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
     order = await get_order_by_id(db, order_id)
     if order is None or order.user_id != current_user.id:
         raise OrderNotFound(order_id=order_id)

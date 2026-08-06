@@ -20,13 +20,15 @@ class Settings(BaseSettings):
     # the order/inventory path can be pressure-tested directly. Guarded below — only
     # honoured when DEBUG is on; the app refuses to start if this is set without DEBUG.
     LOADTEST_BYPASS_ADMISSION: bool = False
+    ENABLE_MOCK_PAYMENT: bool = False        # /orders/{id}/pay 的模擬付款,DEBUG 專用
     REFRESH_TOKEN_SLIDING_DAYS: int = 14
     REFRESH_TOKEN_ABSOLUTE_EXPIRE_DAYS: int = 30
     REFRESH_TOKEN_REUSE_GRACE_SECONDS: int =10
     PII_KEK_BASE64: str
     PII_LOOKUP_KEY_BASE64:str
     STRIPE_SECRET_KEY: str
-    STRIPE_WEBHOOK_SECRET: str=""
+    STRIPE_WEBHOOK_SECRET: str = ""
+    """Stripe webhook 的簽章密鑰。**非 DEBUG 下不得為空** —— 見 _guard_webhook_secret。"""
     LOGIN_RATE_LIMIT: str = "5/minute"
     AUDIT_LOG_RETENTION_DAYS: int = 90
 
@@ -71,6 +73,33 @@ class Settings(BaseSettings):
                 "Generate one: python -c \"import os, base64; print(base64.b64encode(os.urandom(32)).decode())\""
             )
         return v
+
+    @model_validator(mode="after")
+    def _guard_webhook_secret(self) -> "Settings":
+        # 空字串是一個**已知的**密鑰,所以後果是完全顛倒的:真正的 Stripe webhook
+        # 會驗簽失敗被拒,而任何人都能用空密鑰自算 HMAC 偽造 payment_intent.succeeded
+        # 把訂單推成 CONFIRMED,或用別人的 order_id 送 payment_failed 作廢他人訂單
+        # 並把座位吐回市場(_handle_payment_aborted 沒有 ownership 檢查)。
+        #
+        # 驗簽本身是對的(webhook.py 用 construct_event),缺的只是密鑰 —— 所以這裡
+        # 用跟 LOADTEST_BYPASS_ADMISSION 同一套 fail-closed:寧可拒絕啟動。
+        if not self.STRIPE_WEBHOOK_SECRET and not self.DEBUG:
+            raise ValueError(
+                "STRIPE_WEBHOOK_SECRET must be set when DEBUG=False; "
+                "an empty secret is a KNOWN secret — anyone can forge Stripe webhooks"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _guard_mock_payment(self) -> "Settings":
+        # ENABLE_MOCK_PAYMENT 讓 /orders/{id}/pay 把訂單一路推到 CONFIRMED 而不經過
+        # Stripe。它在 v1 一直掛在正式 router 上、沒有任何閘門,任何登入使用者一個
+        # curl 就能零元拿到票與座號。跟 LOADTEST_BYPASS_ADMISSION 同一個模式。
+        if self.ENABLE_MOCK_PAYMENT and not self.DEBUG:
+            raise ValueError(
+                "ENABLE_MOCK_PAYMENT requires DEBUG=True; refusing to start"
+            )
+        return self
 
     @model_validator(mode="after")
     def _guard_loadtest_bypass(self) -> "Settings":

@@ -17,7 +17,7 @@ locals {
   # ECS (via the execution role) reads these at task start and injects them as
   # env vars — the values never appear in the task def or console.
   app_secrets = [
-    for k in ["SECRET_KEY", "PII_KEK_BASE64", "PII_LOOKUP_KEY_BASE64", "STRIPE_SECRET_KEY", "DATABASE_URL"] : {
+    for k in ["SECRET_KEY", "PII_KEK_BASE64", "PII_LOOKUP_KEY_BASE64", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "DATABASE_URL"] : {
       name      = k
       valueFrom = "${aws_secretsmanager_secret.app.arn}:${k}::"
     }

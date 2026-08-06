@@ -22,6 +22,7 @@ from app.core.exceptions import (
     BuyerInfoNotFound,
     NationalIdAlreadyRegistered,
     NoSeatsAvailable,
+    PurchaseLimitExceeded,
     SeatContention,
     SeatPlacementOutOfRun,
     SeatsNotAssigned,
@@ -138,6 +139,23 @@ def register_exception_handlers(app: FastAPI) -> None:
             },
         )
     
+    @app.exception_handler(PurchaseLimitExceeded)
+    async def _purchase_limit_exceeded(request: Request, exc: PurchaseLimitExceeded):
+        # 409 而非 429:429 的語意是「太快了,等一下再試」,而客戶端與各種 SDK 會照著
+        # Retry-After 自動重送 —— 但這個限制重送一萬次也不會過。回 remaining 讓前端能
+        # 說「你還可以買 1 張」而不是一句「超過限購」讓人反覆按。
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": str(exc),
+                "event_id": exc.event_id,
+                "requested": exc.requested,
+                "limit": exc.limit,
+                "already_held": exc.already,
+                "remaining": exc.remaining,
+            },
+        )
+
     @app.exception_handler(NoSeatsAvailable)
     async def _no_seats_available(request: Request, exc: NoSeatsAvailable):
         # 409 而非 sold-out:這個區還有位子,只是湊不出這個張數的連號。回可行張數

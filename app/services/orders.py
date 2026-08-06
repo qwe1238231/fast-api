@@ -13,7 +13,7 @@ from uuid import UUID
 
 from app.core.exceptions import (
     EventCancelled, EventNotOnSale, EventNotFound, InsufficientInventory,
-    ZoneRequired,
+    PurchaseLimitExceeded, ZoneRequired,
 )
 from app.crud.order import transition_order_status
 from app.models.order import Order, OrderStatus
@@ -89,6 +89,7 @@ async def release_order_seat(
         return await release(
             redis,
             event_id=order.event_id,
+            user_id=order.user_id,
             quantity=order.quantity,
             marker=marker,
         )
@@ -103,6 +104,7 @@ async def release_order_seat(
         redis,
         event_id=order.event_id,
         zone_id=order.zone_id,
+        user_id=order.user_id,
         block_id=block_id,
         start_pos=start_pos,
         length=length,
@@ -181,5 +183,13 @@ async def submit_order(
             event_id=event_id,
             requested=quantity,
             available=result.available,
+        )
+    if result.outcome == ReserveOutcome.OVER_LIMIT:
+        raise PurchaseLimitExceeded(
+            event_id=event_id,
+            user_id=user_id,
+            requested=quantity,
+            already=result.held,
+            limit=result.limit,
         )
     return result

@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     LOGIN_RATE_LIMIT: str = "5/minute"
     AUDIT_LOG_RETENTION_DAYS: int = 90
 
+    MAX_TICKETS_PER_USER_PER_EVENT: int = 4
+    """每人每場次的限購張數。**含 PENDING** —— 下單當下就佔額度,不然同時送 20 筆
+    請求時全部都還沒 CONFIRMED,限購形同虛設。過期/取消會退回額度。
+
+    這是每場次獨立的(鍵是 `event:{e}:purchased` 的 user_id 欄位),所以同一個人買
+    不同藝人的票互不排擠。單筆上限 MAX_TICKETS_PER_ORDER 是另一回事:那擋的是
+    單一請求的大小,擋不住同一個人送很多筆。
+    """
+
     # Async order-offload tuning
     ORDER_CONSUMER_BLOCK_MS: int = 2000        # how long the consumer loop blocks per read
     ORDER_RECLAIM_IDLE_MS: int = 60_000        # only reclaim entries idle at least this long

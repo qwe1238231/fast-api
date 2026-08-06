@@ -21,12 +21,17 @@ const EVENT_ID = Number(__ENV.EVENT_ID || 1);
 
 // 旁路模式下 POST /orders 只會回兩種碼:
 //   202 -> 接受(座位已原子預約 + 入 stream,worker 稍後寫 DB)
-//   409 -> InsufficientInventory,賣完(這是【正確的拒絕】,不是錯誤)
+//   409 -> 賣完 或 超過每人限購(兩者都是【正確的拒絕】,不是錯誤)
 // 兩者都列為 expected,http_req_failed 才只計真正的錯(5xx / timeout)。
 http.setResponseCallback(http.expectedStatuses(202, 409));
 
 const accepted = new Counter('orders_accepted');   // 202 計數
-const soldOut = new Counter('orders_sold_out');     // 409 計數
+const soldOut = new Counter('orders_sold_out');    // 409 且真的沒票
+// 409 有兩種原因,必須分開數。bypass 模式用 tokens[i % tokens.length] 循環重用帳號,
+// 所以同一個人第 5 筆起就會撞到每人限購 —— 全部記進 orders_sold_out 的話,壓測的
+// 主要指標(賣完了幾筆)會被安靜地灌水,而且看起來完全正常。
+// 這個計數器不是 0 就代表:帳號數不夠,要調大 seed.py 的 N_USERS。
+const overLimit = new Counter('orders_over_limit');
 
 const MODE = __ENV.MODE || 'knee';
 
@@ -99,8 +104,13 @@ export default function () {
         },
     );
 
-    if (res.status === 202) accepted.add(1);
-    else if (res.status === 409) soldOut.add(1);
+    if (res.status === 202) {
+        accepted.add(1);
+    } else if (res.status === 409) {
+        // 限購的 409 帶著 `limit`;賣完的帶著 `available`。
+        const overLimitHit = (res.body || '').includes('"limit"');
+        (overLimitHit ? overLimit : soldOut).add(1);
+    }
 
     check(res, {
         'accepted (202) or sold out (409)': (r) => r.status === 202 || r.status === 409,

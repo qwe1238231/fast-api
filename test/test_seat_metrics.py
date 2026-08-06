@@ -120,8 +120,8 @@ async def test_no_fit_does_not_pollute_the_window_histogram(redis, zone) -> None
         redis, event_id=event_id, zone_id=zone_id, user_id=1, quantity=4,
         total_price_cents=400, idempotency_key=str(uuid4()),
     )
-    await reserve_seats_and_enqueue(
-        redis, event_id=event_id, zone_id=zone_id, user_id=1, quantity=3,
+    await reserve_seats_and_enqueue(          # 換一個買家:4+3=7 超過每人限購 4
+        redis, event_id=event_id, zone_id=zone_id, user_id=2, quantity=3,
         total_price_cents=300, idempotency_key=str(uuid4()),
     )
     runs = await redis.hgetall(_runs_key(event_id, zone_id))
@@ -130,7 +130,7 @@ async def test_no_fit_does_not_pollute_the_window_histogram(redis, zone) -> None
     before = _window_count()
     with pytest.raises(NoSeatsAvailable):
         await reserve_seats_and_enqueue(
-            redis, event_id=event_id, zone_id=zone_id, user_id=1, quantity=4,
+            redis, event_id=event_id, zone_id=zone_id, user_id=3, quantity=4,
             total_price_cents=400, idempotency_key=str(uuid4()),
         )
     assert _window_count() == before, "沒做 CAS 的請求不該進時間窗直方圖"

@@ -12,7 +12,7 @@ from sqlalchemy import select
 from app.models.event import Event, EventStatus
 from app.models.seating import EventZonePrice, Zone
 from app.scripts.seed_venue import RowSpec, VenueSpec, ZoneSpec, seed_venue
-from app.services.inventory import _key as _event_available_key
+from app.services.inventory import _key as _event_available_key, _purchased_key
 from app.services.publish_event import publish_event
 from app.services.seat_runs import (
     _ends_key,
@@ -53,6 +53,9 @@ async def make_event(db, redis):
         await db.flush()
         db.add(EventZonePrice(event_id=event.id, zone_id=zone_id, price_cents=1000))
         await publish_event(db, redis, event)     # 先用未來的 ends_at 正常發佈
+        # 限購計數器是**買了才存在**的(publish 不會建),所以這裡補一筆假的持有。
+        # 少了它,`_all_keys` 對這把 key 的「清乾淨了」斷言會因為它從未存在而空過。
+        await redis.hset(_purchased_key(event.id), "1", "2")
         if ends_days_ago is not None:
             event.ends_at = now - timedelta(days=ends_days_ago)
         await db.commit()
@@ -64,6 +67,7 @@ async def make_event(db, redis):
 def _all_keys(event_id: int, zone_id: int) -> list[str]:
     return [
         _event_available_key(event_id),
+        _purchased_key(event_id),
         f"queue:{event_id}:admit_start",
         f"queue:{event_id}:salt",
         _runs_key(event_id, zone_id),

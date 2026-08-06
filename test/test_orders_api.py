@@ -56,21 +56,30 @@ async def test_create_order_succeeds(client, db, published_event, redis, drain_o
 
 @pytest.mark.asyncio
 async def test_sold_out_returns_409(client, db, published_event):
+    # 5 席要兩個買家才吃得完 —— 每人限購 4。用一個人買 5 張的話,擋下來的會是
+    # 限購而不是售完,這條測試就會為了完全不相干的理由變綠。
     bearer, uid = await _authed(client, db)
+    other_bearer, other_uid = await _authed(client, db, username="bob")
 
-    r1 = await client.post(                       # 先把 5 張全買走
+    r1 = await client.post(                       # 4 張
         "/v1/orders/",
-        json={"event_id": published_event.id, "quantity": 5},
+        json={"event_id": published_event.id, "quantity": 4},
         headers=_buy_headers(bearer, uid, published_event.id),
     )
     assert r1.status_code == 202
-
-    r2 = await client.post(                       # 再買 → 售完
+    r2 = await client.post(                       # 第 5 張 → 賣光
         "/v1/orders/",
         json={"event_id": published_event.id, "quantity": 1},
-        headers=_buy_headers(bearer, uid, published_event.id),
+        headers=_buy_headers(other_bearer, other_uid, published_event.id),
     )
-    assert r2.status_code == 409
+    assert r2.status_code == 202
+
+    r3 = await client.post(                       # 再買 → 售完
+        "/v1/orders/",
+        json={"event_id": published_event.id, "quantity": 1},
+        headers=_buy_headers(other_bearer, other_uid, published_event.id),
+    )
+    assert r3.status_code == 409
 
 
 @pytest.mark.asyncio
@@ -173,16 +182,24 @@ async def test_sold_out_refunds_the_admission_token(client, db, published_event,
     token = create_admission_token(user_id=uid, event_id=published_event.id, ttl_seconds=120)
     common = {**bearer, "Admission-Token": token}
 
+    other_bearer, other_uid = await _authed(client, db, username="bob")
+    await client.post(                                          # 5 → 1 席
+        "/v1/orders/",
+        json={"event_id": published_event.id, "quantity": 4},
+        headers=_buy_headers(other_bearer, other_uid, published_event.id),
+    )
+
     too_many = await client.post(
         "/v1/orders/",
-        json={"event_id": published_event.id, "quantity": 6},   # 只有 5 席
+        json={"event_id": published_event.id, "quantity": 2},   # 只剩 1 席
         headers={**common, "Idempotency-Key": str(uuid4())},
     )
     assert too_many.status_code == 409, too_many.text
+    assert too_many.json()["available"] == 1, "要走庫存不足那條,不是限購"
 
     retry = await client.post(
         "/v1/orders/",
-        json={"event_id": published_event.id, "quantity": 5},
+        json={"event_id": published_event.id, "quantity": 1},
         headers={**common, "Idempotency-Key": str(uuid4())},
     )
     assert retry.status_code == 202, retry.text

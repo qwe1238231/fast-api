@@ -152,6 +152,32 @@ class InsufficientInventory(InventoryError):
         self.available = available
         super().__init__(f"Event {event_id}: requested {requested}, only {available} available")
 
+class PurchaseLimitExceeded(InventoryError):
+    """這個人在這場次已經買到上限了 —— **不等於賣完,也不是暫時性的**。
+
+    三個錯誤必須分得開,因為客戶端該做的事完全不同:
+      - InsufficientInventory → 沒票了,別重試
+      - SeatContention        → 暫時性,原樣重送
+      - PurchaseLimitExceeded → 重送幾次都一樣,但**改小張數可能會過**
+
+    所以 `remaining` 要帶出去(可能是 0):前端才能顯示「你還可以買 1 張」而不是
+    一句「超過限購」讓人反覆重送。
+    """
+
+    def __init__(self, *, event_id: int, user_id: int, requested: int,
+                 already: int, limit: int):
+        self.event_id = event_id
+        self.user_id = user_id
+        self.requested = requested
+        self.already = already
+        self.limit = limit
+        self.remaining = max(0, limit - already)
+        super().__init__(
+            f"Event {event_id}: limit is {limit} per person; you already hold "
+            f"{already} and requested {requested}"
+        )
+
+
 class NoSeatsAvailable(InventoryError):
     """這個張數在當下的空段分佈裡配不出來 —— **不等於賣完**。
 

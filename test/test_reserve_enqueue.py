@@ -67,13 +67,17 @@ async def test_reserve_sold_out(redis, published_event):
 
 @pytest.mark.asyncio
 async def test_reserve_concurrent_no_oversell(redis, published_event):
-    """50 concurrent single-seat reserves on 5 seats: exactly 5 succeed."""
+    """50 concurrent single-seat reserves on 5 seats: exactly 5 succeed.
+
+    50 個**不同**的買家 —— 同一個人連下 50 筆會先撞到每人限購,那時測到的就是
+    限購而不是超賣。真實的超賣場景本來就是很多人搶同一批票。
+    """
     results = await asyncio.gather(*[
         reserve_and_enqueue(
-            redis, event_id=published_event.id, user_id=1,
+            redis, event_id=published_event.id, user_id=buyer,
             quantity=1, total_price_cents=1500, idempotency_key=str(uuid4()),
         )
-        for _ in range(50)
+        for buyer in range(1, 51)
     ])
 
     ok = sum(1 for r in results if r.outcome == ReserveOutcome.OK)

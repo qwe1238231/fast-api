@@ -16,7 +16,7 @@ from app.models.seating import SeatBlock, SeatHold, Zone
 from app.schemas.seating import SeatedOrderDetail, ZoneAvailability
 from app.services.pricing import load_zone_prices
 from app.services.seat_runs import (
-    MAX_TICKETS_PER_ORDER,
+    max_purchasable,
     read_zone_snapshots,
     seat_labels,
 )
@@ -89,7 +89,7 @@ async def _compute_zone_availability(
                 available_quantities=feasible_quantities(
                     snapshot.state.runs,
                     snapshot.state.geometry,
-                    MAX_TICKETS_PER_ORDER,
+                    max_purchasable(),
                     policy,
                 ),
             )

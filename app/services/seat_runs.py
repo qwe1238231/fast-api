@@ -45,10 +45,12 @@ from app.core.seat_metrics import (
     SEAT_CAS_WINDOW,
     SEAT_CONTENTION,
 )
+from app.core.config import get_settings
 from app.core.exceptions import (
     InsufficientInventory,
     InventoryNotReconcilable,
     NoSeatsAvailable,
+    PurchaseLimitExceeded,
     SeatContention,
     SeatPlacementOutOfRun,
     SeatReleaseOverlap,
@@ -58,6 +60,7 @@ from app.services.idempotency import _key as _claim_key
 from app.services.inventory import (
     ORDER_STREAM_KEY,
     _key as _event_available_key,
+    _purchased_key,
     _released_key,
     queue_depth,
 )
@@ -82,6 +85,16 @@ MAX_CAS_ATTEMPTS = 5
 
 #: 單筆訂單張數上限。必須與 OrderCreate.quantity 的 le= 一致。
 MAX_TICKETS_PER_ORDER = 10
+
+
+def max_purchasable() -> int:
+    """實際買得到的單筆張數上限 = min(單筆上限, 每人限購)。
+
+    兩個上限任一個都能擋下請求,所以回報「配得出來的張數」時必須取小的那個。少了
+    這個 min,限購 4 張的場次會在選區畫面顯示「可以買 8 張連號」,使用者選了 8 之後
+    才被 409 擋掉 —— 那是我們自己造出來的死路。
+    """
+    return min(MAX_TICKETS_PER_ORDER, get_settings().MAX_TICKETS_PER_USER_PER_EVENT)
 
 #: 連續幾筆被嚴格策略拒絕之後,這個 zone 就切換到收尾期策略(允許在邊緣留下孤兒)。
 #:
@@ -370,6 +383,15 @@ if redis.call('EXISTS', KEYS[3]) == 1 then
     return {'DUP'}
 end
 
+-- 1b) 每人限購。放在 CAS **之前**是刻意的:放後面的話,一個已達上限的人在熱門
+--     場次會先撞幾次 RETRY 才拿到 OVER_LIMIT —— 白跑幾輪讀-算-CAS,而且那些
+--     RETRY 會被記成競爭,污染 T 的樣本。放前面則第一次就給終局答案。
+local limit = tonumber(ARGV[12])
+local held = tonumber(redis.call('HGET', KEYS[7], ARGV[7])) or 0
+if held + length > limit then
+    return {'OVER_LIMIT', tostring(held), tostring(limit)}
+end
+
 -- 2) CAS:那個空段必須還是原樣,且我們要的區間必須完整落在它裡面。
 local current = redis.call('HGET', KEYS[1], f(block, run_start))
 if not current or tonumber(current) ~= run_len then
@@ -396,9 +418,11 @@ if right > 0 then
     redis.call('HSET', KEYS[2], f(block, run_end), start_pos + length)
 end
 
--- 4) 扣兩個計數器:zone 的(配位用)與 event 的(等候室的 sold_out 訊號用)。
+-- 4) 扣三個計數器:zone 的(配位用)、event 的(等候室的 sold_out 訊號用),
+--    以及這個人的限購額度。額度必須跟庫存同進同出。
 local zone_remaining = redis.call('DECRBY', KEYS[5], length)
 redis.call('DECRBY', KEYS[6], length)
+redis.call('HINCRBY', KEYS[7], ARGV[7], length)
 
 -- 5) 入列 + 寫 claim。座位資訊一起帶走,worker 才能建 seat_holds。
 local stream_id = redis.call('XADD', KEYS[4], '*',
@@ -473,6 +497,13 @@ end
 --    正確的釋放變成 DUP no-op —— 座位就永遠回不來了。
 redis.call('SET', KEYS[3], '1', 'EX', tonumber(ARGV[4]))
 
+-- 3b) 退限購額度。在 marker 底下所以最多退一次;歸零就刪欄位,那同時是垃圾回收
+--     與負值的地板(功能上線前建立的舊訂單從來沒加過額度)。
+local left = redis.call('HINCRBY', KEYS[7], ARGV[5], -tonumber(ARGV[3]))
+if left <= 0 then
+    redis.call('HDEL', KEYS[7], ARGV[5])
+end
+
 -- 左鄰:它的 end 等於我的 start(靠 ends 反向索引才查得到)。
 local left_start = redis.call('HGET', KEYS[2], f(block, lo))
 if left_start then
@@ -524,6 +555,7 @@ async def reserve_seats_and_enqueue(
     claim_ttl_seconds: int = 86400,
     top_k: int = TOP_K,
     rng: random.Random | None = None,
+    max_per_user: int | None = None,
 ) -> SeatReservation | None:
     """配一段連續座位、扣庫存、入列 —— 讀-算-CAS。
 
@@ -534,6 +566,8 @@ async def reserve_seats_and_enqueue(
     if _claim_script is None:
         _claim_script = redis.register_script(_CLAIM_SEATS_LUA)
     picker = rng or random
+    if max_per_user is None:
+        max_per_user = get_settings().MAX_TICKETS_PER_USER_PER_EVENT
 
     # 收尾期一旦切過就不回頭,所以只在進來時讀一次。
     relaxed = await is_relaxed(redis, event_id=event_id, zone_id=zone_id)
@@ -590,12 +624,14 @@ async def reserve_seats_and_enqueue(
                 ORDER_STREAM_KEY,
                 _zone_available_key(event_id, zone_id),
                 _event_available_key(event_id),
+                _purchased_key(event_id),
             ],
             args=[
                 pick.block_id, host.start, host.length,
                 pick.start, pick.length,
                 claim_ttl_seconds, user_id, event_id,
                 total_price_cents, idempotency_key, zone_id,
+                max_per_user,
             ],
             client=redis,
         )
@@ -604,6 +640,13 @@ async def reserve_seats_and_enqueue(
 
         if result[0] == "DUP":
             return None
+        if result[0] == "OVER_LIMIT":
+            # 終局:重送幾次都一樣。**不要** continue —— 那會讓它撞滿重試次數後回
+            # SeatContention(503),客戶端讀到「暫時性、請重試」而無限重送。
+            raise PurchaseLimitExceeded(
+                event_id=event_id, user_id=user_id, requested=quantity,
+                already=int(result[1]), limit=int(result[2]),
+            )
         if result[0] == "BOUNDS":
             raise SeatPlacementOutOfRun(
                 event_id=event_id, zone_id=zone_id, block_id=pick.block_id,
@@ -636,7 +679,7 @@ def _feasible(state: ZoneState, policy: Policy) -> list[int]:
     """當下配得出來的張數。注意這不能簡化成「最大連號長度」—— 只剩一段 5 連號時
     4 張是配不出來的(會留下孤兒),回 max_contiguous=5 然後拒絕 4 張正是誤導。"""
     return feasible_quantities(
-        state.runs, state.geometry, MAX_TICKETS_PER_ORDER, policy
+        state.runs, state.geometry, max_purchasable(), policy
     )
 
 
@@ -645,16 +688,21 @@ async def release_seats(
     *,
     event_id: int,
     zone_id: int,
+    user_id: int,
     block_id: int,
     start_pos: int,
     length: int,
     marker: str,
     ttl_seconds: int = 86400,
 ) -> bool:
-    """歸還一段座位(含左右合併)。回傳 True 表示這次呼叫真的歸還了。
+    """歸還一段座位(含左右合併)與該買家的限購額度。回傳 True 表示真的歸還了。
 
     `marker` 唯一標識這一次釋放事件("order:{id}" / "dl:{idempotency_key}"),
-    讓重放(commit 與 release 之間崩潰、stream 重投、重複取消)成為 no-op。
+    讓重放(commit 與 release 之間崩潰、stream 重投、重複取消)成為 no-op ——
+    額度退回也在同一個 marker 底下,所以同樣最多一次。
+
+    `user_id` 必填的理由見 `inventory.release`:漏退額度的症狀是那個人再也買不了,
+    而且不會有任何錯誤訊息。
     """
     global _release_script
     if _release_script is None:
@@ -667,8 +715,9 @@ async def release_seats(
             _zone_available_key(event_id, zone_id),
             _event_available_key(event_id),
             _geom_key(event_id, zone_id),
+            _purchased_key(event_id),
         ],
-        args=[block_id, start_pos, length, ttl_seconds],
+        args=[block_id, start_pos, length, ttl_seconds, user_id],
         client=redis,
     )
     if result[0] == "DUP":

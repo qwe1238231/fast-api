@@ -120,7 +120,10 @@ async def test_available_quantities_is_not_max_contiguous(client, arena) -> None
     body = (await client.get(f"/v1/events/{arena['event_id']}/zones")).json()
     back = next(z for z in body if z["name"] == "後區")
     assert back["available"] == 5
-    assert back["available_quantities"] == [1, 2, 3, 5]
+    # 結構上 {1,2,3,5} 可行,但每人限購 4 把 5 夾掉了 —— 建議一個誰都買不到的張數,
+    # 使用者選了之後只會再吃一個 409。純函式層的 {L} ∪ [1, L-2] 由
+    # test_seating.py::test_feasible_quantities_is_not_max_contiguous 守著。
+    assert back["available_quantities"] == [1, 2, 3]
     assert 4 not in back["available_quantities"]
 
 

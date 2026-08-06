@@ -63,10 +63,12 @@ async def test_a_freshly_published_zone_has_no_drift(redis, seated) -> None:
 
 
 async def test_no_drift_after_real_allocations(redis, seated) -> None:
-    for _ in range(3):
+    for buyer in range(3):
+        # 三個不同買家:三筆兩人票共 6 張,同一個人會撞到限購 4 —— 而這條測的是
+        # 漂移偵測,不該因為限購而變紅。
         assert await reserve_seats_and_enqueue(
             redis, event_id=seated["event_id"], zone_id=seated["zone_id"],
-            user_id=seated["user_id"], quantity=2, total_price_cents=2000,
+            user_id=seated["user_id"] + buyer, quantity=2, total_price_cents=2000,
             idempotency_key=str(uuid4()),
         ) is not None
     # Redis 已扣但 DB 還沒落帳(stream 有 backlog)→ 補集檢查必須跳過而不是誤報。

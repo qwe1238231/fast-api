@@ -29,7 +29,7 @@ from app.models.event import Event, EventStatus
 from app.services.inventory import (
     compute_expected_available, get_available, release,
     ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY, queue_depth,
-    _key as _event_available_key,
+    _key as _event_available_key, _purchased_key,
 )
 from app.services.idempotency import mark_claim_failed
 from app.services.seat_runs import (
@@ -366,6 +366,7 @@ async def _dead_letter_intent(redis, entry_id: str, fields: dict) -> None:
                 redis,
                 event_id=int(fields["event_id"]),
                 zone_id=int(zone_id),
+                user_id=int(fields["user_id"]),
                 block_id=int(block_id),
                 start_pos=int(fields["start_pos"]),
                 length=int(fields["quantity"]),
@@ -375,6 +376,7 @@ async def _dead_letter_intent(redis, entry_id: str, fields: dict) -> None:
             await release(
                 redis,
                 event_id=int(fields["event_id"]),
+                user_id=int(fields["user_id"]),
                 quantity=int(fields["quantity"]),
                 marker=f"dl:{idem}",
             )
@@ -573,6 +575,7 @@ async def purge_finished_event_keys(
             # queue:{e}:admit_start,而漏掉的原因正是憑印象打 key 格式。
             keys += [
                 _event_available_key(event_id),
+                _purchased_key(event_id),
                 _salt_key(event_id),
                 _draw_key(event_id),
                 _admit_start_key(event_id),

@@ -97,7 +97,7 @@ async def test_release_reports_true_when_new_count_is_negative(redis, published_
     count lands on -1 must report True, not be misread as a replay (DUP)."""
     eid = published_event.id
     await redis.set(_key(eid), -2)                  # oversold — reconcile writes negatives
-    assert await release(redis, event_id=eid, quantity=1, marker=f"order:{eid}:x") is True
+    assert await release(redis, event_id=eid, user_id=1, quantity=1, marker=f"order:{eid}:x") is True
     assert int(await redis.get(_key(eid))) == -1    # seat actually returned
 
 
@@ -106,8 +106,8 @@ async def test_release_is_idempotent_per_marker(redis, published_event):
     eid = published_event.id
     await redis.set(_key(eid), 0)
     m = f"order:{eid}:y"
-    assert await release(redis, event_id=eid, quantity=1, marker=m) is True
-    assert await release(redis, event_id=eid, quantity=1, marker=m) is False   # replay -> DUP
+    assert await release(redis, event_id=eid, user_id=1, quantity=1, marker=m) is True
+    assert await release(redis, event_id=eid, user_id=1, quantity=1, marker=m) is False   # replay -> DUP
     assert int(await redis.get(_key(eid))) == 1     # returned exactly once
 
 
@@ -146,7 +146,7 @@ async def test_release_pokes_only_on_restock_crossing(redis, published_event, mo
     await redis.set(_key(eid), 0)
     calls = _poke_spy(monkeypatch)
 
-    await release(redis, event_id=eid, quantity=1, marker=f"order:{eid}:a")   # 0 -> 1: restock crossing
+    await release(redis, event_id=eid, user_id=1, quantity=1, marker=f"order:{eid}:a")   # 0 -> 1: restock crossing
     assert calls == [eid]
-    await release(redis, event_id=eid, quantity=1, marker=f"order:{eid}:b")   # 1 -> 2: no crossing
+    await release(redis, event_id=eid, user_id=1, quantity=1, marker=f"order:{eid}:b")   # 1 -> 2: no crossing
     assert calls == [eid]

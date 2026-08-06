@@ -67,6 +67,18 @@ async def buyer(client, db):
     return bearer, user_id
 
 
+async def _fresh_buyer(client, db, n: int) -> tuple[dict[str, str], int]:
+    """第 n 個買家(註冊 + 登入)。模擬型測試用它避開每人限購 —— 真實情況本來就是
+    很多不同的人在搶,而不是同一個人連下十幾筆。"""
+    name = f"seatbuyer{n}"
+    await client.post("/v1/users/", json={"username": name, "password": "secret123"})
+    token = await client.post(
+        "/v1/auth/token", data={"username": name, "password": "secret123"}
+    )
+    bearer = {"Authorization": f"Bearer {token.json()['access_token']}"}
+    return bearer, await db.scalar(select(User.id).where(User.username == name))
+
+
 def _headers(buyer, event_id: int) -> dict[str, str]:
     bearer, user_id = buyer
     return {
@@ -212,7 +224,10 @@ async def test_no_fit_returns_409_with_the_feasible_quantities(
     )
     assert response.status_code == 409, response.text
     body = response.json()
-    assert body["available_quantities"] == [1, 2, 3, 5]
+    # 結構上 5 張配得出來(整段賣掉不留孤兒),但每人限購 4 把它夾掉了 —— 不能
+    # 建議一個誰都買不到的張數。純函式層的 {L} ∪ [1, L-2] 由
+    # test_seating.py::test_feasible_quantities_is_not_max_contiguous 守著。
+    assert body["available_quantities"] == [1, 2, 3]
     assert body["requested"] == 4
     # 拒絕發生在扣庫存之前。
     assert int(await redis.get(_zone_available_key(event.id, zone_id))) == 5
@@ -251,10 +266,12 @@ async def test_group_of_two_always_sits_together(
     event, zone_id = await _seated_event(db, redis, blocks=(6, 12, 6))
     placed = 0
     while True:
+        # 每筆換一個買家:每人限購 4 張,同一個人第三筆就會被擋 —— 而這條測的是
+        # 「兩人票永遠坐在一起」,不是限購。真實情況本來就是很多不同的人在搶。
         response = await client.post(
             "/v1/orders/",
             json={"event_id": event.id, "quantity": 2, "zone_id": zone_id},
-            headers=_headers(buyer, event.id),
+            headers=_headers(await _fresh_buyer(client, db, placed), event.id),
         )
         if response.status_code == 409:
             break

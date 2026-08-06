@@ -83,25 +83,28 @@ async def test_reconcile_rebuilds_inventory_after_redis_loss(client, db, redis, 
     event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
     await client.post(f"/v1/events/{event_id}/publish", headers=headers)        # 庫存 100
 
-    # 下 3 筆共 30 張 → Redis 立刻剩 70,worker 漆帳後 DB 有 30 的 pending 訂單
-    for _ in range(3):
+    # 三個買家各 4 張 = 12 張 → Redis 立刻剩 88,worker 落帳後 DB 有 12 的 pending。
+    # 三個人而不是同一個人下三筆:每人限購 4,同一個人第二筆就會被擋 —— 那時測到的
+    # 是限購而不是 reconcile 的算術。
+    for name in ("buyer1", "buyer2", "buyer3"):
+        buyer = await _make_admin_and_login(client, db, username=name)
         r = await client.post(
             "/v1/orders/",
-            json={"event_id": event_id, "quantity": 10},
-            headers=await _order_headers(db, headers, event_id),
+            json={"event_id": event_id, "quantity": 4},
+            headers=await _order_headers(db, buyer, event_id, username=name),
         )
-        assert r.status_code == 202
-    assert await get_available(redis, event_id=event_id) == 70
-    await drain_orders()                                                        # 30 筆寫進 Postgres
+        assert r.status_code == 202, r.text
+    assert await get_available(redis, event_id=event_id) == 88
+    await drain_orders()                                                        # 12 筆寫進 Postgres
 
     # 模擬 Redis 遺失那個 key
     await redis.delete(f"event:{event_id}:available")
     assert await get_available(redis, event_id=event_id) == 0
 
-    # reconcile 從 Postgres 重建:100 - 30 = 70
+    # reconcile 從 Postgres 重建:100 - 12 = 88
     available = await reconcile_inventory(db, redis, event_id=event_id)
-    assert available == 70
-    assert await get_available(redis, event_id=event_id) == 70
+    assert available == 88
+    assert await get_available(redis, event_id=event_id) == 88
 
 @pytest.mark.asyncio
 async def test_reconcile_refuses_when_stream_not_drained(client, db, redis):

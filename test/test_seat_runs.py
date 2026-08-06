@@ -17,7 +17,11 @@ from app.models.seating import SeatBlock, SeatHold, Zone
 from app.models.user import User
 from app.models.order import Order, OrderStatus
 from app.scripts.seed_venue import RowSpec, VenueSpec, ZoneSpec, odd_even_labels, seed_venue
-from app.services.inventory import ORDER_STREAM_KEY, _key as _event_available_key
+from app.services.inventory import (
+    ORDER_STREAM_KEY,
+    _key as _event_available_key,
+    _purchased_key,
+)
 from app.core.exceptions import (
     InsufficientInventory,
     InventoryNotReconcilable,
@@ -26,6 +30,7 @@ from app.core.exceptions import (
 )
 from app.services.seat_runs import (
     MAX_TICKETS_PER_ORDER,
+    max_purchasable,
     STRICT_MISS_THRESHOLD,
     STRICT_MISS_TTL_SECONDS,
     _misses_key,
@@ -245,8 +250,9 @@ async def test_stale_run_is_rejected_by_the_cas(db, redis, zone_fixture) -> None
             _runs_key(event.id, zone_id), _ends_key(event.id, zone_id),
             "claim:never", ORDER_STREAM_KEY,
             _zone_available_key(event.id, zone_id), _event_available_key(event.id),
+            _purchased_key(event.id),
         ],
-        args=[block_id, 0, 999, 0, 2, 60, 1, event.id, 200, "never", zone_id],
+        args=[block_id, 0, 999, 0, 2, 60, 1, event.id, 200, "never", zone_id, 4],
         client=redis,
     )
     assert result[0] == "RETRY"
@@ -274,8 +280,13 @@ async def test_no_fit_reports_the_feasible_quantities(db, redis) -> None:
             redis, event_id=event.id, zone_id=zone_id, user_id=1, quantity=4,
             total_price_cents=400, idempotency_key=str(uuid4()),
         )
-    assert excinfo.value.feasible == [1, 2, 3, 5]
-    assert MAX_TICKETS_PER_ORDER >= 5
+    # 結構上可行的是 {1,2,3,5}(5 = 整段賣掉不留孤兒),但每人限購 4 把 5 夾掉了。
+    # 兩個上限任一個擋得住,建議清單就必須取交集 —— 建議一個誰都買不到的張數,
+    # 使用者選了之後只會再吃一個 409。
+    assert excinfo.value.feasible == [1, 2, 3]
+    # 夾掉 5 的是限購而不是配位演算法:單筆上限仍然是 10,而純函式層的
+    # {L} ∪ [1, L-2] 由 test_seating.py::test_feasible_quantities_is_not_max_contiguous 守著。
+    assert MAX_TICKETS_PER_ORDER >= 5 > max_purchasable()
 
 
 # ─ 釋放與合併
@@ -312,7 +323,7 @@ async def test_release_merges_left_right_and_both(db, redis, zone_fixture) -> No
 
     async def give_back(start: int, marker: str) -> list[Run]:
         assert await release_seats(
-            redis, event_id=event.id, zone_id=zone_id, block_id=block.id,
+            redis, event_id=event.id, zone_id=zone_id, user_id=1, block_id=block.id,
             start_pos=start, length=2, marker=marker,
         )
         await _assert_indexes_agree(redis, event.id, zone_id)
@@ -334,7 +345,7 @@ async def test_release_is_idempotent_per_marker(db, redis, zone_fixture) -> None
     )
     assert reserved is not None
     args = dict(
-        event_id=event.id, zone_id=zone_id, block_id=reserved.block_id,
+        event_id=event.id, zone_id=zone_id, user_id=1, block_id=reserved.block_id,
         start_pos=reserved.start_pos, length=reserved.length, marker="order:7",
     )
     assert await release_seats(redis, **args) is True
@@ -364,7 +375,7 @@ async def test_lua_matches_the_pure_functions(db, redis, zone_fixture) -> None:
         if live and rng.random() < 0.35:
             block_id, start, length, marker = live.pop(rng.randrange(len(live)))
             assert await release_seats(
-                redis, event_id=event.id, zone_id=zone_id, block_id=block_id,
+                redis, event_id=event.id, zone_id=zone_id, user_id=1, block_id=block_id,
                 start_pos=start, length=length, marker=marker,
             )
             pure = release(pure, block_id=block_id, start=start, length=length)
@@ -373,7 +384,9 @@ async def test_lua_matches_the_pure_functions(db, redis, zone_fixture) -> None:
             quantity = rng.randint(1, 4)
             try:
                 reserved = await reserve_seats_and_enqueue(
-                    redis, event_id=event.id, zone_id=zone_id, user_id=1,
+                    # 每一步換一個買家:這條測的是配位結構,而同一個人連下 120 筆
+                    # 會撞到限購 —— 那是另一條測試的主題。
+                    redis, event_id=event.id, zone_id=zone_id, user_id=step + 1,
                     quantity=quantity, total_price_cents=100 * quantity,
                     idempotency_key=str(uuid4()), rng=rng,
                 )
@@ -407,10 +420,12 @@ async def test_no_orphan_survives_the_random_sequence(db, redis, zone_fixture) -
     """
     event, zone_id = zone_fixture["event"], zone_fixture["zone_id"]
     rng = random.Random(555)
+    buyer = 0
     while True:
+        buyer += 1
         try:
             reserved = await reserve_seats_and_enqueue(
-                redis, event_id=event.id, zone_id=zone_id, user_id=1,
+                redis, event_id=event.id, zone_id=zone_id, user_id=buyer,
                 quantity=rng.randint(2, 4), total_price_cents=200,
                 idempotency_key=str(uuid4()), rng=rng,
             )
@@ -441,9 +456,9 @@ async def _tiny_zone(db, redis, *blocks: int):
     return event, zone_id
 
 
-async def _try(redis, event, zone_id, quantity: int):
+async def _try(redis, event, zone_id, quantity: int, user_id: int = 1):
     return await reserve_seats_and_enqueue(
-        redis, event_id=event.id, zone_id=zone_id, user_id=1, quantity=quantity,
+        redis, event_id=event.id, zone_id=zone_id, user_id=user_id, quantity=quantity,
         total_price_cents=100 * quantity, idempotency_key=str(uuid4()),
     )
 
@@ -500,7 +515,7 @@ async def test_the_ratchet_is_one_way(db, redis) -> None:
     assert reserved is not None
 
     assert await release_seats(
-        redis, event_id=event.id, zone_id=zone_id, block_id=reserved.block_id,
+        redis, event_id=event.id, zone_id=zone_id, user_id=1, block_id=reserved.block_id,
         start_pos=reserved.start_pos, length=reserved.length, marker="order:1",
     )
     assert [r.length for r in await _redis_runs(redis, event.id, zone_id)] == [5]
@@ -510,12 +525,13 @@ async def test_the_ratchet_is_one_way(db, redis) -> None:
 async def test_ratchet_recovers_the_seats_uniform_demand_would_strand(db, redis) -> None:
     """奇數 block + 只有兩人票:嚴格策略擱淺 3 席,放寬後只擱淺 1 席(算術下限)。"""
     event, zone_id = await _tiny_zone(db, redis, 9)
-    sold, misses = 0, 0
+    sold, misses, buyer = 0, 0, 0
     # 被拒之後真實客戶會重送(入場券現在會退還),所以模擬要繼續試而不是放棄 ——
     # ratchet 本來就需要連續幾筆被拒才認得出「結構性卡住」。
     while misses <= STRICT_MISS_THRESHOLD + 1:
+        buyer += 1                        # 每筆換一個買家:這條測 ratchet,不測限購
         try:
-            reserved = await _try(redis, event, zone_id, 2)
+            reserved = await _try(redis, event, zone_id, 2, user_id=buyer)
         except NoSeatsAvailable:          # 席數夠但湊不出連號 → ratchet 的訊號
             misses += 1
             continue
@@ -608,7 +624,7 @@ async def test_release_of_a_free_interval_is_rejected(db, redis, zone_fixture) -
 
     with pytest.raises(SeatReleaseOverlap):
         await release_seats(
-            redis, event_id=event.id, zone_id=zone_id, block_id=run.block_id,
+            redis, event_id=event.id, zone_id=zone_id, user_id=1, block_id=run.block_id,
             start_pos=run.start + 2, length=2, marker="wrong-interval",
         )
     assert await _redis_runs(redis, event.id, zone_id) == before, "結構不得被動到"
@@ -632,12 +648,12 @@ async def test_a_rejected_release_does_not_burn_the_marker(db, redis, zone_fixtu
     )
     with pytest.raises(SeatReleaseOverlap):
         await release_seats(
-            redis, event_id=event.id, zone_id=zone_id, block_id=free.block_id,
+            redis, event_id=event.id, zone_id=zone_id, user_id=1, block_id=free.block_id,
             start_pos=free.start, length=2, marker="order:9",
         )
     # 再用正確的區間 + 同一個 marker → 必須成功
     assert await release_seats(
-        redis, event_id=event.id, zone_id=zone_id, block_id=reserved.block_id,
+        redis, event_id=event.id, zone_id=zone_id, user_id=1, block_id=reserved.block_id,
         start_pos=reserved.start_pos, length=reserved.length, marker="order:9",
     )
     assert int(await redis.get(_zone_available_key(event.id, zone_id))) == 48
@@ -655,7 +671,7 @@ async def test_a_legitimate_replay_is_still_a_dup_not_an_overlap(
     )
     assert reserved is not None
     args = dict(
-        event_id=event.id, zone_id=zone_id, block_id=reserved.block_id,
+        event_id=event.id, zone_id=zone_id, user_id=1, block_id=reserved.block_id,
         start_pos=reserved.start_pos, length=reserved.length, marker="order:11",
     )
     assert await release_seats(redis, **args) is True
@@ -675,7 +691,7 @@ async def test_release_beyond_the_block_is_rejected(db, redis, zone_fixture) -> 
 
     with pytest.raises(SeatReleaseOverlap, match="out of block bounds"):
         await release_seats(
-            redis, event_id=event.id, zone_id=zone_id, block_id=run.block_id,
+            redis, event_id=event.id, zone_id=zone_id, user_id=1, block_id=run.block_id,
             start_pos=run.start + run.length, length=2, marker="oob",
         )
     assert await _redis_runs(redis, event.id, zone_id) == before
@@ -707,7 +723,10 @@ async def test_enough_seats_but_not_together_is_a_fragmentation_problem(
     event, zone_id = await _tiny_zone(db, redis, 5, 5)
     with pytest.raises(NoSeatsAvailable) as excinfo:
         await _try(redis, event, zone_id, 4)
-    assert excinfo.value.feasible == [1, 2, 3, 5]
+    # 結構上 5 張配得出來(整段賣掉不留孤兒),但每人限購 4 —— 誰都買不到,所以
+    # 不能出現在「改買這些張數」的建議裡。純函式層的 {L} ∪ [1, L-2] 性質由
+    # test_seating.py::test_feasible_quantities_is_not_max_contiguous 守著。
+    assert excinfo.value.feasible == [1, 2, 3]
 
 
 async def test_a_sold_out_zone_does_not_record_a_ratchet_signal(db, redis) -> None:
@@ -747,7 +766,7 @@ async def test_lua_and_oracle_agree_on_rejecting_bad_releases(db, redis, zone_fi
                     length=length, capacity=capacity)
         with pytest.raises(SeatReleaseOverlap):  # Lua
             await release_seats(
-                redis, event_id=event.id, zone_id=zone_id, block_id=run.block_id,
+                redis, event_id=event.id, zone_id=zone_id, user_id=1, block_id=run.block_id,
                 start_pos=start, length=length, marker=f"bad-{label}",
             )
         assert await _redis_runs(redis, event.id, zone_id) == pure, label

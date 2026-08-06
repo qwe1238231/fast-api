@@ -25,10 +25,10 @@ async def test_reserve_sold_out_raises_and_rolls_back(redis):
 async def test_release_returns_stock(redis):
     await set_initial_stock(redis, event_id=EVENT_ID, total_seats=5)
     await reserve(redis, event_id=EVENT_ID, quantity=5)
-    assert await release(redis, event_id=EVENT_ID, quantity=2, marker="order:1") is True
+    assert await release(redis, event_id=EVENT_ID, user_id=1, quantity=2, marker="order:1") is True
     assert await get_available(redis, event_id=EVENT_ID) == 2
     # idempotent: same marker again is a no-op (guards double-release)
-    assert await release(redis, event_id=EVENT_ID, quantity=2, marker="order:1") is False
+    assert await release(redis, event_id=EVENT_ID, user_id=1, quantity=2, marker="order:1") is False
     assert await get_available(redis, event_id=EVENT_ID) == 2
 
 @pytest.mark.asyncio

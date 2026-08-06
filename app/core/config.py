@@ -30,6 +30,29 @@ class Settings(BaseSettings):
     STRIPE_WEBHOOK_SECRET: str = ""
     """Stripe webhook 的簽章密鑰。**非 DEBUG 下不得為空** —— 見 _guard_webhook_secret。"""
     LOGIN_RATE_LIMIT: str = "5/minute"
+    REGISTER_RATE_LIMIT: str = "10/hour"
+    """註冊的每 IP 上限。註冊是「未認證 + 寫 DB + 跑一次 Argon2」—— 三個特徵湊在
+    一起就是最好用的放大攻擊面,而且黃牛本來就要大量帳號。放寬一點(10/小時而不是
+    跟登入一樣 5/分鐘)是因為 NAT 後面會有整間公司/整棟宿舍共用一個 IP。"""
+
+    RATE_LIMIT_STORAGE_URI: str = ""
+    """限流計數器放哪。空字串 → 用 REDIS_URL。
+
+    **不能留在記憶體**(slowapi 的預設):compose 的 api 跑 `--workers 4`,ECS 又有
+    多個 task,於是「5 次/分鐘」實際上變成 5 × process 數。而且 process 一重啟計數
+    就歸零 —— 攻擊者只要等一次部署。
+    """
+
+    TRUSTED_PROXY_COUNT: int = 0
+    """前面有幾層我們自己的反向代理(ALB=1、ALB+CloudFront=2、本機直連=0)。
+
+    決定 `X-Forwarded-For` 要從右邊數第幾個才是真實客戶端。ALB 是**附加**在既有
+    XFF 後面,所以最右邊那個是它親眼看到的 TCP 對端,左邊的都可能是客戶端自己塞的。
+    取最左邊(常見寫法)等於讓任何人自稱任意 IP —— 限流直接失效。
+    0 表示完全不信任 XFF,用 socket 對端。**寧可預設不信任**:設錯成 0 只是限流
+    變嚴,設錯成 1 而前面其實沒有代理,就是誰都能繞過。
+    """
+
     AUDIT_LOG_RETENTION_DAYS: int = 90
 
     MAX_TICKETS_PER_USER_PER_EVENT: int = 4
@@ -68,7 +91,14 @@ class Settings(BaseSettings):
     QUEUE_ADMISSION_TOKEN_TTL_SECONDS: int = 120  # admitted buyers must complete within this window
     QUEUE_JOIN_LIMIT_PER_MINUTE: int = 30         # anti-hammer cap on queue-join per user per event
     # Circuit breaker: pause admission when the downstream order pipeline is unhealthy.
-    ADMISSION_PAUSE_DEAD_LETTER_THRESHOLD: int = 100   # dead-lettered orders above this → pause
+    ADMISSION_PAUSE_NEW_DEAD_LETTERS: int = 100
+    """一次檢查(每分鐘)之內**新增**幾筆死信就暫停放行。
+
+    刻意是增量不是總量。舊版比的是 `XLEN(orders:stream:dead)` —— 那個數字只增不減
+    (沒有人會去清它),所以只要歷史上曾經壞過一次超過門檻,斷路器就**永遠**開著,
+    整站永久停售,而且看起來完全像是「系統正在保護自己」。
+    backlog 用總量是對的:那是佇列深度,消費者追上就會自己降下來。
+    """
     ADMISSION_PAUSE_BACKLOG_THRESHOLD: int = 10000     # unpersisted backlog above this → pause
 
     model_config = SettingsConfigDict(env_file=".env",extra="ignore")

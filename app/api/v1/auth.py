@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status ,Request, Response
 from fastapi.security import OAuth2PasswordRequestForm
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import DbSession, limiter, CurrentUser, Redis
+from app.api.deps import DbSession, client_ip, limiter, CurrentUser, Redis
 from app.core.config import get_settings
 
 from app.core.security import (
@@ -97,7 +97,7 @@ async def login_for_access_token(
         await emit_event(
             redis,
             event_type="auth.login_failure",
-            actor_ip=request.client.host if request.client else None,
+            actor_ip=client_ip(request),
             payload={
         "username_attempted": form_data.username[:64],
         "reason": "invalid_credentials_or_inactive",
@@ -114,7 +114,7 @@ async def login_for_access_token(
     absolute = timedelta(days=settings.REFRESH_TOKEN_ABSOLUTE_EXPIRE_DAYS)
 
     user_agent = request.headers.get("user-agent")
-    ip_address = request.client.host if request.client else None
+    ip_address = client_ip(request)
 
     refresh_plain, _ = await issue_refresh_token(
         db,
@@ -141,13 +141,13 @@ async def login_for_access_token(
         redis,
         event_type="auth.login_success",
         actor_user_id=user.id,
-        actor_ip=request.client.host if request.client else None,
+        actor_ip=client_ip(request),
         payload={
             "user_agent": request.headers.get("user-agent", "")[:256],
         },
     )
     return Token(
-        access_token=create_access_token(subject=user.username),
+        access_token=create_access_token(subject=str(user.id)),
         expires_in=settings.access_token_lifetime_seconds,
     )
 
@@ -195,7 +195,7 @@ async def refresh_access_token(
     sliding = timedelta(days=settings.REFRESH_TOKEN_SLIDING_DAYS)
     absolute = timedelta(days=settings.REFRESH_TOKEN_ABSOLUTE_EXPIRE_DAYS)
     user_agent = request.headers.get("user-agent")
-    ip_address = request.client.host if request.client else None
+    ip_address = client_ip(request)
 
     new_refresh_plain, _ = await issue_refresh_token(
         db,

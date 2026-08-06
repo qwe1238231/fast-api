@@ -22,6 +22,14 @@ from app.services.queue_events import publish_event_poke
 ORDER_STREAM_KEY="orders:stream"
 ORDER_DEAD_LETTER_KEY="orders:stream:dead"
 
+#: 死信串流的長度上限(近似修剪,跟 AUDIT_STREAM_MAX_LEN 同一個模式)。
+#:
+#: 沒有上限的話它只增不減:沒有人會去清它,而每一筆都留著完整的 order intent 欄位。
+#: 一次持續的下游故障就能把 Redis 撐爆 —— 而 Redis 同時是庫存的唯一真相來源,
+#: 所以「訂單寫不進 DB」會升級成「整個站賣不了票」。
+#: 10 萬筆遠超過任何值得人工排查的量;真的到那個量級,問題不在保留了幾筆。
+ORDER_DEAD_LETTER_MAX_LEN = 100_000
+
 
 
 def _key(event_id: int) -> str:

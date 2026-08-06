@@ -1,7 +1,7 @@
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.schemas.user import UserCreate
-from app.core.security import get_password_hash
+from app.core.security import hash_password_async
 from app.models import User
 
 
@@ -29,7 +29,9 @@ async def create_user(
 ) -> User:
     user = User(
         username=user_in.username,
-        hashed_password=get_password_hash(user_in.password.get_secret_value()),
+        hashed_password=await hash_password_async(
+            user_in.password.get_secret_value()
+        ),
     )
     db.add(user)
     await db.commit()

@@ -461,9 +461,12 @@ locals {
       threshold = 1000, eval = 5,
       desc      = "order stream backlog > 1000 for 5 min — consumer not keeping up; 202'd orders not persisting"
     }
-    order_dead_letter_depth = {
+    # 掛在「每分鐘新增」而不是累計深度。累計值只增不減(沒有人會去清死信),門檻 0
+    # 的告警一旦響過就永遠在 ALARM —— 而一個永遠在響的告警等於沒有告警。用新增值
+    # 才會在事故結束後自己 OK,下次再響時是真的又出事了。
+    order_dead_letter_new = {
       threshold = 0, eval = 1,
-      desc      = "dead-letter depth > 0 — orders permanently failed (should be 0)"
+      desc      = "new order dead-letters in the last minute — orders permanently failing right now"
     }
   }
 }

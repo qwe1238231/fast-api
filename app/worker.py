@@ -30,6 +30,7 @@ from app.services.inventory import (
     compute_expected_available, get_available, release,
     ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY, queue_depth,
     _key as _event_available_key, _purchased_key,
+    ORDER_DEAD_LETTER_MAX_LEN,
 )
 from app.services.idempotency import mark_claim_failed
 from app.services.seat_runs import (
@@ -348,7 +349,12 @@ async def _dead_letter_intent(redis, entry_id: str, fields: dict) -> None:
     async with AsyncSessionLocal() as db:
         already_persisted = await get_order_by_idempotency_key(db, UUID(idem)) is not None
 
-    await redis.xadd(ORDER_DEAD_LETTER_KEY, {**fields, "original_id": entry_id})
+    await redis.xadd(
+        ORDER_DEAD_LETTER_KEY,
+        {**fields, "original_id": entry_id},
+        maxlen=ORDER_DEAD_LETTER_MAX_LEN,
+        approximate=True,
+    )
     if not already_persisted:
         block_id = fields.get("block_id") or None
         if block_id:
@@ -430,17 +436,56 @@ async def reclaim_stale_order_intents(
         except Exception as exc:
             print(f"Reclaim failed for order intent {entry_id}: {exc}")
 
+#: 斷路器讀到哪一筆死信了。存的是 stream id,不是筆數 —— 筆數會被 maxlen 修剪弄髒。
+DEAD_LETTER_CURSOR_KEY = "orders:stream:dead:breaker_cursor"
+
+
+async def count_new_dead_letters(redis, *, cap: int) -> int:
+    """自上次呼叫以來新增了幾筆死信(數到 cap + 1 就夠了,不會掃整條)。
+
+    斷路器要的是**速率**而不是總量。`XLEN` 只增不減(沒有人會清死信),所以拿它比
+    門檻的話,歷史上壞過一次就永遠跳閘、整站永久停售 —— 而且外觀跟「系統正在保護
+    自己」一模一樣,沒有人會覺得該去看。
+
+    兩個容易寫錯的地方:
+    - **第一次要對齊游標並回報 0。** 不然 worker 每次重啟都會把整段歷史當成「剛剛
+      新增的」而立刻跳閘 —— 就是同一個 bug 換一個入口回來。
+    - **游標一律推進到當下最新的一筆**,不是只推進我們數到的那 cap + 1 筆。否則一次
+      湧入一萬筆之後,每分鐘都還會數到滿額,斷路器在事故結束後又多開一百分鐘。
+    """
+    cursor = await redis.get(DEAD_LETTER_CURSOR_KEY)
+    newest = await redis.xrevrange(ORDER_DEAD_LETTER_KEY, count=1)
+    newest_id = newest[0][0] if newest else "0-0"
+
+    if cursor is None:
+        await redis.set(DEAD_LETTER_CURSOR_KEY, newest_id)
+        return 0
+
+    entries = await redis.xrange(
+        ORDER_DEAD_LETTER_KEY, min=f"({cursor}", max=newest_id, count=cap + 1
+    )
+    await redis.set(DEAD_LETTER_CURSOR_KEY, newest_id)
+    return len(entries)
+
+
 async def collect_queue_stats(redis) -> dict:
-    """Current order-queue depths. backlog = unprocessed intents still in the
-    stream; dead_letter = intents given up on (should stay 0)."""
+    """Current order-queue depths.
+
+    backlog = unprocessed intents still in the stream (總量是對的:佇列深度,消費者
+    追上就會降);dead_letter = 累計放棄的筆數(給儀表板看趨勢);new_dead_letters =
+    自上次檢查以來新增的筆數(**斷路器與告警看這個**,理由見 count_new_dead_letters)。
+    """
+    cap = get_settings().ADMISSION_PAUSE_NEW_DEAD_LETTERS
     return {
         "backlog": await redis.xlen(ORDER_STREAM_KEY),
         "dead_letter": await redis.xlen(ORDER_DEAD_LETTER_KEY),
+        "new_dead_letters": await count_new_dead_letters(redis, cap=cap),
     }
 
 METRIC_NAMESPACE_ENV_VAR = "PIPELINE_METRIC_NAMESPACE"
 METRIC_NAME_BACKLOG = "order_stream_backlog"
-METRIC_NAME_DEAD_LETTER = "order_dead_letter_depth"
+METRIC_NAME_DEAD_LETTER = "order_dead_letter_depth"      # 累計:給儀表板看趨勢
+METRIC_NAME_DEAD_LETTER_NEW = "order_dead_letter_new"    # 每分鐘新增:**告警看這個**
 
 _METRIC_NAMESPACE = os.environ.get(METRIC_NAMESPACE_ENV_VAR)
 # Build the client only when BOTH env vars are present (the deployed worker task
@@ -458,7 +503,15 @@ _cloudwatch = (
     else None
 )
 
-async def _publish_pipeline_gauges(backlog: int, dead_letter: int) -> None:
+async def _publish_pipeline_gauges(
+    backlog: int, dead_letter: int, new_dead_letters: int
+) -> None:
+    """死信發兩個指標:累計與每分鐘新增。
+
+    告警必須掛在**新增**上。累計值只增不減,門檻 0 的告警一旦響過就永遠在 ALARM ——
+    而那跟斷路器永久跳閘是同一個病:一個永遠在響的告警等於沒有告警,下次真的出事
+    沒有人會注意到。累計值留著是因為儀表板上的趨勢線仍然有用。
+    """
     if _cloudwatch is None:
         return
     try:
@@ -476,6 +529,11 @@ async def _publish_pipeline_gauges(backlog: int, dead_letter: int) -> None:
                     "Value": dead_letter,
                     "Unit": "Count",
                 },
+                {
+                    "MetricName": METRIC_NAME_DEAD_LETTER_NEW,
+                    "Value": new_dead_letters,
+                    "Unit": "Count",
+                },
             ],
         )
     except Exception as exc:
@@ -487,9 +545,16 @@ async def report_queue_depth(ctx: dict) -> dict:
     """Cron: log a smoke-alarm when the dead-letter stream is non-empty or the
     backlog is climbing. (Grafana reads the same depths via the API /metrics.)"""
     stats = await collect_queue_stats(ctx["redis_client"])
-    await _publish_pipeline_gauges(stats["backlog"], stats["dead_letter"])
-    if stats["dead_letter"] > 0:
-        print(f"ALERT order dead-letter depth={stats['dead_letter']} — orders failing permanently")
+    await _publish_pipeline_gauges(
+        stats["backlog"], stats["dead_letter"], stats["new_dead_letters"]
+    )
+    # 告警看新增而不是總量:總量 > 0 會在第一次事故之後每分鐘叫到天荒地老,而一個
+    # 永遠在響的告警等於沒有告警。
+    if stats["new_dead_letters"] > 0:
+        print(
+            f"ALERT {stats['new_dead_letters']} new order dead-letters this minute "
+            f"(total={stats['dead_letter']}) — orders failing permanently"
+        )
     if stats["backlog"] > BACKLOG_WARN:
         print(f"WARN order backlog={stats['backlog']} — consumers may be falling behind")
 
@@ -497,12 +562,15 @@ async def report_queue_depth(ctx: dict) -> dict:
     # unhealthy, so we stop feeding new buyers into a system that can't keep up.
     settings = get_settings()
     unhealthy = (
-        stats["dead_letter"] > settings.ADMISSION_PAUSE_DEAD_LETTER_THRESHOLD
+        stats["new_dead_letters"] > settings.ADMISSION_PAUSE_NEW_DEAD_LETTERS
         or stats["backlog"] > settings.ADMISSION_PAUSE_BACKLOG_THRESHOLD
     )
     await set_admission_paused(ctx["redis_client"], unhealthy)
     if unhealthy:
-        print(f"CIRCUIT-BREAKER admission paused (backlog={stats['backlog']}, dead_letter={stats['dead_letter']})")
+        print(
+            f"CIRCUIT-BREAKER admission paused (backlog={stats['backlog']}, "
+            f"new_dead_letters={stats['new_dead_letters']})"
+        )
     return stats
 
 

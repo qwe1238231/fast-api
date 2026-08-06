@@ -12,6 +12,14 @@ locals {
     value = "redis://${aws_elasticache_cluster.main.cache_nodes[0].address}:6379/0"
   }
 
+  # 這裡的每個請求都經過恰好一層我們自己的代理(ALB),所以 X-Forwarded-For 最右邊
+  # 那一跳才是 ALB 親眼看到的客戶端。不設的話預設是 0 = 不看 XFF,於是所有請求的
+  # 來源都變成 ALB 的內網 IP —— 每 IP 的限流就退化成全站共用一個桶。
+  proxy_env = {
+    name  = "TRUSTED_PROXY_COUNT"
+    value = "1"
+  }
+
   # Sensitive env: pull each key out of the ONE JSON secret. The `:KEY::` suffix
   # selects a json field (the two trailing colons = default version-stage/id).
   # ECS (via the execution role) reads these at task start and injects them as
@@ -57,7 +65,7 @@ resource "aws_ecs_task_definition" "api" {
     image        = local.image
     essential    = true
     portMappings = [{ containerPort = 8000, protocol = "tcp" }] # only the API exposes a port
-    environment  = [local.redis_env]
+    environment  = [local.redis_env, local.proxy_env]
     secrets      = local.app_secrets
     # command omitted → uses the image's default CMD (uvicorn app.main:app ... :8000)
     logConfiguration = { logDriver = "awslogs", options = local.log_options.api }

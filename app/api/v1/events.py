@@ -5,7 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from app.api.deps import CurrentAdmin, CurrentUser, DbSession, Redis, StreamUser
+from app.api.deps import CurrentAdmin, CurrentUser, DbSession, Redis, StreamUser, client_ip
 from app.core.config import get_settings
 from app.core.exceptions import EventNotFound
 from app.core.security import create_admission_token
@@ -78,7 +78,7 @@ async def list_zones_endpoint(
     """
     await enforce_rate_limit(
         redis,
-        f"zones:{event_id}:{request.client.host if request.client else 'unknown'}",
+        f"zones:{event_id}:{client_ip(request)}",
         limit=get_settings().ZONES_LIST_LIMIT_PER_MINUTE,
         window_seconds=60,
     )

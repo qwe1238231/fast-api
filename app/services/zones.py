@@ -11,12 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from redis.asyncio import Redis
 
 from app.core.exceptions import EventNotFound, SeatsNotAssigned
+from app.core.config import max_purchasable
 from app.models.event import Event
 from app.models.seating import SeatBlock, SeatHold, Zone
 from app.schemas.seating import SeatedOrderDetail, ZoneAvailability
 from app.services.pricing import load_zone_prices
 from app.services.seat_runs import (
-    max_purchasable,
     read_zone_snapshots,
     seat_labels,
 )

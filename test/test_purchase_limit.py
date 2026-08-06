@@ -16,7 +16,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select
 
-from app.core.config import get_settings
+from app.core.config import get_settings, max_purchasable
 from app.core.exceptions import PurchaseLimitExceeded
 from app.core.security import create_admission_token
 from app.models.event import Event, EventStatus
@@ -34,8 +34,6 @@ from app.services.orders import release_order_seat
 from app.services.publish_event import publish_event
 from app.services.seat_runs import release_seats, reserve_seats_and_enqueue
 
-pytestmark = pytest.mark.asyncio
-
 LIMIT = get_settings().MAX_TICKETS_PER_USER_PER_EVENT
 
 
@@ -46,6 +44,7 @@ async def _held(redis, event_id: int, user_id: int) -> int:
 
 # ─ 無座位圖的路徑
 
+@pytest.mark.asyncio
 async def test_a_buyer_can_reach_the_limit_across_several_orders(
     redis, published_event
 ) -> None:
@@ -59,6 +58,7 @@ async def test_a_buyer_can_reach_the_limit_across_several_orders(
         assert await _held(redis, published_event.id, 7) == n
 
 
+@pytest.mark.asyncio
 async def test_the_ticket_past_the_limit_is_refused(redis, published_event) -> None:
     for _ in range(LIMIT):
         await reserve_and_enqueue(
@@ -74,6 +74,7 @@ async def test_the_ticket_past_the_limit_is_refused(redis, published_event) -> N
     assert await _held(redis, published_event.id, 7) == LIMIT, "被拒的請求不能加額度"
 
 
+@pytest.mark.asyncio
 async def test_a_rejected_request_does_not_consume_stock(
     redis, published_event
 ) -> None:
@@ -93,6 +94,7 @@ async def test_a_rejected_request_does_not_consume_stock(
     assert await get_available(redis, event_id=published_event.id) == before
 
 
+@pytest.mark.asyncio
 async def test_sold_out_wins_over_the_limit(redis, published_event) -> None:
     """只剩 5 席卻要 6 張:回「售完」而不是「超過限購」。
 
@@ -108,6 +110,7 @@ async def test_sold_out_wins_over_the_limit(redis, published_event) -> None:
     assert result.available == 5
 
 
+@pytest.mark.asyncio
 async def test_concurrent_requests_from_one_buyer_cannot_beat_the_limit(
     redis, published_event
 ) -> None:
@@ -128,6 +131,7 @@ async def test_concurrent_requests_from_one_buyer_cannot_beat_the_limit(
     assert await _held(redis, published_event.id, 7) == LIMIT
 
 
+@pytest.mark.asyncio
 async def test_the_limit_is_per_event(redis, db, published_event) -> None:
     """買了 A 藝人的票不該排擠 B 藝人 —— 鍵是 (event, user) 而不是 user。"""
     now = datetime.now(timezone.utc)
@@ -155,6 +159,7 @@ async def test_the_limit_is_per_event(redis, db, published_event) -> None:
 
 # ─ 退額度:每一條釋放路徑
 
+@pytest.mark.asyncio
 async def test_releasing_gives_the_quota_back(redis, published_event) -> None:
     await reserve_and_enqueue(
         redis, event_id=published_event.id, user_id=7, quantity=LIMIT,
@@ -176,6 +181,7 @@ async def test_releasing_gives_the_quota_back(redis, published_event) -> None:
     )).outcome == ReserveOutcome.OK, "退了額度就必須買得回來"
 
 
+@pytest.mark.asyncio
 async def test_a_replayed_release_does_not_refund_twice(
     redis, published_event
 ) -> None:
@@ -197,6 +203,7 @@ async def test_a_replayed_release_does_not_refund_twice(
     assert await _held(redis, published_event.id, 7) == 0
 
 
+@pytest.mark.asyncio
 async def test_releasing_an_order_from_before_the_feature_floors_at_zero(
     redis, published_event
 ) -> None:
@@ -210,6 +217,7 @@ async def test_releasing_an_order_from_before_the_feature_floors_at_zero(
     assert not await redis.hexists(_purchased_key(published_event.id), "7")
 
 
+@pytest.mark.asyncio
 async def test_cancelling_an_order_frees_the_quota(
     client, db, redis, published_event, drain_orders
 ) -> None:
@@ -246,40 +254,110 @@ async def test_cancelling_an_order_frees_the_quota(
     assert await _held(redis, published_event.id, uid) == 0
 
 
+async def _login(client, db, username: str) -> tuple[dict[str, str], int]:
+    await client.post("/v1/users/", json={"username": username, "password": "secret123"})
+    token = (await client.post(
+        "/v1/auth/token", data={"username": username, "password": "secret123"}
+    )).json()["access_token"]
+    uid = await db.scalar(select(User.id).where(User.username == username))
+    return {"Authorization": f"Bearer {token}"}, uid
+
+
+@pytest.mark.asyncio
 async def test_the_api_says_how_many_are_left_and_refunds_the_token(
-    client, db, redis, published_event, drain_orders
+    client, db, redis, published_event
 ) -> None:
     """409 要帶著 remaining,而且入場券必須退還。
 
     不變式是「入場券被消耗 ⟺ 訂單意圖已受理」。限購的拒絕發生在任何寫入之前
     (兩支 Lua 都在扣庫存前就回 OVER_LIMIT),所以退還是安全的 —— 而且是必要的:
     使用者只要改小張數就買得到,不該被迫回去重新排隊。
-    """
-    await client.post("/v1/users/", json={"username": "greedy", "password": "secret123"})
-    token = (await client.post(
-        "/v1/auth/token", data={"username": "greedy", "password": "secret123"}
-    )).json()["access_token"]
-    uid = await db.scalar(select(User.id).where(User.username == "greedy"))
-    admission = create_admission_token(
-        user_id=uid, event_id=published_event.id, ttl_seconds=120
-    )
-    common = {"Authorization": f"Bearer {token}", "Admission-Token": admission}
 
-    rejected = await client.post(
+    先買 LIMIT-1 張再要 2 張,是因為 `quantity` 的上限已經被夾成 LIMIT ——
+    「一次就要超過上限」現在在驗證層就被擋掉(422),走不到這條路徑。真正還會發生的
+    是這個:分批買,最後一筆跨過線。而且它讓 remaining 是有資訊量的 1 而不是 LIMIT。
+    """
+    auth, uid = await _login(client, db, "greedy")
+    common = {
+        **auth,
+        "Admission-Token": create_admission_token(
+            user_id=uid, event_id=published_event.id, ttl_seconds=120
+        ),
+    }
+    first = await client.post(
         "/v1/orders/",
-        json={"event_id": published_event.id, "quantity": LIMIT + 1},
+        json={"event_id": published_event.id, "quantity": LIMIT - 1},
+        headers={
+            **auth,
+            "Admission-Token": create_admission_token(
+                user_id=uid, event_id=published_event.id, ttl_seconds=120
+            ),
+            "Idempotency-Key": str(uuid4()),
+        },
+    )
+    assert first.status_code == 202, first.text
+
+    rejected = await client.post(          # 3 + 2 > 4
+        "/v1/orders/",
+        json={"event_id": published_event.id, "quantity": 2},
         headers={**common, "Idempotency-Key": str(uuid4())},
     )
     assert rejected.status_code == 409, rejected.text
     body = rejected.json()
-    assert body["limit"] == LIMIT and body["remaining"] == LIMIT
+    assert body["limit"] == LIMIT
+    assert body["already_held"] == LIMIT - 1
+    assert body["remaining"] == 1, "要告訴使用者還能買幾張,不是只說被擋了"
 
-    retry = await client.post(          # 同一張入場券,改小張數
+    retry = await client.post(          # 同一張入場券,改成剩下的 1 張
+        "/v1/orders/",
+        json={"event_id": published_event.id, "quantity": 1},
+        headers={**common, "Idempotency-Key": str(uuid4())},
+    )
+    assert retry.status_code == 202, retry.text
+
+
+@pytest.mark.asyncio
+async def test_asking_for_more_than_the_limit_is_rejected_at_the_boundary(
+    client, db, redis, published_event
+) -> None:
+    """一次就要超過上限 → 422,而且連入場券都不會被碰。
+
+    `quantity` 的 `le=` 是 min(單筆上限, 每人限購)。不夾的話這種請求會通過驗證、
+    驗完入場券、跑進 Redis,最後才拿到 409 —— 而 OpenAPI 仍然對外宣告可以買 10 張,
+    前端的數量選單就照著生出四個永遠買不到的選項。
+    """
+    auth, uid = await _login(client, db, "overreach")
+    admission = create_admission_token(
+        user_id=uid, event_id=published_event.id, ttl_seconds=120
+    )
+    common = {**auth, "Admission-Token": admission}
+
+    r = await client.post(
+        "/v1/orders/",
+        json={"event_id": published_event.id, "quantity": LIMIT + 1},
+        headers={**common, "Idempotency-Key": str(uuid4())},
+    )
+    assert r.status_code == 422, r.text
+    assert await _held(redis, published_event.id, uid) == 0
+
+    ok = await client.post(          # 同一張入場券仍然有效
         "/v1/orders/",
         json={"event_id": published_event.id, "quantity": LIMIT},
         headers={**common, "Idempotency-Key": str(uuid4())},
     )
-    assert retry.status_code == 202, retry.text
+    assert ok.status_code == 202, ok.text
+
+
+def test_the_advertised_maximum_matches_the_enforced_one() -> None:
+    """OpenAPI 宣告的上限必須等於實際執行的上限。
+
+    這條擋的是「有人把 `le=` 改回寫死的數字」:文件說 10、實際擋 4,前端照文件
+    生出來的選單有四成的選項是死的,而且沒有任何測試會紅。
+    """
+    from app.schemas.order import OrderCreate
+
+    advertised = OrderCreate.model_json_schema()["properties"]["quantity"]["maximum"]
+    assert advertised == max_purchasable() == LIMIT
 
 
 # ─ 座位場次走的是另一支 Lua,所以要各測一次
@@ -307,6 +385,7 @@ async def seated(db, redis):
     return event.id, zone_id
 
 
+@pytest.mark.asyncio
 async def test_the_seated_path_enforces_the_same_limit(redis, seated) -> None:
     event_id, zone_id = seated
     assert await reserve_seats_and_enqueue(
@@ -323,6 +402,7 @@ async def test_the_seated_path_enforces_the_same_limit(redis, seated) -> None:
     assert excinfo.value.limit == LIMIT
 
 
+@pytest.mark.asyncio
 async def test_the_seated_limit_is_not_reported_as_contention(redis, seated) -> None:
     """超過限購**不能**走成 SeatContention(503)。
 
@@ -345,6 +425,7 @@ async def test_the_seated_limit_is_not_reported_as_contention(redis, seated) -> 
     assert not issubclass(PurchaseLimitExceeded, SeatContention)
 
 
+@pytest.mark.asyncio
 async def test_releasing_seats_gives_the_quota_back(redis, seated) -> None:
     event_id, zone_id = seated
     reserved = await reserve_seats_and_enqueue(
@@ -366,6 +447,7 @@ async def test_releasing_seats_gives_the_quota_back(redis, seated) -> None:
     ) is not None
 
 
+@pytest.mark.asyncio
 async def test_a_rejected_seat_release_does_not_refund_the_quota(
     redis, seated
 ) -> None:

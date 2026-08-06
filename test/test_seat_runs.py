@@ -28,9 +28,8 @@ from app.core.exceptions import (
     NoSeatsAvailable,
     SeatReleaseOverlap,
 )
+from app.core.config import get_settings, max_purchasable
 from app.services.seat_runs import (
-    MAX_TICKETS_PER_ORDER,
-    max_purchasable,
     STRICT_MISS_THRESHOLD,
     STRICT_MISS_TTL_SECONDS,
     _misses_key,
@@ -286,7 +285,7 @@ async def test_no_fit_reports_the_feasible_quantities(db, redis) -> None:
     assert excinfo.value.feasible == [1, 2, 3]
     # 夾掉 5 的是限購而不是配位演算法:單筆上限仍然是 10,而純函式層的
     # {L} ∪ [1, L-2] 由 test_seating.py::test_feasible_quantities_is_not_max_contiguous 守著。
-    assert MAX_TICKETS_PER_ORDER >= 5 > max_purchasable()
+    assert get_settings().MAX_TICKETS_PER_ORDER >= 5 > max_purchasable()
 
 
 # ─ 釋放與合併

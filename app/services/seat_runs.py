@@ -45,7 +45,7 @@ from app.core.seat_metrics import (
     SEAT_CAS_WINDOW,
     SEAT_CONTENTION,
 )
-from app.core.config import get_settings
+from app.core.config import get_settings, max_purchasable
 from app.core.exceptions import (
     InsufficientInventory,
     InventoryNotReconcilable,
@@ -82,19 +82,6 @@ TOP_K = 16
 
 #: CAS 重試上限。超過就當成暫時性失敗往上拋 —— 有界重試,不要在熱路徑上無限迴圈。
 MAX_CAS_ATTEMPTS = 5
-
-#: 單筆訂單張數上限。必須與 OrderCreate.quantity 的 le= 一致。
-MAX_TICKETS_PER_ORDER = 10
-
-
-def max_purchasable() -> int:
-    """實際買得到的單筆張數上限 = min(單筆上限, 每人限購)。
-
-    兩個上限任一個都能擋下請求,所以回報「配得出來的張數」時必須取小的那個。少了
-    這個 min,限購 4 張的場次會在選區畫面顯示「可以買 8 張連號」,使用者選了 8 之後
-    才被 409 擋掉 —— 那是我們自己造出來的死路。
-    """
-    return min(MAX_TICKETS_PER_ORDER, get_settings().MAX_TICKETS_PER_USER_PER_EVENT)
 
 #: 連續幾筆被嚴格策略拒絕之後,這個 zone 就切換到收尾期策略(允許在邊緣留下孤兒)。
 #:

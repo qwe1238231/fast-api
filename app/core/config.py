@@ -37,9 +37,13 @@ class Settings(BaseSettings):
     請求時全部都還沒 CONFIRMED,限購形同虛設。過期/取消會退回額度。
 
     這是每場次獨立的(鍵是 `event:{e}:purchased` 的 user_id 欄位),所以同一個人買
-    不同藝人的票互不排擠。單筆上限 MAX_TICKETS_PER_ORDER 是另一回事:那擋的是
-    單一請求的大小,擋不住同一個人送很多筆。
+    不同藝人的票互不排擠。跟 MAX_TICKETS_PER_ORDER 是兩件事:那擋的是單一請求的
+    大小,擋不住同一個人送很多筆。實際能買的是兩者取小 —— 見 `max_purchasable`。
     """
+
+    MAX_TICKETS_PER_ORDER: int = 10
+    """單筆訂單的張數上限。純粹是請求大小的護欄(擋掉 quantity=99999 這種),跟
+    「這個人能買幾張」無關。"""
 
     # Async order-offload tuning
     ORDER_CONSUMER_BLOCK_MS: int = 2000        # how long the consumer loop blocks per read
@@ -131,3 +135,16 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+def max_purchasable() -> int:
+    """一個人在一筆請求裡實際買得到的張數上限 = min(單筆上限, 每人限購)。
+
+    住在 config 而不是 seat_runs,是因為三個地方都要它 —— 請求 schema 的 `le=`、
+    配位回報的「可行張數」、選區畫面的張數選單。上一版把 `MAX_TICKETS_PER_ORDER`
+    放在 seat_runs 而 schema 自己寫死 `le=10`,靠一行「必須與 OrderCreate 一致」的
+    註解綁著兩處 —— 註解不會在改壞的時候變紅。這個專案已經在 key 格式上踩過兩次
+    同一個坑,所以上限也只留一個宣告點。
+    """
+    settings = get_settings()
+    return min(settings.MAX_TICKETS_PER_ORDER, settings.MAX_TICKETS_PER_USER_PER_EVENT)

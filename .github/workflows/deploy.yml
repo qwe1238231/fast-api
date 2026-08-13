@@ -1,6 +1,6 @@
 name: deploy
 
-# Push to main → build the image, push to ECR, roll the ECS services.
+# Push to main → run the tests, build the image, migrate, roll the ECS services.
 on:
   push:
     branches: [main]
@@ -10,6 +10,13 @@ permissions:
   id-token: write
   contents: read
 
+# 部署不可以有兩份同時跑:兩次快速推送會讓兩組 migration 與兩組 update-service 交錯,
+# 最後線上跑的是哪一個 SHA 變成賽跑結果。cancel-in-progress 是 false —— 取消一個跑到
+# 一半的部署(migration 已經下去、服務還沒滾)比讓它跑完更糟。
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 env:
   AWS_REGION: ap-northeast-2
   CLUSTER: justin-test
@@ -17,7 +24,14 @@ env:
   ROLE_ARN: arn:aws:iam::992382571445:role/justin-test-github-actions
 
 jobs:
+  # 測試是部署的**第一關**,不是平行跑的另一支工作流。舊寫法是 test.yml 與 deploy.yml
+  # 各自被 push 觸發,所以「測試紅了」跟「已經部署上去了」可以同時成立 —— 而且部署
+  # 通常先完成,因為它不必裝 Rust toolchain。
+  test:
+    uses: ./.github/workflows/test.yml
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest # x86_64 runner → native build (task defs are X86_64)
     steps:
       - uses: actions/checkout@v4
@@ -32,19 +46,100 @@ jobs:
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Tag with the commit SHA (identifiable/rollback-able) AND latest (what the
-      # task defs pull). Native x86 build on the runner — no QEMU.
+      # `latest` 還是推(手動 run-task、本機 pull 會用到),但**服務不再靠它**。
+      # 服務改指向釘住 SHA 的 task def 修訂版,理由有兩個:
+      #   - 可回滾:回上一版就是 update-service 指回上一個修訂版,不必重推 image。
+      #   - 可知道現在跑的是誰:describe-services 直接看得到 SHA。靠 :latest 的話,
+      #     一個在半夜被替換掉的任務會安靜地拉到「當時的」:latest —— 那可能已經不是
+      #     當初部署的那一版,而且沒有任何紀錄顯示它換過。
       - name: Build & push image
         run: |
           docker build -t "$ECR_REPO:$GITHUB_SHA" -t "$ECR_REPO:latest" .
           docker push "$ECR_REPO:$GITHUB_SHA"
           docker push "$ECR_REPO:latest"
 
-      # force-new-deployment makes each service pull the new :latest and roll.
+      # 照抄現行定義、只換 image,再註冊成新修訂版。「照抄」是重點:祕密、環境變數、
+      # log 設定全部由 Terraform 擁有,CI 不該有第二份規格 —— 那份副本一定會漂。
+      - name: Register SHA-pinned task definitions
+        id: taskdefs
+        run: |
+          set -euo pipefail
+          for s in api consumer worker; do
+            aws ecs describe-task-definition --task-definition "$CLUSTER-$s" \
+              --query taskDefinition --output json > "td-$s.json"
+            jq --arg img "$ECR_REPO:$GITHUB_SHA" '
+              .containerDefinitions[0].image = $img
+              | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                    .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+            ' "td-$s.json" > "new-$s.json"
+            arn=$(aws ecs register-task-definition \
+              --cli-input-json "file://new-$s.json" \
+              --query 'taskDefinition.taskDefinitionArn' --output text)
+            echo "$s=$arn" >> "$GITHUB_OUTPUT"
+            echo "registered $arn"
+          done
+
+      # 網路設定直接抄 api 服務自己的 —— 不要在這裡重打 subnet / SG 清單,那會是第三份
+      # 會漂掉的規格(Terraform 一份、服務一份、CI 一份)。
+      - name: Run database migrations (one-off task; must succeed before the roll)
+        run: |
+          set -euo pipefail
+          net=$(aws ecs describe-services --cluster "$CLUSTER" --services "$CLUSTER-api" \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration' --output json)
+          subnets=$(echo "$net" | jq -r '.subnets | join(",")')
+          groups=$(echo "$net" | jq -r '.securityGroups | join(",")')
+
+          # startedBy 上限是 36 字元,"deploy-" 加上完整的 40 字 SHA 是 47 —— API 會
+          # 直接拒絕,而錯誤訊息跟遷移本身完全無關。取前 8 碼夠人辨認了。
+          task_arn=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "${{ steps.taskdefs.outputs.worker }}" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$groups],assignPublicIp=ENABLED}" \
+            --overrides '{"containerOverrides":[{"name":"worker","command":["alembic","upgrade","head"]}]}' \
+            --started-by "deploy-${GITHUB_SHA:0:8}" \
+            --query 'tasks[0].taskArn' --output text)
+          echo "migration task: $task_arn"
+
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$task_arn"
+          exit_code=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task_arn" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+
+          if [ "$exit_code" != "0" ]; then
+            echo "::error::migration failed (exit $exit_code) — services NOT rolled"
+            # 印出容器 log,否則 Actions 上只看得到一個退出碼,要開 console 才知道
+            # 是哪一句 SQL 炸了。
+            aws logs get-log-events \
+              --log-group-name "/ecs/$CLUSTER" \
+              --log-stream-name "worker/worker/${task_arn##*/}" \
+              --query 'events[].message' --output text || true
+            exit 1
+          fi
+          echo "migrations applied"
+
+      # 順序是刻意的:**先遷移、再換程式碼**。代價是 migration 必須向後相容 —— 舊程式碼
+      # 會在新 schema 上再跑幾十秒。破壞性變更(drop / rename column)要拆成兩次部署
+      # (先加、雙寫、再刪),不能靠把這兩步對調來解決:反過來的話新程式碼會在舊 schema
+      # 上跑,那個窗口裡它是壞的,而且壞的是剛部署的東西。
       - name: Roll ECS services
         run: |
-          for s in api consumer worker; do
-            aws ecs update-service --cluster "$CLUSTER" --service "$CLUSTER-$s" \
-              --force-new-deployment --region "$AWS_REGION" >/dev/null
-            echo "rolled $CLUSTER-$s"
-          done
+          set -euo pipefail
+          roll() {
+            aws ecs update-service --cluster "$CLUSTER" --service "$CLUSTER-$1" \
+              --task-definition "$2" >/dev/null
+            echo "rolled $CLUSTER-$1 → $2"
+          }
+          roll api      "${{ steps.taskdefs.outputs.api }}"
+          roll consumer "${{ steps.taskdefs.outputs.consumer }}"
+          roll worker   "${{ steps.taskdefs.outputs.worker }}"
+
+      # 沒有這一步的話,工作流在 update-service 回傳的那一刻就變綠 —— 而那只代表
+      # 「ECS 收到了指令」。新任務一路 crash-loop,CI 仍然是綠的,部署失敗只能靠使用者
+      # 告訴你。服務上有 deployment_circuit_breaker(rollback=true),所以這裡失敗的
+      # 意思是「已經自動回滾了」而不是「線上現在是壞的」—— 那是可以安心讀的訊號。
+      - name: Wait for services to stabilise
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable --cluster "$CLUSTER" \
+            --services "$CLUSTER-api" "$CLUSTER-consumer" "$CLUSTER-worker"
+          echo "all services stable on $GITHUB_SHA"

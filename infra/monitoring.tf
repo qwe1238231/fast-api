@@ -411,6 +411,20 @@ locals {
       period  = 600 # drift cron runs every 5 min; 10-min window always catches a persistent drift
       desc    = "Redis vs Postgres stock disagree — oversell / phantom sold-out risk"
     }
+    # 「有人要來看一眼」的總開關。ALERT 與 REFUND 是程式碼裡兩個刻意保留的字首,標的是
+    # 沒有任何自動修復路徑的事:
+    #   ALERT allocator bug             — 配位算出界外區間 → 使用者吃 500,是我們的 bug
+    #   ALERT dead-letter intent ...    — 死信欄位自相矛盾,座位還不回去
+    #   ALERT order N expired but ...   — 座位釋放失敗,要人工跑 rebuild_seat_runs
+    #   REFUND payment_intent ...       — 真的有錢退出去了
+    # 這些各自都很罕見,罕見到不值得一個一個做告警;但「其中任何一個發生了」是絕對
+    # 要知道的。用一條 OR 的過濾器把它們全部收進來,總比讓每一條新的 ALERT 都靜靜
+    # 躺在 log 裡等人去 grep 好。
+    needs_a_human = {
+      pattern = "?\"ALERT \" ?\"REFUND \""
+      period  = 300
+      desc    = "an ALERT/REFUND line was logged — no automatic remedy exists for these; read the log group"
+    }
   }
 }
 

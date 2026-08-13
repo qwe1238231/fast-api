@@ -1,8 +1,13 @@
 name: tests
 on:
   push:
-    branches: [main, feat/*]
+    branches: [feat/*]
   pull_request:
+  # deploy.yml 用 `uses:` 叫這支,所以 main 上的測試是**部署管線的第一關**而不是
+  # 一條平行的工作流。`main` 刻意不在上面的 push 清單裡:留著的話 main 上每次推送
+  # 會跑兩次同樣的測試,而且真正危險的是舊寫法 —— 兩支工作流各自被 push 觸發、
+  # 平行跑,於是「測試還在跑」跟「已經部署完了」可以同時成立。
+  workflow_call:
 
 jobs:
   test:

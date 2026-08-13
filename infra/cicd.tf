@@ -69,8 +69,18 @@ data "aws_iam_policy_document" "cicd" {
     actions = [
       "ecs:UpdateService", "ecs:DescribeServices",
       "ecs:RunTask", "ecs:DescribeTasks", "ecs:RegisterTaskDefinition",
+      # 讀現行的 task def 才能「照抄一份、只換 image」重新註冊(把 image 釘在
+      # commit SHA 上)。少了它,CI 只能自己重打整份定義 —— 那就是第二份 task def
+      # 規格,而它會跟 Terraform 那份慢慢漂開。
+      "ecs:DescribeTaskDefinition",
     ]
     resources = ["*"] # dev: broad; could scope to this cluster's ARNs
+  }
+  # 遷移失敗時把容器的 log 印進 CI 輸出。少了這個,一次失敗的 migration 在 Actions
+  # 上就只是一行 "exit code 1",要開 AWS console 才知道是哪一句 SQL 炸了。
+  statement {
+    actions   = ["logs:GetLogEvents"]
+    resources = ["${aws_cloudwatch_log_group.app.arn}:*"]
   }
   # RunTask/UpdateService must be allowed to PASS the task roles to the tasks
   statement {

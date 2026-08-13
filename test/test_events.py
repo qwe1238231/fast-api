@@ -371,9 +371,8 @@ async def test_queue_admission_paused_by_circuit_breaker(client, db, redis):
 
 
 @pytest.mark.asyncio
-async def test_queue_join_rate_limited(client, db, monkeypatch):
-    from app.core.config import get_settings
-    monkeypatch.setattr(get_settings(), "QUEUE_JOIN_LIMIT_PER_MINUTE", 2)
+async def test_queue_join_rate_limited(client, db, monkeypatch, rate_limiting):
+    monkeypatch.setattr(rate_limiting, "QUEUE_JOIN_LIMIT_PER_MINUTE", 2)
     event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
 
     codes = [

@@ -7,8 +7,6 @@ from stripe import StripeClient
 from fastapi.security import OAuth2PasswordBearer
 from jwt.exceptions import InvalidTokenError
 from pydantic import ValidationError
-from slowapi import Limiter
-from slowapi.util import get_remote_address
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -16,6 +14,7 @@ from app.crud.user import get_user_by_id
 from app.db.session import AsyncSessionLocal, get_db
 from app.models.user import User
 from app.schemas.token import TokenPayload
+from app.services.rate_limit import enforce
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/v1/auth/token")
 # EventSource can't send an Authorization header, so the SSE stream also reads the
@@ -33,9 +32,9 @@ def client_ip(request: Request) -> str:
     `TRUSTED_PROXY_COUNT=0`(預設)直接用 socket 對端,不看 XFF。這是安全的預設:
     設太小只是限流變嚴,設太大而前面沒有那麼多層代理就是誰都能繞過。
 
-    兩個消費者(slowapi 的 key_func、稽核事件的 actor_ip)共用這一份 —— 上一版
-    限流讀 `get_remote_address`、稽核讀 `request.client.host`,兩處各自寫死,於是
-    「要正確處理代理」這個原則只在其中一處被想起來過(而且兩處都沒做)。
+    三個消費者(每 IP 限流、稽核事件的 actor_ip、選區端點的限流 key)共用這一份 ——
+    上一版三處各自寫死(`get_remote_address` / `request.client.host` × 2),於是
+    「要正確處理代理」這個原則只在其中一處被想起來過,而且那一處也寫錯了。
     """
     trusted = get_settings().TRUSTED_PROXY_COUNT
     if trusted > 0:
@@ -45,30 +44,19 @@ def client_ip(request: Request) -> str:
             if hops:
                 # 從右邊數第 trusted 個;鏈比宣告的短就退回最左邊(仍在鏈內)。
                 return hops[max(0, len(hops) - trusted)]
-    return get_remote_address(request)
+    return request.client.host if request.client else "unknown"
 
 
-def _rate_limit_storage() -> str:
-    settings = get_settings()
-    return settings.RATE_LIMIT_STORAGE_URI or settings.REDIS_URL
+async def enforce_ip_rate_limit(
+    request: Request, redis: RedisClient, *, bucket: str, rate: str
+) -> None:
+    """每 IP 限流。`bucket` 區分不同端點,免得它們共用同一個計數器。
 
-
-# storage_uri 不能省:預設的 memory:// 是**每個 process 一份**,而 api 跑
-# `--workers 4`、ECS 又有多個 task,「5 次/分鐘」就變成 5 × process 數,重啟還會歸零。
-#
-# 逾時要自己設:`limits` 的 Redis 後端預設沒有 socket timeout,所以 Redis 卡住
-# (不是掛掉,是慢)會把每一個受限端點一起掛住 —— 而登入正是最不能掛的那條。
-# 1 秒遠大於正常的 sub-ms,又遠小於任何人願意等的時間。
-#
-# **刻意不做 in-memory fallback。** Redis 掛掉時登入本來就會失敗 —— 它會
-# `emit_event(redis, ...)` 寫稽核事件,早就硬依賴 Redis 了。加 fallback 只會多一條
-# 「限流悄悄退化成 per-process」的路徑,而 slowapi 對自己的 logger 掛了 BlackHole
-# handler,那個退化是無聲的:一個壞掉的限流器跟一個健康的長得一模一樣。
-limiter = Limiter(
-    key_func=client_ip,
-    storage_uri=_rate_limit_storage(),
-    storage_options={"socket_connect_timeout": 1, "socket_timeout": 1},
-)
+    key 的組法(bucket + client_ip)只在這裡出現一次。以前每個端點自己拼字串,而
+    那正是「同一個原則被寫錯三次」的來源 —— 這個專案在 Redis key 格式上已經栽過
+    兩次了,限流的 key 是第三次。
+    """
+    await enforce(redis, f"{bucket}:{client_ip(request)}", rate=rate)
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 

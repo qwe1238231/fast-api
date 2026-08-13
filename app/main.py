@@ -3,14 +3,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
-from slowapi import _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
 
 from app.core.config import get_settings
 from app.core.redis import create_redis_client
 from app.services.queue_events import run_subscriber
 from app.services.stripe_client import create_stripe_client
-from app.api.deps import limiter
 from app.api.v1.router import api_router
 from app.api.exception_handlers import register_exception_handlers
 
@@ -40,8 +37,6 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 register_exception_handlers(app)
 Instrumentator(
     # regex, matched with re.search -> anchor so "/" doesn't match every path

@@ -5,7 +5,9 @@ from typing import Annotated
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-from app.api.deps import CurrentAdmin, CurrentUser, DbSession, Redis, StreamUser, client_ip
+from app.api.deps import (
+    CurrentAdmin, CurrentUser, DbSession, Redis, StreamUser, enforce_ip_rate_limit,
+)
 from app.core.config import get_settings
 from app.core.exceptions import EventNotFound
 from app.core.security import create_admission_token
@@ -76,11 +78,10 @@ async def list_zones_endpoint(
     開賣前後這裡會被瘋狂刷新,而每次真實計算是「每個 zone 讀 runs+geom + 跑
     feasible_quantities」。無認證的端點更需要限流。
     """
-    await enforce_rate_limit(
-        redis,
-        f"zones:{event_id}:{client_ip(request)}",
-        limit=get_settings().ZONES_LIST_LIMIT_PER_MINUTE,
-        window_seconds=60,
+    await enforce_ip_rate_limit(
+        request, redis,
+        bucket=f"zones:{event_id}",
+        rate=f"{get_settings().ZONES_LIST_LIMIT_PER_MINUTE}/minute",
     )
     return await list_zone_availability(db, redis, event_id=event_id)
 

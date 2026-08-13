@@ -12,12 +12,13 @@ import asyncio
 import pytest
 from starlette.requests import Request
 
-from app.api.deps import client_ip, get_stream_user, limiter
+from app.api.deps import client_ip, get_stream_user
 from app.core.config import get_settings
 from app.core.security import create_access_token
 from app.db.session import get_db
 from app.main import app
 from app.services.inventory import ORDER_DEAD_LETTER_KEY
+from app.services.rate_limit import _full_key, parse_rate
 from app.worker import DEAD_LETTER_CURSOR_KEY, count_new_dead_letters
 
 
@@ -216,7 +217,7 @@ def test_a_shorter_chain_than_declared_falls_back_inside_the_chain(monkeypatch) 
 
 @pytest.mark.asyncio
 async def test_the_limiter_buckets_by_the_real_client_not_the_proxy(
-    client, monkeypatch
+    client, monkeypatch, rate_limiting
 ) -> None:
     """限流器真的**接上** `client_ip`,而且偽造的 XFF 分不到新的桶。
 
@@ -225,61 +226,59 @@ async def test_the_limiter_buckets_by_the_real_client_not_the_proxy(
     而「全站共用一個桶」這個實際後果沒有任何測試看得到。
     """
     monkeypatch.setattr(get_settings(), "TRUSTED_PROXY_COUNT", 1)
-    limiter.enabled = True
-    limiter.reset()
-    try:
-        cap = int(get_settings().REGISTER_RATE_LIMIT.split("/")[0])
+    cap, _ = parse_rate(get_settings().REGISTER_RATE_LIMIT)
 
-        async def register(n: int, xff: str) -> int:
-            r = await client.post(
-                "/v1/users/",
-                json={"username": f"ip{n}", "password": "secret123"},
-                headers={"X-Forwarded-For": xff},
-            )
-            return r.status_code
+    async def register(n: int, xff: str) -> int:
+        r = await client.post(
+            "/v1/users/",
+            json={"username": f"ip{n}", "password": "secret123"},
+            headers={"X-Forwarded-For": xff},
+        )
+        return r.status_code
 
-        # 客戶端 A(ALB 看到 5.6.7.8)把自己的桶用完。
-        for n in range(cap):
-            assert await register(n, "5.6.7.8") == 201
-        assert await register(900, "5.6.7.8") == 429
+    # 客戶端 A(ALB 看到 5.6.7.8)把自己的桶用完。
+    for n in range(cap):
+        assert await register(n, "5.6.7.8") == 201
+    assert await register(900, "5.6.7.8") == 429
 
-        # 同一個人換一個**偽造的**左邊欄位 —— ALB 附加的仍然是 5.6.7.8,所以同一個桶。
-        assert await register(901, "1.1.1.1, 5.6.7.8") == 429, "偽造 XFF 不該換到新桶"
+    # 同一個人換一個**偽造的**左邊欄位 —— ALB 附加的仍然是 5.6.7.8,所以同一個桶。
+    assert await register(901, "1.1.1.1, 5.6.7.8") == 429, "偽造 XFF 不該換到新桶"
 
-        # 真的換一台機器(ALB 看到 9.9.9.9)→ 新的桶。
-        assert await register(902, "9.9.9.9") == 201
-    finally:
-        limiter.enabled = False
+    # 真的換一台機器(ALB 看到 9.9.9.9)→ 新的桶。
+    assert await register(902, "9.9.9.9") == 201
 
 
-def test_the_limiter_does_not_count_in_process_memory() -> None:
-    """限流計數器必須在 Redis。
+@pytest.mark.asyncio
+async def test_the_counter_lives_in_redis_not_in_this_process(
+    client, redis, rate_limiting
+) -> None:
+    """限流計數器必須看得見在 Redis 裡。
 
-    slowapi 預設的 `memory://` 是每個 process 一份:api 跑 `--workers 4`、ECS 又有
-    多個 task,「5 次/分鐘」就變成 5 × process 數,而且 process 一重啟就歸零 ——
-    攻擊者只要等一次部署。
+    在 process 記憶體裡的話,api 跑 `--workers 4`、ECS 又有多個 task,「5 次/分鐘」
+    就變成 5 × process 數,而且一重啟就歸零 —— 攻擊者只要等一次部署。
+    斷言「Redis 裡真的有那把 key」而不是「儲存後端的類別名不含 memory」:前者不管
+    換成哪一套實作都成立。
     """
-    assert "memory" not in type(limiter.limiter.storage).__name__.lower()
+    await client.post(
+        "/v1/users/", json={"username": "redischeck", "password": "secret123"}
+    )
+    keys = [k for k in await redis.keys(_full_key("register:*"))]
+    assert keys, "限流計數沒有出現在 Redis —— 它一定是留在 process 記憶體裡"
 
 
 # ─ 4) 註冊:無認證 + 寫 DB + 一次 Argon2
 
 @pytest.mark.asyncio
-async def test_registration_is_rate_limited(client) -> None:
+async def test_registration_is_rate_limited(client, rate_limiting) -> None:
     """註冊是無認證端點,每次呼叫寫一列 DB 並跑一次 ~220ms 的 Argon2 —— 不擋的話
     任何人都能免費徵用 CPU 與連線池,而搶票站開賣前本來就會被註冊機器人打。"""
-    limiter.enabled = True
-    limiter.reset()
-    try:
-        cap = int(get_settings().REGISTER_RATE_LIMIT.split("/")[0])
-        codes = [
-            (await client.post(
-                "/v1/users/", json={"username": f"flood{i}", "password": "secret123"}
-            )).status_code
-            for i in range(cap + 1)
-        ]
-    finally:
-        limiter.enabled = False
+    cap, _ = parse_rate(get_settings().REGISTER_RATE_LIMIT)
+    codes = [
+        (await client.post(
+            "/v1/users/", json={"username": f"flood{i}", "password": "secret123"}
+        )).status_code
+        for i in range(cap + 1)
+    ]
     assert codes[:cap] == [201] * cap
     assert codes[-1] == 429, "超過上限之後必須被擋"
 

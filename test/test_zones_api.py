@@ -301,11 +301,9 @@ async def test_zone_list_is_cached_briefly(client, db, arena, buyer, redis) -> N
     assert next(z for z in fresh if z["name"] == "前區")["available"] == 4
 
 
-async def test_zone_list_is_rate_limited(client, arena) -> None:
+async def test_zone_list_is_rate_limited(client, arena, rate_limiting) -> None:
     """無認證端點,而且每次 cache miss 都有實質計算成本 —— 必須限流。"""
-    from app.core.config import get_settings
-
-    limit = get_settings().ZONES_LIST_LIMIT_PER_MINUTE
+    limit = rate_limiting.ZONES_LIST_LIMIT_PER_MINUTE
     event_id = arena["event_id"]
     for _ in range(limit):
         assert (await client.get(f"/v1/events/{event_id}/zones")).status_code == 200

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status ,Request, Response
 from fastapi.security import OAuth2PasswordRequestForm
 from starlette.concurrency import run_in_threadpool
 
-from app.api.deps import DbSession, client_ip, limiter, CurrentUser, Redis
+from app.api.deps import DbSession, client_ip, enforce_ip_rate_limit, CurrentUser, Redis
 from app.core.config import get_settings
 
 from app.core.security import (
@@ -14,7 +14,9 @@ from app.core.security import (
 )
 from app.crud.user import get_user_by_username
 from app.schemas.token import Token
+from app.core.exceptions import RateLimited
 from app.services.audit import emit_event
+from app.services.rate_limit import clear, hit, peek
 import secrets
 from datetime import timedelta, datetime, timezone
 from app.crud.refresh_token import (
@@ -74,8 +76,17 @@ def clear_auth_cookies(
     )
 
 
+def _login_failure_key(username: str) -> str:
+    """每帳號失敗計數的 key。
+
+    小寫化是為了不讓大小寫變化繞過(`Alice` 與 `alice` 共用一個桶)。用**送進來的
+    字串**而不是查到的 user.id 是關鍵:不存在的帳號也一樣計數,所以「被擋」這件事
+    對存在與不存在的帳號表現一致 —— 否則 429 與 401 的差異就是一個帳號列舉的預言機。
+    """
+    return f"login_fail:{username.strip().lower()[:64]}"
+
+
 @router.post("/token",response_model=Token)
-@limiter.limit(get_settings().LOGIN_RATE_LIMIT)
 async def login_for_access_token(
     request: Request,
     response: Response,
@@ -83,6 +94,29 @@ async def login_for_access_token(
     db: DbSession,
     redis: Redis,
 ) -> Token:
+    settings = get_settings()
+    # 兩層限流,擋的是兩種不同的攻擊者:
+    #   每 IP  —— 一台機器猛捶。
+    #   每帳號 —— 有殭屍網路的人:每個 IP 都在 5 次/分鐘以內,合起來仍然是每分鐘
+    #             幾千次猜測。要擋住它,計數必須掛在被攻擊的**帳號**上。
+    await enforce_ip_rate_limit(
+        request, redis, bucket="login", rate=settings.LOGIN_RATE_LIMIT
+    )
+    failure_key = _login_failure_key(form_data.username)
+    failures, retry_after = await peek(redis, failure_key)
+    if settings.RATE_LIMIT_ENABLED and failures >= settings.LOGIN_FAILURE_LIMIT:
+        # 在驗密碼**之前**擋掉。順帶把 Argon2 的 ~220ms 也省下來 —— 否則對單一帳號
+        # 狂捶本身就是一個 CPU 耗盡攻擊,而限流器卻在幫它加熱。
+        await emit_event(
+            redis,
+            event_type="auth.login_blocked",
+            actor_ip=client_ip(request),
+            payload={"username_attempted": form_data.username[:64],
+                     "failures": failures},
+            success=False,
+        )
+        raise RateLimited(retry_after=retry_after or settings.LOGIN_FAILURE_WINDOW_SECONDS)
+
     user = await get_user_by_username(db, username=form_data.username)
     if user is None:
         # argon2 is CPU-bound; offload to a thread so it doesn't block the event
@@ -94,6 +128,10 @@ async def login_for_access_token(
             verify_password, form_data.password, user.hashed_password
         )
     if user is None or not password_valid or not user.is_active:
+        await hit(
+            redis, failure_key,
+            window_seconds=settings.LOGIN_FAILURE_WINDOW_SECONDS,
+        )
         await emit_event(
             redis,
             event_type="auth.login_failure",
@@ -109,7 +147,9 @@ async def login_for_access_token(
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    settings = get_settings()
+    # 密碼對了就把失敗計數清掉:否則一個先打錯幾次、最後打對的正常使用者,會帶著
+    # 一個逼近上限的計數器走,下次再錯一兩次就被鎖 15 分鐘。
+    await clear(redis, failure_key)
     sliding = timedelta(days=settings.REFRESH_TOKEN_SLIDING_DAYS)
     absolute = timedelta(days=settings.REFRESH_TOKEN_ABSOLUTE_EXPIRE_DAYS)
 
@@ -152,12 +192,15 @@ async def login_for_access_token(
     )
 
 @router.post("/refresh",response_model=Token)
-@limiter.limit(get_settings().REFRESH_RATE_LIMIT)
 async def refresh_access_token(
     request: Request,
     response: Response,
     db: DbSession,
+    redis: Redis,
 ) -> Token:
+    await enforce_ip_rate_limit(
+        request, redis, bucket="refresh", rate=get_settings().REFRESH_RATE_LIMIT
+    )
     refresh_plain = request.cookies.get("refresh_token")
     csrf_cookie = request.cookies.get("csrf_token")
     csrf_header = request.headers.get("x-csrf-token")

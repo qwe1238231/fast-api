@@ -28,7 +28,7 @@ from app.core.redis import create_redis_client
 from app.db.base import Base
 from app.db.session import engine
 from app.db.session import AsyncSessionLocal
-from app.api.deps import limiter
+from app.core.config import get_settings
 
 from sqlalchemy import text
 
@@ -144,9 +144,30 @@ async def redis():
 
 @pytest.fixture(autouse=True)
 def _disable_rate_limit():
-    limiter.enabled = False
+    """大多數測試會重複登入/註冊,開著限流的話它們會為了無關的理由變紅。
+
+    要驗限流本身的測試改 request `rate_limiting` fixture(在下面)—— 不要在測試裡
+    自己翻旗標,那就是同一個決定被寫在五個地方的開端。
+
+    直接改 Settings 實例而不是設環境變數:`get_settings` 是 lru_cache 的,環境變數
+    在 import 之後才改沒有效果。存原值再還原,而不是無條件設回 True —— 否則跟
+    `rate_limiting` 疊在一起時會把狀態留給下一個測試。
+    """
+    settings = get_settings()
+    original = settings.RATE_LIMIT_ENABLED
+    settings.RATE_LIMIT_ENABLED = False
     yield
-    limiter.enabled = True
+    settings.RATE_LIMIT_ENABLED = original
+
+
+@pytest.fixture
+def rate_limiting():
+    """把限流打開(蓋過 autouse 的 `_disable_rate_limit`)。回傳 settings 讓測試
+    可以順手調上限。"""
+    settings = get_settings()
+    settings.RATE_LIMIT_ENABLED = True
+    yield settings
+    settings.RATE_LIMIT_ENABLED = False
 
 @pytest_asyncio.fixture
 async def published_event(db, redis):

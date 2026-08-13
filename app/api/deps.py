@@ -55,7 +55,20 @@ def _rate_limit_storage() -> str:
 
 # storage_uri 不能省:預設的 memory:// 是**每個 process 一份**,而 api 跑
 # `--workers 4`、ECS 又有多個 task,「5 次/分鐘」就變成 5 × process 數,重啟還會歸零。
-limiter = Limiter(key_func=client_ip, storage_uri=_rate_limit_storage())
+#
+# 逾時要自己設:`limits` 的 Redis 後端預設沒有 socket timeout,所以 Redis 卡住
+# (不是掛掉,是慢)會把每一個受限端點一起掛住 —— 而登入正是最不能掛的那條。
+# 1 秒遠大於正常的 sub-ms,又遠小於任何人願意等的時間。
+#
+# **刻意不做 in-memory fallback。** Redis 掛掉時登入本來就會失敗 —— 它會
+# `emit_event(redis, ...)` 寫稽核事件,早就硬依賴 Redis 了。加 fallback 只會多一條
+# 「限流悄悄退化成 per-process」的路徑,而 slowapi 對自己的 logger 掛了 BlackHole
+# handler,那個退化是無聲的:一個壞掉的限流器跟一個健康的長得一模一樣。
+limiter = Limiter(
+    key_func=client_ip,
+    storage_uri=_rate_limit_storage(),
+    storage_options={"socket_connect_timeout": 1, "socket_timeout": 1},
+)
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 

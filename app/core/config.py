@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     STRIPE_WEBHOOK_SECRET: str = ""
     """Stripe webhook 的簽章密鑰。**非 DEBUG 下不得為空** —— 見 _guard_webhook_secret。"""
     LOGIN_RATE_LIMIT: str = "5/minute"
+    REFRESH_RATE_LIMIT: str = "30/minute"
     REGISTER_RATE_LIMIT: str = "10/hour"
     """註冊的每 IP 上限。註冊是「未認證 + 寫 DB + 跑一次 Argon2」—— 三個特徵湊在
     一起就是最好用的放大攻擊面,而且黃牛本來就要大量帳號。放寬一點(10/小時而不是

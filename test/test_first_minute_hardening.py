@@ -214,6 +214,44 @@ def test_a_shorter_chain_than_declared_falls_back_inside_the_chain(monkeypatch) 
     assert client_ip(_request({"X-Forwarded-For": "5.6.7.8"})) == "5.6.7.8"
 
 
+@pytest.mark.asyncio
+async def test_the_limiter_buckets_by_the_real_client_not_the_proxy(
+    client, monkeypatch
+) -> None:
+    """限流器真的**接上** `client_ip`,而且偽造的 XFF 分不到新的桶。
+
+    上面那幾條測的是 `client_ip` 自己算得對不對;這條測的是它有沒有被接到限流器上。
+    少了這條,把 `key_func` 改回 `get_remote_address` 只會讓一條測試變紅(儲存那條),
+    而「全站共用一個桶」這個實際後果沒有任何測試看得到。
+    """
+    monkeypatch.setattr(get_settings(), "TRUSTED_PROXY_COUNT", 1)
+    limiter.enabled = True
+    limiter.reset()
+    try:
+        cap = int(get_settings().REGISTER_RATE_LIMIT.split("/")[0])
+
+        async def register(n: int, xff: str) -> int:
+            r = await client.post(
+                "/v1/users/",
+                json={"username": f"ip{n}", "password": "secret123"},
+                headers={"X-Forwarded-For": xff},
+            )
+            return r.status_code
+
+        # 客戶端 A(ALB 看到 5.6.7.8)把自己的桶用完。
+        for n in range(cap):
+            assert await register(n, "5.6.7.8") == 201
+        assert await register(900, "5.6.7.8") == 429
+
+        # 同一個人換一個**偽造的**左邊欄位 —— ALB 附加的仍然是 5.6.7.8,所以同一個桶。
+        assert await register(901, "1.1.1.1, 5.6.7.8") == 429, "偽造 XFF 不該換到新桶"
+
+        # 真的換一台機器(ALB 看到 9.9.9.9)→ 新的桶。
+        assert await register(902, "9.9.9.9") == 201
+    finally:
+        limiter.enabled = False
+
+
 def test_the_limiter_does_not_count_in_process_memory() -> None:
     """限流計數器必須在 Redis。
 

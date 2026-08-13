@@ -19,6 +19,16 @@ from app.models.order import Order, OrderStatus
 from app.services.idempotency import _key as _claim_key
 from app.services.queue_events import publish_event_poke
 
+#: 訂單意圖的主串流。
+#:
+#: **這一條刻意沒有 MAXLEN,不要「補上」。** audit 與 dead-letter 都有上限,所以下一個
+#: 讀到這裡的人很自然會覺得這裡漏了 —— 但這兩者的內容意義完全不同:
+#:   - audit / dead-letter 裡的東西已經定案了,修剪掉最舊的只是丟掉歷史。
+#:   - 這條裡的每一筆都是**已經扣過庫存、還沒寫進 DB** 的訂單。修剪 = 那個人付了
+#:     admission、佔了位子、拿到 202,然後訂單人間蒸發,而庫存永遠回不來。
+#: 它的有界性來自另一端:消費者落帳之後原子地 XACK + XDEL(worker.py 的 _ack_and_remove),
+#: 所以正常情況下長度就是 backlog。消費者掛掉時它會漲 —— 那正是 ORDER_BACKLOG_WARN
+#: 與斷路器要偵測的事,答案是把消費者修好,不是把訂單丟掉。
 ORDER_STREAM_KEY="orders:stream"
 ORDER_DEAD_LETTER_KEY="orders:stream:dead"
 

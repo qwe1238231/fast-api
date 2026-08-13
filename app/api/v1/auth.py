@@ -152,7 +152,7 @@ async def login_for_access_token(
     )
 
 @router.post("/refresh",response_model=Token)
-@limiter.limit("30/minute")
+@limiter.limit(get_settings().REFRESH_RATE_LIMIT)
 async def refresh_access_token(
     request: Request,
     response: Response,

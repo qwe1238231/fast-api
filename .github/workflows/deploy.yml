@@ -146,4 +146,32 @@ jobs:
           set -euo pipefail
           aws ecs wait services-stable --cluster "$CLUSTER" \
             --services "$CLUSTER-api" "$CLUSTER-consumer" "$CLUSTER-worker"
-          echo "all services stable on $GITHUB_SHA"
+          echo "waiter says stable"
+
+          # **waiter 回 0 不代表部署成功。** 它的條件是「只有一個 deployment 且
+          # running == desired」—— 而斷路器**回滾成功之後服務也滿足這個條件**,只是
+          # 滿足在舊版本上。
+          #
+          # 2026-08-14 實測(ap-northeast-2, desiredCount=1):壞版本 15:43:00 部署、
+          # 斷路器 15:52:29 跳、回滾 15:53:29 完成,而 waiter 的 600 秒上限在 15:53:00
+          # —— 只差 29 秒它就會回 0,CI 就會在一次失敗的部署上變綠。desiredCount 調大
+          # 之後失敗平行累積、回滾更快,那 29 秒會變成負的。
+          #
+          # 也就是說「waiter 抓得到」這件事建立在「復原比它慢」上面 —— 那是反過來的。
+          # 所以這裡明確確認線上跑的就是我們部署的那一版,不靠時序。
+          fail=0
+          confirm() {
+            live=$(aws ecs describe-services --cluster "$CLUSTER" --services "$CLUSTER-$1" \
+              --query 'services[0].taskDefinition' --output text)
+            if [ "$live" != "$2" ]; then
+              echo "::error::$CLUSTER-$1 is running ${live##*/} but we deployed ${2##*/} — it rolled back"
+              fail=1
+            else
+              echo "$CLUSTER-$1 confirmed on ${2##*/}"
+            fi
+          }
+          confirm api      "${{ steps.taskdefs.outputs.api }}"
+          confirm consumer "${{ steps.taskdefs.outputs.consumer }}"
+          confirm worker   "${{ steps.taskdefs.outputs.worker }}"
+          [ "$fail" = "0" ] || exit 1
+          echo "all services stable AND running $GITHUB_SHA"

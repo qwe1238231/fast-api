@@ -117,6 +117,30 @@ def test_the_deploy_waits_for_the_services_to_stabilise(deploy) -> None:
     assert _step_index(deploy, "stabilise") > _step_index(deploy, "Roll ECS")
 
 
+def test_the_deploy_confirms_the_new_version_is_actually_live(deploy) -> None:
+    """光等穩定不夠 —— 要確認線上跑的就是我們部署的那一版。
+
+    `wait services-stable` 的條件是「只有一個 deployment 且 running == desired」,
+    而斷路器**回滾成功之後服務也滿足這個條件**,只是滿足在舊版本上。
+
+    2026-08-14 在 ap-northeast-2 實測(desiredCount=1):部署壞版本 15:43:00、斷路器
+    15:52:29 跳、回滾 15:53:29 完成,而 waiter 的 600 秒上限在 15:53:00 —— 那一輪
+    waiter 回了 255(CI 紅),但只差 **29 秒**它就會回 0。desiredCount 調大之後失敗
+    平行累積、回滾更快,那 29 秒就變成負的。
+
+    所以這條測試守的是「不要把安全性建立在復原比 waiter 慢上面」。
+    """
+    script = _steps(deploy)[_step_index(deploy, "stabilise")]["run"]
+    assert "describe-services" in script and "taskDefinition" in script, (
+        "wait 之後必須讀回線上的 task definition"
+    )
+    for service in ("api", "consumer", "worker"):
+        assert f"steps.taskdefs.outputs.{service}" in script, (
+            f"{service} 沒有跟部署的 ARN 比對"
+        )
+    assert "exit 1" in script, "比對不符必須讓這一步失敗"
+
+
 def test_a_failed_rollout_rolls_itself_back() -> None:
     """`wait services-stable` 逾時要能被安心解讀成「已經回滾了」而不是「線上是壞的」。
     那要靠服務上的 deployment_circuit_breaker,不是 CI 腳本 —— 放在 Terraform 才會

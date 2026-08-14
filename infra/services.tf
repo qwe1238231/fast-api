@@ -63,7 +63,9 @@ resource "aws_ecs_service" "consumer" {
   # 的話,下一次 terraform apply 會把服務打回 TF 管的那一版(image 是 :latest)——
   # 也就是把剛部署的東西默默換掉,而 plan 上只會顯示一行 task_definition 變更。
   lifecycle {
-    ignore_changes = [task_definition]
+    # desired_count 由 autoscaling.tf 的 appautoscaling target 管。不忽略的話,下一次
+    # terraform apply 會把擴出去的實例數打回 1 —— 而 plan 上只有一行 desired_count。
+    ignore_changes = [task_definition, desired_count]
   }
 
   # 部署自己會回滾。少了它,新版本一直起不來時 ECS 會永遠重試,服務停在「舊的還在跑

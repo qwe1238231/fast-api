@@ -154,8 +154,16 @@ def test_a_failed_rollout_rolls_itself_back() -> None:
 def test_terraform_does_not_undo_the_deploy() -> None:
     """CI 會把服務指向新修訂版;不忽略這個欄位的話,下一次 terraform apply 會把它
     打回 TF 管的那一版(image 是 :latest)—— 也就是默默換掉剛部署的東西,而 plan
-    上只顯示一行 task_definition 變更。"""
-    assert len(re.findall(r"ignore_changes\s*=\s*\[task_definition\]", SERVICES_TF)) == 3
+    上只顯示一行 task_definition 變更。
+
+    比對「清單裡有 task_definition」而不是「清單恰好等於 [task_definition]」——
+    consumer 的清單還有 desired_count(交給 autoscaling 了),寫死整個清單會讓這條
+    測試為了一個無關的正確改動而變紅。
+    """
+    ignored = re.findall(r"ignore_changes\s*=\s*\[([^\]]+)\]", SERVICES_TF)
+    assert len(ignored) == 3, f"三個服務都要有 lifecycle,實際 {len(ignored)}"
+    for fields in ignored:
+        assert "task_definition" in fields
 
 
 # ─ expand/contract:migration 必須能跟舊程式碼並存
@@ -266,6 +274,93 @@ def test_the_grandfather_list_does_not_rot() -> None:
         assert upgrade is not None and _breaking_operations(upgrade), (
             f"{revision} 已經沒有破壞性操作 —— 從豁免清單移除,否則它會遮住未來的改動"
         )
+
+
+# ─ consumer 自動擴容:能擴的只有它,而上限由連線預算決定
+
+AUTOSCALING_TF = (ROOT / "infra" / "autoscaling.tf").read_text()
+TASKDEFS_TF = (ROOT / "infra" / "taskdefs.tf").read_text()
+
+
+def test_only_the_consumer_autoscales() -> None:
+    """**worker 絕對不能有 autoscaling target。**
+
+    它跑 ARQ 的 cron。兩個實例會讓每一條定時任務重複觸發 —— 過期掃描會把同一個座位
+    釋放兩次,而那就是超賣。services.tf 已經用 max 100% / min 0% 把它鎖成跨部署的單例,
+    這條測試守的是「沒有人為了對稱而順手給它也加一個 target」。
+    """
+    targets = re.findall(r'resource\s+"aws_appautoscaling_target"\s+"(\w+)"', AUTOSCALING_TF)
+    assert targets == ["consumer"], f"只有 consumer 該擴,實際有:{targets}"
+
+
+def test_the_consumer_scales_on_the_queue_depth_not_cpu() -> None:
+    """訊號必須是佇列深度。
+
+    consumer 大部分時間阻塞在 XREADGROUP 上,落後的時候 CPU 一樣不高 —— 用
+    CPUUtilization 當訊號會**永遠不觸發**,而那個設定看起來完全合理。
+    """
+    assert "order_stream_backlog" in AUTOSCALING_TF
+    scaling_alarms = re.findall(
+        r'resource\s+"aws_cloudwatch_metric_alarm"\s+"consumer_backlog_\w+"\s*\{(.*?)\n\}',
+        AUTOSCALING_TF, re.S,
+    )
+    assert len(scaling_alarms) == 2, "要有擴出去與縮回去兩個告警"
+    for body in scaling_alarms:
+        assert "CPUUtilization" not in body
+        assert 'metric_name = "order_stream_backlog"' in body
+
+
+def test_scaling_in_is_slower_than_scaling_out() -> None:
+    """縮回去必須比擴出去慢。
+
+    擴錯的代價是幾分錢;縮錯的代價是在搶票尖峰中間把消費者拿掉,而被縮掉的那個實例
+    正在處理的 entry 要等 reclaim 才會被接手 —— 那是分鐘級的延遲。
+    """
+    out = re.search(r'"consumer_out"\s*\{(.*?)\n\}\n\nresource', AUTOSCALING_TF, re.S)
+    in_ = re.search(r'"consumer_in"\s*\{(.*?)\n\}\s*\Z', AUTOSCALING_TF, re.S)
+    assert out and in_
+    out_cooldown = int(re.search(r"cooldown\s*=\s*(\d+)", out.group(1)).group(1))
+    in_cooldown = int(re.search(r"cooldown\s*=\s*(\d+)", in_.group(1)).group(1))
+    assert in_cooldown > out_cooldown, f"縮 {in_cooldown}s 不該快於擴 {out_cooldown}s"
+
+    low = re.search(r'"consumer_backlog_low"\s*\{(.*?)\n\}', AUTOSCALING_TF, re.S).group(1)
+    high = re.search(r'"consumer_backlog_high"\s*\{(.*?)\n\}', AUTOSCALING_TF, re.S).group(1)
+    low_periods = int(re.search(r"evaluation_periods\s*=\s*(\d+)", low).group(1))
+    high_periods = int(re.search(r"evaluation_periods\s*=\s*(\d+)", high).group(1))
+    assert low_periods > high_periods, "縮回去要看更久才確定真的沒事了"
+
+
+def test_terraform_does_not_undo_the_autoscaling() -> None:
+    """desired_count 交給 autoscaling 之後 Terraform 不能再管它 —— 否則下一次 apply
+    會把擴出去的實例數打回 1,而 plan 上只有一行 desired_count。跟 task_definition
+    是同一個坑,這裡是它的第二個實例。"""
+    consumer_block = SERVICES_TF.split('resource "aws_ecs_service" "consumer" {')[1]
+    consumer_block = consumer_block.split('resource "aws_ecs_service"')[0]
+    assert re.search(r"ignore_changes\s*=\s*\[task_definition,\s*desired_count\]", consumer_block)
+
+
+def test_the_scaling_ceiling_respects_the_connection_budget() -> None:
+    """擴容上限乘上每個實例的連線池,不能超過 RDS 的 max_connections。
+
+    這條算術是**唯一**擋住「把 max_capacity 調大就好」的東西。db.t4g.micro 只有約
+    112 條連線;把它用光的症狀是「全站 500」,而那看起來跟 consumer 完全無關 ——
+    沒有人會想到去查一個擴容設定。
+    """
+    max_capacity = int(re.search(r"max_capacity\s*=\s*(\d+)", AUTOSCALING_TF).group(1))
+    pool = int(re.search(r'name = "DB_POOL_SIZE", value = "(\d+)"', TASKDEFS_TF).group(1))
+    overflow = int(re.search(r'name = "DB_MAX_OVERFLOW", value = "(\d+)"', TASKDEFS_TF).group(1))
+
+    consumer_peak = max_capacity * (pool + overflow)
+    api_peak = 2 * 15      # 部署期間 max 200% → 兩個 task,各 5 + 10
+    worker_peak = 15       # 單例
+    migration_peak = 15    # 部署期間的 one-off task
+    budget = 112           # db.t4g.micro: LEAST(DBInstanceClassMemory/9531392, 5000)
+
+    total = consumer_peak + api_peak + worker_peak + migration_peak
+    assert total <= budget - 10, (
+        f"最壞情況要 {total} 條連線,而 db.t4g.micro 只有 ~{budget} —— "
+        f"調高 max_capacity 之前要先縮某個 pool 或換大一號的 RDS"
+    )
 
 
 # ─ 告警接線:程式碼印的字串必須真的被過濾器接到

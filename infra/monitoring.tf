@@ -411,6 +411,14 @@ locals {
       period  = 600 # drift cron runs every 5 min; 10-min window always catches a persistent drift
       desc    = "Redis vs Postgres stock disagree — oversell / phantom sold-out risk"
     }
+    # 限購額度的漂移**比庫存漂移更難發現**:超賣會撞到總量、等候室的 sold_out 會叫;
+    # 超買不會撞到任何東西 —— 那個人就是多買了幾張,而所有計數器都自洽。這條 log
+    # 是唯一會看到它的地方,所以它必須有自己的告警,不能只靠 needs_a_human 那條總開關。
+    quota_drift = {
+      pattern = "\"QUOTA DRIFT event\""
+      period  = 600
+      desc    = "per-user purchase quotas in Redis disagree with Postgres — someone can exceed the cap, and nothing else will notice"
+    }
     # 「有人要來看一眼」的總開關。ALERT 與 REFUND 是程式碼裡兩個刻意保留的字首,標的是
     # 沒有任何自動修復路徑的事:
     #   ALERT allocator bug             — 配位算出界外區間 → 使用者吃 500,是我們的 bug

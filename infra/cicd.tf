@@ -82,6 +82,12 @@ data "aws_iam_policy_document" "cicd" {
     actions   = ["logs:GetLogEvents"]
     resources = ["${aws_cloudwatch_log_group.app.arn}:*"]
   }
+  # 部署後的煙霧測試要先問出 ALB 的 DNS 名稱才打得到 /health/deps。
+  # DescribeLoadBalancers 不支援資源層級的授權(只能 "*"),但它是純唯讀。
+  statement {
+    actions   = ["elasticloadbalancing:DescribeLoadBalancers"]
+    resources = ["*"]
+  }
   # RunTask/UpdateService must be allowed to PASS the task roles to the tasks
   statement {
     actions   = ["iam:PassRole"]

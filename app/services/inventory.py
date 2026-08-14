@@ -270,7 +270,66 @@ async def reconcile_inventory(
 
     remaining = total_seats - sold
     await redis.set(_key(event_id), remaining)
+    # 限購計數器也要一起重建。以前只重建 `available`,於是 Redis 遺失之後**每個人的
+    # 限購額度都歸零** —— 已經買滿 4 張的人可以再買 4 張,而庫存看起來是對的(它剛被
+    # 重建過),所以沒有任何訊號會亮。這比庫存漂移更難發現:超賣會撞到總量,超買不會。
+    #
+    # 兩者必須從**同一次** DB 讀出來的事實推導,而且共用同一道 backlog 守衛 —— 不然
+    # 就會出現「庫存按新事實重建、額度按舊事實」這種內部不一致。
+    await _rebuild_purchase_quotas(db, redis, event_id=event_id, held=held)
     return remaining
+
+
+async def _rebuild_purchase_quotas(
+        db: AsyncSession,
+        redis: Redis,
+        *,
+        event_id: int,
+        held: tuple[OrderStatus, ...],
+) -> int:
+    """把 `event:{e}:purchased` 覆寫成 Postgres 的事實。回傳有持有記錄的人數。
+
+    用 DEL + HSET 而不是逐欄位修正:目標是「讓 Redis 等於 DB」,而多出來的欄位(某個
+    人的訂單全被取消了,但退額度那一步沒跑到)只有整體覆寫才清得掉。逐欄位比對會把
+    那些幽靈欄位永久留下,而它們的效果正是「那個人再也買不了這場」。
+    """
+    rows = (
+        await db.execute(
+            select(Order.user_id, func.sum(Order.quantity))
+            .where(Order.event_id == event_id, Order.status.in_(held))
+            .group_by(Order.user_id)
+        )
+    ).all()
+    key = _purchased_key(event_id)
+    async with redis.pipeline(transaction=True) as pipe:
+        pipe.delete(key)
+        if rows:
+            pipe.hset(key, mapping={str(uid): int(qty) for uid, qty in rows})
+        await pipe.execute()
+    return len(rows)
+
+
+async def compute_expected_quotas(
+        db: AsyncSession,
+        *,
+        event_id: int,
+) -> dict[str, int]:
+    """從 Postgres 算出『每個人應該持有幾張』—— 不碰 Redis,純讀。給漂移偵測用。"""
+    held = (OrderStatus.PENDING, OrderStatus.PAID, OrderStatus.CONFIRMED)
+    rows = (
+        await db.execute(
+            select(Order.user_id, func.sum(Order.quantity))
+            .where(Order.event_id == event_id, Order.status.in_(held))
+            .group_by(Order.user_id)
+        )
+    ).all()
+    return {str(uid): int(qty) for uid, qty in rows}
+
+
+async def read_purchase_quotas(redis: Redis, *, event_id: int) -> dict[str, int]:
+    """讀出 Redis 裡的限購持有量。"""
+    raw = await redis.hgetall(_purchased_key(event_id))
+    return {k: int(v) for k, v in raw.items()}
 
 async def compute_expected_available(
         db: AsyncSession,

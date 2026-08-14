@@ -20,6 +20,15 @@ locals {
     value = "1"
   }
 
+  # consumer 是**序列**處理的(run_order_consumer_loop → _consume_batch 一個 for 迴圈,
+  # 一次一筆),所以它同時只用到一條 DB 連線。給它跟 api 一樣的 5+10 池子純粹是浪費
+  # 連線預算 —— 而連線預算正是 autoscaling.tf 裡 max_capacity 的限制因素。縮成 2+3
+  # 讓擴容上限從 3 個實例變成 6 個。
+  consumer_pool_env = [
+    { name = "DB_POOL_SIZE", value = "2" },
+    { name = "DB_MAX_OVERFLOW", value = "3" },
+  ]
+
   # Sensitive env: pull each key out of the ONE JSON secret. The `:KEY::` suffix
   # selects a json field (the two trailing colons = default version-stage/id).
   # ECS (via the execution role) reads these at task start and injects them as
@@ -94,7 +103,7 @@ resource "aws_ecs_task_definition" "consumer" {
     image            = local.image
     essential        = true
     command          = ["python", "-m", "app.order_consumer"] # override CMD; no port
-    environment      = [local.redis_env]
+    environment      = concat([local.redis_env], local.consumer_pool_env)
     secrets          = local.app_secrets
     logConfiguration = { logDriver = "awslogs", options = local.log_options.consumer }
   }])

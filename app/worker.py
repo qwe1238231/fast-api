@@ -27,7 +27,8 @@ from app.models.audit_log import AuditLog
 from app.services.audit import AUDIT_STREAM_KEY
 from app.models.event import Event, EventStatus
 from app.services.inventory import (
-    compute_expected_available, get_available, release,
+    compute_expected_available, compute_expected_quotas, get_available,
+    read_purchase_quotas, release,
     ORDER_STREAM_KEY, ORDER_DEAD_LETTER_KEY, queue_depth,
     _key as _event_available_key, _purchased_key,
     ORDER_DEAD_LETTER_MAX_LEN,
@@ -592,6 +593,31 @@ async def detect_inventory_drift(ctx: dict) -> list[dict]:
             if expected != actual:
                 drifts.append({"event_id":event_id, "expected": expected, "actual":actual})
                 print(f"INVENTORY DRIFT event={event_id} redis={actual} expected={expected}")
+
+            # 限購額度也要對帳。它的漂移**比庫存漂移更難發現**:超賣會撞到總量、
+            # 等候室會叫;超買不會撞到任何東西 —— 那個人就是多買了幾張,而所有計數器
+            # 都自洽。所以這裡是唯一會看到它的地方。
+            #
+            # 只記「誰對不上」而不是整份 hash:一個熱門場次有幾萬個買家,把整份倒進
+            # log 只會讓真正的訊號被淹掉。
+            expected_quotas = await compute_expected_quotas(db, event_id=event_id)
+            actual_quotas = await read_purchase_quotas(redis, event_id=event_id)
+            mismatched = {
+                user_id: (actual_quotas.get(user_id, 0), expected_quotas.get(user_id, 0))
+                for user_id in expected_quotas.keys() | actual_quotas.keys()
+                if actual_quotas.get(user_id, 0) != expected_quotas.get(user_id, 0)
+            }
+            if mismatched:
+                drifts.append({
+                    "kind": "quota", "event_id": event_id,
+                    "users": len(mismatched),
+                    # 只舉幾個例子,足夠讓人去查。
+                    "sample": dict(list(mismatched.items())[:5]),
+                })
+                print(
+                    f"QUOTA DRIFT event={event_id} users={len(mismatched)} "
+                    f"sample={dict(list(mismatched.items())[:5])} (redis, expected)"
+                )
 
     return drifts
         

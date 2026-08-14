@@ -175,3 +175,24 @@ jobs:
           confirm worker   "${{ steps.taskdefs.outputs.worker }}"
           [ "$fail" = "0" ] || exit 1
           echo "all services stable AND running $GITHUB_SHA"
+
+      # ALB 的健康檢查是**淺的**(只證明 process 服務得了 HTTP,理由見 app/main.py 的
+      # health())。所以「跑起來了但連不到 DB / Redis」在這裡還看不出來 —— 靠這一步。
+      #
+      # 放在最後而不是拿去當 ALB 的檢查路徑,是因為 ALB 的檢查會驅動任務替換:資料庫
+      # 一抖就殺掉全部任務,只會讓恢復更慢。部署後跑一次是剛好的位置 —— 這時候「新版本
+      # 連不到依賴」還是我們自己造成的,而且回滾是正確的反應。
+      - name: Smoke-test the dependencies through the ALB
+        run: |
+          set -euo pipefail
+          dns=$(aws elbv2 describe-load-balancers --names "$CLUSTER-alb" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          for attempt in $(seq 1 10); do
+            body=$(curl -sS --max-time 10 -w '\n%{http_code}' "http://$dns/health/deps" || echo $'\n000')
+            code=$(echo "$body" | tail -1)
+            echo "attempt $attempt → $code $(echo "$body" | head -n -1)"
+            [ "$code" = "200" ] && exit 0
+            sleep 15
+          done
+          echo "::error::/health/deps never returned 200 — the new version is up but cannot reach its dependencies"
+          exit 1

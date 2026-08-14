@@ -10,3 +10,9 @@ stripe_secret_key     = "your-STRIPE_SECRET_KEY"
 # Stripe Dashboard → Developers → Webhooks → your endpoint → "Signing secret".
 # NOT the API key. Without it the app refuses to boot.
 stripe_webhook_secret = "whsec_your-STRIPE_WEBHOOK_SECRET"
+
+# order-consumer 的佇列深度自動擴容。預設 false —— 打開之前執行 terraform 的身分要有
+# application-autoscaling 的 ListTagsForResource / TagResource / UntagResource
+# (AmazonECS_FullAccess **不含**這三條;少了它們 apply 會 AccessDenied,而 validate
+# 與 plan 都是綠的)。理由與完整說明見 variables.tf。
+enable_consumer_autoscaling = false

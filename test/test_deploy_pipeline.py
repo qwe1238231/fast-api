@@ -293,6 +293,35 @@ def test_only_the_consumer_autoscales() -> None:
     assert targets == ["consumer"], f"只有 consumer 該擴,實際有:{targets}"
 
 
+def test_autoscaling_is_gated_so_a_plain_apply_still_works() -> None:
+    """自動擴容必須是**預設關閉的開關**,而且五個資源都吃同一個開關。
+
+    2026-08-14 實測發現的:`terraform validate` 與 `plan` 都是綠的,`apply` 才炸 ——
+    provider 的 default_tags 讓 RegisterScalableTarget 帶 Tags,而那需要
+    `application-autoscaling:TagResource`;拿掉 tag 之後 provider 讀回狀態時還是會
+    ListTagsForResource,同樣被拒。`AmazonECS_FullAccess` 不含這幾個 tag 動作。
+
+    沒有這個開關的話,任何人的 apply 都會在這裡失敗,而錯誤訊息(AccessDenied on
+    TagResource)跟「自動擴容」看起來毫無關係 —— 那是一顆地雷。開關讓「還沒打開」
+    是一個明確的狀態。
+    """
+    variables_tf = (ROOT / "infra" / "variables.tf").read_text()
+    flag = re.search(
+        r'variable\s+"enable_consumer_autoscaling"\s*\{(.*?)\n\}', variables_tf, re.S
+    )
+    assert flag, "找不到 enable_consumer_autoscaling 開關"
+    assert re.search(r"default\s*=\s*false", flag.group(1)), "必須預設關閉"
+    # 缺的權限要寫在設定檔裡,不是只留在某次對話的記憶裡。
+    for action in ("ListTagsForResource", "TagResource", "UntagResource"):
+        assert action in variables_tf, f"缺的 IAM 權限 {action} 沒有寫下來"
+
+    gated = len(re.findall(r"count\s*=\s*var\.enable_consumer_autoscaling", AUTOSCALING_TF))
+    declared = len(re.findall(r'^resource\s+"', AUTOSCALING_TF, re.M))
+    assert gated == declared == 5, (
+        f"{declared} 個資源但只有 {gated} 個吃開關 —— 漏掉的那個會讓 apply 照樣炸"
+    )
+
+
 def test_the_consumer_scales_on_the_queue_depth_not_cpu() -> None:
     """訊號必須是佇列深度。
 

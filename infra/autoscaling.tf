@@ -18,6 +18,12 @@
 # 擴出去的實例數打回 1(而 plan 上只有一行 desired_count 變更)。跟 task_definition
 # 同一個道理。
 resource "aws_appautoscaling_target" "consumer" {
+  count = var.enable_consumer_autoscaling ? 1 : 0
+
+  # 不帶 default_tags 的 provider。這**減少**了需要的權限(不必 TagResource),但不夠 ——
+  # provider 讀回狀態時仍會 ListTagsForResource。見 variables.tf 那個開關的說明。
+  provider = aws.untagged
+
   service_namespace  = "ecs"
   resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.consumer.name}"
   scalable_dimension = "ecs:service:DesiredCount"
@@ -32,12 +38,20 @@ resource "aws_appautoscaling_target" "consumer" {
   #   migration one-off task(只在部署期間)→ 15
   #   最壞情況 30 + 15 + 30 + 15 = 90,留 22 給 superuser 與監控連線。
   #
+  # 這 90 是**上界**不是預測值。2026-08-14 實測(api 1 + consumer 3 + worker 1 個任務、
+  # 無負載):RDS 的 DatabaseConnections = **4**。SQLAlchemy 的 QueuePool 是懶建立的,
+  # pool_size 只是「閒置時最多保留幾條」而不是預先配置。所以閒置基線極低,而峰值
+  # **這次沒有驗到**(要壓測才會逼出來)。用上界當容量天花板是對的,但別把 90 當成
+  # 「一定會用到 90」。
+  #
   # 要調高這個數字,必須先做一件事:縮某個 pool 或換大一號的 RDS。直接加會在下一次
   # 搶票尖峰把資料庫的連線用光 —— 而那個症狀是「全站 500」,看起來跟 consumer 無關。
   max_capacity = 6
 }
 
 resource "aws_cloudwatch_metric_alarm" "consumer_backlog_high" {
+  count = var.enable_consumer_autoscaling ? 1 : 0
+
   alarm_name        = "${var.project}-consumer-backlog-high"
   alarm_description = "orders:stream backlog is growing — the consumer is falling behind; scaling out"
 
@@ -53,11 +67,13 @@ resource "aws_cloudwatch_metric_alarm" "consumer_backlog_high" {
   # 沒有資料**不算超標**:worker 掛掉(沒人送 metric)不該被誤判成 backlog 爆掉而狂擴。
   treat_missing_data = "notBreaching"
 
-  alarm_actions = [aws_appautoscaling_policy.consumer_out.arn]
+  alarm_actions = [aws_appautoscaling_policy.consumer_out[0].arn]
   tags          = { Name = "${var.project}-consumer-backlog-high" }
 }
 
 resource "aws_cloudwatch_metric_alarm" "consumer_backlog_low" {
+  count = var.enable_consumer_autoscaling ? 1 : 0
+
   alarm_name        = "${var.project}-consumer-backlog-low"
   alarm_description = "orders:stream backlog is drained — scaling the consumer back in"
 
@@ -73,18 +89,20 @@ resource "aws_cloudwatch_metric_alarm" "consumer_backlog_low" {
   evaluation_periods = 10
   treat_missing_data = "notBreaching"
 
-  alarm_actions = [aws_appautoscaling_policy.consumer_in.arn]
+  alarm_actions = [aws_appautoscaling_policy.consumer_in[0].arn]
   tags          = { Name = "${var.project}-consumer-backlog-low" }
 }
 
 # 用 step scaling 而不是 target tracking:target tracking 要一個「每個實例分攤多少
 # backlog」的比值 metric,而我們只有總量。step 也更好推理 —— 門檻與級距都寫在這裡。
 resource "aws_appautoscaling_policy" "consumer_out" {
+  count = var.enable_consumer_autoscaling ? 1 : 0
+
   name               = "${var.project}-consumer-scale-out"
   policy_type        = "StepScaling"
-  service_namespace  = aws_appautoscaling_target.consumer.service_namespace
-  resource_id        = aws_appautoscaling_target.consumer.resource_id
-  scalable_dimension = aws_appautoscaling_target.consumer.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.consumer[0].service_namespace
+  resource_id        = aws_appautoscaling_target.consumer[0].resource_id
+  scalable_dimension = aws_appautoscaling_target.consumer[0].scalable_dimension
 
   step_scaling_policy_configuration {
     adjustment_type = "ChangeInCapacity"
@@ -106,11 +124,13 @@ resource "aws_appautoscaling_policy" "consumer_out" {
 }
 
 resource "aws_appautoscaling_policy" "consumer_in" {
+  count = var.enable_consumer_autoscaling ? 1 : 0
+
   name               = "${var.project}-consumer-scale-in"
   policy_type        = "StepScaling"
-  service_namespace  = aws_appautoscaling_target.consumer.service_namespace
-  resource_id        = aws_appautoscaling_target.consumer.resource_id
-  scalable_dimension = aws_appautoscaling_target.consumer.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.consumer[0].service_namespace
+  resource_id        = aws_appautoscaling_target.consumer[0].resource_id
+  scalable_dimension = aws_appautoscaling_target.consumer[0].scalable_dimension
 
   step_scaling_policy_configuration {
     adjustment_type = "ChangeInCapacity"

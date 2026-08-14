@@ -63,3 +63,26 @@ variable "stripe_webhook_secret" {
     error_message = "Must be the signing secret from the Stripe webhook endpoint (starts with whsec_), not the API key."
   }
 }
+
+# order-consumer 的自動擴容。**預設關閉,而且理由是 IAM 而不是「還沒做好」。**
+#
+# 2026-08-14 實測:`terraform validate` 與 `plan` 都是綠的,但 `apply` 會失敗 ——
+# provider 的 default_tags 讓 aws_appautoscaling_target 在 RegisterScalableTarget
+# 時帶 Tags,而那需要 `application-autoscaling:TagResource`;拿掉 tag 之後 provider
+# 還是會在讀回狀態時呼叫 `ListTagsForResource`,同樣被拒。`AmazonECS_FullAccess`
+# **不含**這幾個 tag 動作,所以只掛那個政策的帳號一定卡住。
+#
+# 要打開它,先給執行 terraform 的身分補這三條(其餘動作 ECS_FullAccess 已涵蓋):
+#
+#   application-autoscaling:ListTagsForResource
+#   application-autoscaling:TagResource
+#   application-autoscaling:UntagResource
+#
+# 為什麼用開關而不是直接留著:留著的話任何人的 apply 都會在這裡炸,而錯誤訊息
+# (AccessDenied on TagResource)跟「自動擴容」看起來毫無關係 —— 那是一顆地雷。
+# 開關讓「還沒打開」是一個明確的狀態,而不是一個待踩的意外。
+variable "enable_consumer_autoscaling" {
+  description = "Autoscale the order-consumer on queue depth. Needs application-autoscaling Tag/ListTags/UntagResource — see the comment above."
+  type        = bool
+  default     = false
+}

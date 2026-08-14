@@ -117,10 +117,14 @@ jobs:
           fi
           echo "migrations applied"
 
-      # 順序是刻意的:**先遷移、再換程式碼**。代價是 migration 必須向後相容 —— 舊程式碼
-      # 會在新 schema 上再跑幾十秒。破壞性變更(drop / rename column)要拆成兩次部署
-      # (先加、雙寫、再刪),不能靠把這兩步對調來解決:反過來的話新程式碼會在舊 schema
-      # 上跑,那個窗口裡它是壞的,而且壞的是剛部署的東西。
+      # 順序是刻意的:**先遷移、再換程式碼**。不能靠把這兩步對調來解決 —— 反過來的話
+      # 新程式碼會在舊 schema 上跑,那個窗口裡壞的正好是剛部署的東西。
+      #
+      # 代價是 migration 必須向後相容:滾動部署期間新舊 task 同時打同一個資料庫,所以
+      # 舊程式碼會在新 schema 上再跑幾十秒。破壞性變更要拆成兩次部署(expand 先加、
+      # 雙寫;contract 下一次才刪)。
+      # **這條規則由 test/test_deploy_pipeline.py 執行,不是靠這段註解** ——
+      # 註解不會變紅,而這正是它要防的那種「看起來部署成功了」的失敗。
       - name: Roll ECS services
         run: |
           set -euo pipefail

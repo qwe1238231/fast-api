@@ -134,6 +134,116 @@ def test_terraform_does_not_undo_the_deploy() -> None:
     assert len(re.findall(r"ignore_changes\s*=\s*\[task_definition\]", SERVICES_TF)) == 3
 
 
+# ─ expand/contract:migration 必須能跟舊程式碼並存
+
+#: 這些 migration 在規則存在之前就寫好了。它們當時是「停機部署」的假設下寫的,而
+#: 那個假設在有 rolling deployment 之後不成立了。列成明確清單而不是「只檢查新的」,
+#: 是因為後者需要一個基準修訂版,而那個基準會慢慢變成沒有人記得為什麼的魔法字串。
+_PRE_RULE_MIGRATIONS = {
+    "35846ecd3442",  # add check constraint on orders.status
+    "7ae1b044057f",  # add positive-value checks
+    "a248c0739bb0",  # add absolute_expires_at NOT NULL
+    "a6528a2656ba",  # add check constraints on orders status/timestamps
+    "b9a4fce2cc69",  # use SAEnum for status columns (alter → NOT NULL)
+}
+
+#: 滾動部署期間會讓**舊程式碼**壞掉的操作。判準是「舊 task 還在跑,它做得到的事
+#: 會不會因為這次 schema 變更而失敗」。
+#: drop_index / create_index / create_table / add_column(nullable=True) 不在裡面 ——
+#: 那些舊程式碼完全感覺不到。
+_BREAKING_OPS = {"drop_column", "drop_table", "rename_table"}
+
+
+def _breaking_operations(upgrade: ast.FunctionDef) -> set[str]:
+    found: set[str] = set()
+    for node in ast.walk(upgrade):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        name, src = node.func.attr, ast.unparse(node)
+        if name in _BREAKING_OPS:
+            found.add(f"{name}() — 舊程式碼還在讀/寫它")
+        elif name == "add_column" and "nullable=False" in src and "server_default" not in src:
+            found.add("add_column(nullable=False) 沒有 server_default — 舊程式碼的 INSERT 不會帶這一欄")
+        elif name == "alter_column":
+            if "nullable=False" in src:
+                found.add("alter_column(nullable=False) — 舊程式碼可能還在寫 NULL")
+            if "new_column_name" in src:
+                found.add("改欄位名 — 對舊程式碼等於同時砍掉又新增")
+        elif name == "create_check_constraint":
+            found.add("create_check_constraint — 舊程式碼可能寫出違反它的列")
+    return found
+
+
+def _migrations() -> list[tuple[str, ast.Module]]:
+    out = []
+    for path in sorted((ROOT / "alembic" / "versions").glob("*.py")):
+        out.append((path.name, ast.parse(path.read_text(), filename=str(path))))
+    return out
+
+
+def test_new_migrations_survive_a_rolling_deploy() -> None:
+    """migration 先於程式碼跑,所以**舊程式碼會在新 schema 上再跑幾十秒**。
+
+    這不是理論:滾動部署期間新舊 task 同時打同一個資料庫。在同一次部署裡砍掉一個
+    欄位,那幾十秒內舊 task 的每一個 SELECT 都會炸 —— 而部署本身會顯示成功。
+
+    破壞性變更要拆成兩次部署(expand:先加、雙寫;contract:下一次才刪)。真的需要
+    contract 那一半時,在 migration 裡寫一行 `BACKWARD_INCOMPATIBLE = "理由"` ——
+    用字串而不是布林旗標,是要逼作者寫下那句話:expand 的那一半是哪個修訂版、
+    為什麼現在刪掉是安全的。
+
+    這條測試存在的理由是:這個規則以前只寫在 deploy.yml 的註解裡,而註解不會變紅。
+    """
+    offenders = []
+    for filename, tree in _migrations():
+        revision = filename.split("_")[0]
+        if revision in _PRE_RULE_MIGRATIONS:
+            continue
+        upgrade = next(
+            (n for n in tree.body
+             if isinstance(n, ast.FunctionDef) and n.name == "upgrade"), None
+        )
+        if upgrade is None:
+            continue
+        breaking = _breaking_operations(upgrade)
+        if not breaking:
+            continue
+        acknowledged = any(
+            isinstance(n, ast.Assign)
+            and any(getattr(t, "id", None) == "BACKWARD_INCOMPATIBLE" for t in n.targets)
+            and isinstance(n.value, ast.Constant)
+            and isinstance(n.value.value, str)
+            and n.value.value.strip()
+            for n in tree.body
+        )
+        if not acknowledged:
+            offenders.append(f"{filename}\n      " + "\n      ".join(sorted(breaking)))
+
+    assert not offenders, (
+        "這些 migration 在滾動部署期間會讓舊程式碼壞掉。拆成 expand/contract 兩次部署,"
+        "或在檔案裡加一行 BACKWARD_INCOMPATIBLE = \"為什麼這次是安全的\":\n    "
+        + "\n    ".join(offenders)
+    )
+
+
+def test_the_grandfather_list_does_not_rot() -> None:
+    """清單裡的每一支都要真的還在,而且真的還有破壞性操作。
+
+    少了這條,清單會慢慢變成一堆沒有人敢刪的字串 —— 有人把某支 migration 改乾淨了,
+    它卻還被豁免著,於是下一次真的改壞就悄悄過關。
+    """
+    by_revision = {name.split("_")[0]: tree for name, tree in _migrations()}
+    for revision in _PRE_RULE_MIGRATIONS:
+        assert revision in by_revision, f"{revision} 已經不存在 —— 從清單移除"
+        upgrade = next(
+            (n for n in by_revision[revision].body
+             if isinstance(n, ast.FunctionDef) and n.name == "upgrade"), None
+        )
+        assert upgrade is not None and _breaking_operations(upgrade), (
+            f"{revision} 已經沒有破壞性操作 —— 從豁免清單移除,否則它會遮住未來的改動"
+        )
+
+
 # ─ 告警接線:程式碼印的字串必須真的被過濾器接到
 
 def _alert_prefixes() -> set[str]:

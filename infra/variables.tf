@@ -66,17 +66,23 @@ variable "stripe_webhook_secret" {
 
 # order-consumer 的自動擴容。**預設關閉,而且理由是 IAM 而不是「還沒做好」。**
 #
-# 2026-08-14 實測:`terraform validate` 與 `plan` 都是綠的,但 `apply` 會失敗 ——
-# provider 的 default_tags 讓 aws_appautoscaling_target 在 RegisterScalableTarget
-# 時帶 Tags,而那需要 `application-autoscaling:TagResource`;拿掉 tag 之後 provider
-# 還是會在讀回狀態時呼叫 `ListTagsForResource`,同樣被拒。`AmazonECS_FullAccess`
-# **不含**這幾個 tag 動作,所以只掛那個政策的帳號一定卡住。
+# 實測 2026-08-14:`terraform validate` 與 `plan` 都是綠的,但 `apply` 會失敗 ——
+# AccessDenied on `application-autoscaling:TagResource`。而且**繞不掉**:試過用不帶
+# default_tags 的 provider 別名讓它不寫 tag,target 是建起來了,但 provider 讀回狀態時
+# 仍然呼叫 `ListTagsForResource`,一樣被拒 —— 而那讓整個 state 變成無法操作(連 plan
+# 與 destroy 都卡在同一個 refresh 上)。`AmazonECS_FullAccess` **不含**這幾個動作。
+#
+# 也就是說真正的硬性需求是**讀**:即使一個 tag 都沒有,provider 還是要讀得到。
 #
 # 要打開它,先給執行 terraform 的身分補這三條(其餘動作 ECS_FullAccess 已涵蓋):
 #
-#   application-autoscaling:ListTagsForResource
+#   application-autoscaling:ListTagsForResource   ← 一定要,即使不打算加 tag
 #   application-autoscaling:TagResource
 #   application-autoscaling:UntagResource
+#
+# 補完之後實測(2026-08-17)整套通:apply 建得起來、五個資源都進 state、
+# `terraform plan -detailed-exitcode` 回 0(No changes),target 也正常被 default_tags
+# 標上 Project/ManagedBy。
 #
 # 為什麼用開關而不是直接留著:留著的話任何人的 apply 都會在這裡炸,而錯誤訊息
 # (AccessDenied on TagResource)跟「自動擴容」看起來毫無關係 —— 那是一顆地雷。

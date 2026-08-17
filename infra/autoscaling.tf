@@ -20,10 +20,6 @@
 resource "aws_appautoscaling_target" "consumer" {
   count = var.enable_consumer_autoscaling ? 1 : 0
 
-  # 不帶 default_tags 的 provider。這**減少**了需要的權限(不必 TagResource),但不夠 ——
-  # provider 讀回狀態時仍會 ListTagsForResource。見 variables.tf 那個開關的說明。
-  provider = aws.untagged
-
   service_namespace  = "ecs"
   resource_id        = "service/${aws_ecs_cluster.main.name}/${aws_ecs_service.consumer.name}"
   scalable_dimension = "ecs:service:DesiredCount"

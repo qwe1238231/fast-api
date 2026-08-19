@@ -71,6 +71,21 @@ jobs:
           PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
         run: alembic upgrade head
 
+      # 測試是走 metadata.create_all 建表的,完全不經過 migration —— 所以「model 改了
+      # 但沒補 migration」這一類漂移,整套測試一個都抓不到,會一路綠到部署當下才炸。
+      # `alembic check` 拿剛剛 upgrade 出來的 schema 跟 model metadata 對照,有差就退非零。
+      #
+      # 一定要在 pytest **之前**:pytest 的 create_all 會把缺的表直接補進同一個資料庫,
+      # 補完之後再檢查就永遠是乾淨的 —— 那正是這一步要抓的東西被蓋掉。
+      - name: Check migrations match the models
+        env:
+          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
+          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
+          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
+          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
+          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
+        run: alembic check
+
       - name: Run pytest
         env:
           DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb

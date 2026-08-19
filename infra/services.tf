@@ -7,8 +7,15 @@ resource "aws_ecs_service" "api" {
   name            = "${var.project}-api"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.api.arn
-  desired_count   = 1 # dev; bump to 2+ for HA across AZs
   launch_type     = "FARGATE"
+
+  # **2 是 HA 的下限,不是效能調校。** 一個任務的時候,那個任務所在的 AZ 出問題、
+  # 或它自己被回收,站台就是全黑;而部署期間也只有「舊的停掉、新的還沒健康」這一種
+  # 狀態。Fargate 會把任務分散到 networkConfiguration 裡的兩個子網(= 兩個 AZ)。
+  #
+  # 這個值在 autoscaling 打開之後由 autoscaling 接管(min_capacity 也是 2),但它必須
+  # 寫在這裡:HA **不應該**取決於 autoscaling 那個開關有沒有打開。
+  desired_count = 2
 
   network_configuration {
     subnets          = aws_subnet.public[*].id
@@ -31,7 +38,10 @@ resource "aws_ecs_service" "api" {
   # 的話,下一次 terraform apply 會把服務打回 TF 管的那一版(image 是 :latest)——
   # 也就是把剛部署的東西默默換掉,而 plan 上只會顯示一行 task_definition 變更。
   lifecycle {
-    ignore_changes = [task_definition]
+    # desired_count 由 autoscaling.tf 的 appautoscaling target 管(預熱會把它拉到
+    # max)。不忽略的話,下一次 apply 會在**開賣中間**把它打回 2 —— 而 plan 上只有
+    # 一行 desired_count 變更。跟 consumer 是同一個坑,這是它的第三個實例。
+    ignore_changes = [task_definition, desired_count]
   }
 
   # 部署自己會回滾。少了它,新版本一直起不來時 ECS 會永遠重試,服務停在「舊的還在跑

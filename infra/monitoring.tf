@@ -246,11 +246,21 @@ locals {
   }
 }
 
+# **每個節點一組告警,不是每個 replication group 一組。** ElastiCache 的指標掛在節點上
+# (`CacheClusterId` = `<group-id>-001` / `-002`),拿 group id 當 dimension 的告警會
+# 永遠拿不到資料,而 `treat_missing_data = "notBreaching"` 會讓它永遠停在 OK ——
+# 一個永遠不會響的告警比沒有告警更糟,因為它看起來像有人在看。
+#
+# 副本也要監控:它的記憶體/驅逐狀況就是「故障切換之後會變成什麼樣」的預告。
 resource "aws_cloudwatch_metric_alarm" "redis" {
-  for_each = local.redis_alarms
+  for_each = merge([
+    for suffix, node in local.redis_nodes : {
+      for key, cfg in local.redis_alarms : "${key}-${suffix}" => merge(cfg, { node = node })
+    }
+  ]...)
 
   alarm_name          = "${var.project}-redis-${replace(each.key, "_", "-")}"
-  alarm_description   = "Redis ${aws_elasticache_cluster.main.cluster_id}: ${each.value.desc}"
+  alarm_description   = "Redis ${each.value.node}: ${each.value.desc}"
   namespace           = "AWS/ElastiCache"
   metric_name         = each.value.metric
   statistic           = each.value.stat
@@ -261,7 +271,7 @@ resource "aws_cloudwatch_metric_alarm" "redis" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    CacheClusterId = aws_elasticache_cluster.main.cluster_id
+    CacheClusterId = each.value.node
   }
 
   alarm_actions = local.alarm_actions
@@ -386,28 +396,33 @@ resource "aws_cloudwatch_metric_alarm" "alb_unhealthy_hosts" {
 # channel. It only made sense while notifications went to an SNS topic.
 
 # (B) Pipeline alarms via LOG METRIC FILTERS. These failure modes have NO stock
-# CloudWatch metric — but the worker already prints a distinct line for each. A
-# log_metric_filter turns "this phrase appeared in the logs" into a metric we can
+# CloudWatch metric — but the app emits a distinct log EVENT for each. A
+# log_metric_filter turns "this event appeared in the logs" into a metric we can
 # alarm on. Two-step: (1) filter counts matches on the shared /ecs log group,
 # (2) an alarm fires on Sum > 0.
+#
+# 這些模式比對的是 **JSON 欄位**(`{ $.event = "inventory_drift" }`),不是散文。
+# 舊版比對的是 "INVENTORY DRIFT event" 這種訊息字串 —— 任何人改一下措辭,告警就
+# 失效,而失效的方式是「再也不響」,不會有任何錯誤。欄位是契約,訊息是給人讀的;
+# 契約才適合拿來掛告警。欄位由 app/core/logging.py 的 JSON formatter 產生,
+# `event` / `needs_human` 的值定義在各個呼叫點(`alert()` 一律帶 needs_human)。
+#
 # KEY GOTCHA: default_value = "0" on the transformation makes the metric emit 0
 # for non-matching log events, so it's CONTINUOUS and the alarm returns to OK
 # cleanly. Without it the metric only publishes on a match and the alarm can't
-# resolve. Patterns match lines the code prints today (verified in app/worker.py).
+# resolve.
 # (backlog + dead-letter depth are covered by the numeric gauges in section C
-# below — richer than a log-line boolean — so only these two live here:)
-#   line 341  "CIRCUIT-BREAKER admission paused"  (cron, every min while paused)
-#   line 362  "INVENTORY DRIFT event"             (cron, every 5 min per drift)
+# below — richer than a log-line boolean — so they don't live here.)
 locals {
   log_metric_namespace = "${var.project}/pipeline"
   pipeline_log_alarms = {
     admission_paused = {
-      pattern = "\"CIRCUIT-BREAKER admission paused\""
+      pattern = "{ $.event = \"admission_paused\" }"
       period  = 300
       desc    = "circuit breaker tripped: waiting room stopped admitting buyers (business outage, looks 'up')"
     }
     inventory_drift = {
-      pattern = "\"INVENTORY DRIFT event\""
+      pattern = "{ $.event = \"inventory_drift\" }"
       period  = 600 # drift cron runs every 5 min; 10-min window always catches a persistent drift
       desc    = "Redis vs Postgres stock disagree — oversell / phantom sold-out risk"
     }
@@ -415,23 +430,27 @@ locals {
     # 超買不會撞到任何東西 —— 那個人就是多買了幾張,而所有計數器都自洽。這條 log
     # 是唯一會看到它的地方,所以它必須有自己的告警,不能只靠 needs_a_human 那條總開關。
     quota_drift = {
-      pattern = "\"QUOTA DRIFT event\""
+      pattern = "{ $.event = \"quota_drift\" }"
       period  = 600
       desc    = "per-user purchase quotas in Redis disagree with Postgres — someone can exceed the cap, and nothing else will notice"
     }
-    # 「有人要來看一眼」的總開關。ALERT 與 REFUND 是程式碼裡兩個刻意保留的字首,標的是
-    # 沒有任何自動修復路徑的事:
-    #   ALERT allocator bug             — 配位算出界外區間 → 使用者吃 500,是我們的 bug
-    #   ALERT dead-letter intent ...    — 死信欄位自相矛盾,座位還不回去
-    #   ALERT order N expired but ...   — 座位釋放失敗,要人工跑 rebuild_seat_runs
-    #   REFUND payment_intent ...       — 真的有錢退出去了
+    # 「有人要來看一眼」的總開關。標的是沒有任何自動修復路徑的事,今天包括:
+    #   allocator_bug                   — 配位算出界外區間 → 使用者吃 500,是我們的 bug
+    #   dead_letter_fields_inconsistent — 死信欄位自相矛盾,座位還不回去
+    #   seat_release_failed             — 座位釋放失敗,要人工跑 rebuild_seat_runs
+    #   seat_*_drift                    — 座位結構損壞,要重建
+    #   payment_refunded                — 真的有錢退出去了
     # 這些各自都很罕見,罕見到不值得一個一個做告警;但「其中任何一個發生了」是絕對
-    # 要知道的。用一條 OR 的過濾器把它們全部收進來,總比讓每一條新的 ALERT 都靜靜
-    # 躺在 log 裡等人去 grep 好。
+    # 要知道的。
+    #
+    # **判準不在這個檔案裡,在 `app/core/logging.py` 的 `alert()`** —— 那個函式是
+    # 唯一會寫出 needs_human 的地方,所以「什麼算需要人看」只有一個宣告點。舊版靠
+    # 比對 "ALERT " / "REFUND " 兩個字首,等於把那個判準複製到訊息的措辭裡:下一條
+    # 新的 ALERT 只要忘了帶字首就會靜靜躺在 log 裡,而這裡完全看不出少了什麼。
     needs_a_human = {
-      pattern = "?\"ALERT \" ?\"REFUND \""
+      pattern = "{ $.needs_human IS TRUE }"
       period  = 300
-      desc    = "an ALERT/REFUND line was logged — no automatic remedy exists for these; read the log group"
+      desc    = "a needs_human event was logged — no automatic remedy exists for these; read the log group"
     }
   }
 }
@@ -489,6 +508,15 @@ locals {
     order_dead_letter_new = {
       threshold = 0, eval = 1,
       desc      = "new order dead-letters in the last minute — orders permanently failing right now"
+    }
+    # **這條量的是耐久性的曝險窗,不是效能。** stream 裡最舊那筆未落帳 intent 的年紀
+    # 就是「Redis 此刻死掉會丟掉多久以內收下的訂單」—— 那些人已經拿到 202、庫存已經
+    # 扣掉,但 Postgres 還沒有他們。副本 + 自動故障切換只保護得住最後幾百毫秒的寫入,
+    # 所以這個數字必須有人看著:60 秒代表 consumer 卡住了,而卡住的每一秒都在放大
+    # 一次故障切換會造成的損失。正常值是個位數秒(consumer 阻塞讀的週期是 2 秒)。
+    order_stream_oldest_age_seconds = {
+      threshold = 60, eval = 3,
+      desc      = "oldest un-persisted order intent is over 60s old — this is how much a Redis failover would lose"
     }
   }
 }

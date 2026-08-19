@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum 
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from sqlalchemy import Enum as SAEnum
@@ -60,3 +60,13 @@ class Event(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+    # 樂觀鎖版本號。防的不是併發搶單,而是後台的 lost update:兩個管理員同時
+    # 開編輯頁,後存檔的那份帶著過期的欄位值,把先存檔的改動靜默蓋回去。
+    # 值由 SQLAlchemy 自己管(INSERT 填 1、每次 flush +1),所以不寫 default;
+    # server_default 是給 migration 回填既有列用的(NOT NULL 加欄位需要它)。
+    version: Mapped[int] = mapped_column(nullable=False, server_default=text("1"))
+
+    # 掛上之後,任何經 ORM flush 的 Event 修改都會自動帶 `WHERE version = :old`,
+    # 不符即丟 StaleDataError。注意這只對 ORM flush 生效 —— 改用
+    # `update(Event).where(...)` 這種 Core statement 會繞過版本檢查而靜默失效。
+    __mapper_args__ = {"version_id_col": version}

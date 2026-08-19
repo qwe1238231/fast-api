@@ -34,7 +34,12 @@ jobs:
     needs: test
     runs-on: ubuntu-latest # x86_64 runner → native build (task defs are X86_64)
     steps:
+      # fetch-depth: 0 是為了下面那步能跟「上一次部署的 commit」比較,判斷這次推送
+      # 有沒有帶新的 migration。預設的淺 clone(depth 1)拿不到那個 commit,而拿不到
+      # 的後果會是「每次都拍快照」或「每次都不拍」—— 兩個都不對。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Swap the OIDC token for 15-min AWS creds — no stored access keys.
       - name: Configure AWS credentials (OIDC)
@@ -78,6 +83,64 @@ jobs:
             echo "$s=$arn" >> "$GITHUB_OUTPUT"
             echo "registered $arn"
           done
+
+      # **帶 migration 的部署必須先有一個還原點。**
+      #
+      # PITR 本身已經打開(rds.tf 的 backup_retention_period),理論上可以還原到
+      # migration 之前的任何一秒 —— 但那要求事後有人知道「那一秒是幾點」。一張以
+      # commit SHA 命名的快照把它變成一個**看得見的、指名的**還原點:
+      #
+      #     aws rds describe-db-snapshots --db-snapshot-identifier justin-test-db-premigration-<sha>
+      #
+      # schema 可以用 alembic downgrade 退回去,但**資料回不來** —— 一支把欄位算錯的
+      # UPDATE 跑完之後,downgrade 只會把欄位刪掉。所以還原點是 migration 的安全網,
+      # 不是 downgrade。
+      #
+      # 只在這次推送真的改了 `alembic/versions/` 時才拍(等快照 available 要好幾分鐘,
+      # 不值得每次部署都付)。判斷不出來時**當成有改** —— 多花幾分鐘 vs 少一個還原點,
+      # 前者便宜太多了。
+      #
+      # 快照從 Multi-AZ 的待命實例產生,所以對正在服務的實例沒有 I/O 影響(這是
+      # multi_az = true 的附帶好處,也是為什麼開賣期間也能安全地拍)。
+      - name: Snapshot the database before migrating
+        id: presnapshot
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            echo "cannot diff against '$before' — assuming migrations changed (fail-safe)"
+            changed=1
+          else
+            changed=$(git diff --name-only "$before" "$GITHUB_SHA" -- alembic/versions/ | wc -l | tr -d ' ')
+            echo "migration files changed in this push: $changed"
+          fi
+
+          # PITR 的備用座標:即使沒拍快照,也把「migration 之前」這個時間點記在
+          # 部署紀錄裡。事後要還原時,這一行就是那個 --restore-time。
+          echo "pre-migration UTC timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          if [ "$changed" = "0" ]; then
+            echo "no new migrations — skipping the snapshot"
+            exit 0
+          fi
+
+          snap="$CLUSTER-db-premigration-${GITHUB_SHA:0:8}"
+          # 已存在就沿用(重跑同一個 SHA 的部署不該失敗)。
+          if aws rds describe-db-snapshots --db-snapshot-identifier "$snap" >/dev/null 2>&1; then
+            echo "snapshot $snap already exists — reusing it"
+          else
+            # 刻意**不帶** --tags:那會需要 rds:AddTagsToResource,而這個專案已經被
+            # 「plan 綠、apply 因為缺 Tag 權限而炸」咬過一次(見 variables.tf 的
+            # enable_consumer_autoscaling)。實例的 tag 會由 copy_tags_to_snapshot 帶過來。
+            aws rds create-db-snapshot \
+              --db-instance-identifier "$CLUSTER-db" \
+              --db-snapshot-identifier "$snap" >/dev/null
+          fi
+          echo "waiting for $snap to become available…"
+          aws rds wait db-snapshot-available --db-snapshot-identifier "$snap"
+          echo "restore point ready: $snap"
+          echo "snapshot=$snap" >> "$GITHUB_OUTPUT"
 
       # 網路設定直接抄 api 服務自己的 —— 不要在這裡重打 subnet / SG 清單,那會是第三份
       # 會漂掉的規格(Terraform 一份、服務一份、CI 一份)。

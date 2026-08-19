@@ -1,4 +1,5 @@
 import base64
+import logging
 from datetime import datetime
 from typing import Annotated
 from uuid import UUID
@@ -11,6 +12,7 @@ from app.schemas.order import OrderCreate, OrderResponse, OrderAcceptedResponse,
 from app.services.orders import submit_order, cancel_order as cancel_order_service, mark_confirmed, mark_paid, release_order_seat
 from app.services.idempotency import get_claim_state, CLAIM_PENDING, CLAIM_FAILED
 from app.core.config import get_settings
+from app.core.logging import alert
 from app.core.exceptions import DomainError, OrderNotFound, InvalidOrderTransition, SeatsNotAssigned
 from app.crud.order import get_order_by_id, get_order_by_idempotency_key, list_orders_for_user
 from app.schemas.payment import PaymentIntentResponse
@@ -19,6 +21,8 @@ from app.services.zones import describe_order_seats
 from app.services.stripe_client import create_payment_intent
 from app.services.waiting_room import refund_admission, verify_admission
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/orders", tags=["orders"])
 
@@ -229,13 +233,18 @@ async def cancel_order(
     # seat (reconcile), NOT a failed cancel -> log, don't 500 the client.
     try:
         await release_order_seat(db, redis, order)
-    except Exception as exc:
-        print(
-                    f"ALERT order {order_id} cancelled but seat release failed: {exc} "
-                    f"— for a SEATED order nothing repairs this automatically "
-                    f"(reconcile_inventory only fixes the event counter); run "
-                    f"`python -m app.scripts.rebuild_seat_runs <event_id>` once the stream drains"
-                )
+    except Exception:
+        alert(
+            logger,
+            "order cancelled but seat release failed — for a SEATED order nothing "
+            "repairs this automatically (reconcile_inventory only fixes the event "
+            "counter); run `python -m app.scripts.rebuild_seat_runs <event_id>` once "
+            "the stream drains",
+            event="seat_release_failed",
+            exc_info=True,
+            order_id=order_id,
+            event_id=order.event_id,
+        )
 
 @router.post("/{order_id}/payment-intent", response_model=PaymentIntentResponse)
 async def create_order_payment_intent(

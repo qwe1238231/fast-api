@@ -75,6 +75,12 @@ class Zone(Base):
     display_order: Mapped[int] = mapped_column(nullable=False, default=0)
     """越小越靠舞台。只管排序與顯示;實際票價在 EventZonePrice。"""
 
+    # 樂觀鎖 —— 見 app/db/optimistic.py。粒度刻意是「每一列一個」而不是掛在
+    # venue 上:兩個管理員改同一場館的不同區沒有真的衝突,不該互相踢出 409。
+    version: Mapped[int] = mapped_column(nullable=False, server_default=text("1"))
+
+    __mapper_args__ = {"version_id_col": version}
+
 
 class EventZonePrice(Base):
     """某場次某一區的票價。
@@ -92,6 +98,12 @@ class EventZonePrice(Base):
     event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), primary_key=True)
     zone_id: Mapped[int] = mapped_column(ForeignKey("zones.id"), primary_key=True)
     price_cents: Mapped[int] = mapped_column(nullable=False)
+
+    # 樂觀鎖。複合主鍵不影響 version_id_col —— 它加的是 `AND version = :old`,
+    # 主鍵有幾個欄位無關。
+    version: Mapped[int] = mapped_column(nullable=False, server_default=text("1"))
+
+    __mapper_args__ = {"version_id_col": version}
 
 
 class SeatBlock(Base):

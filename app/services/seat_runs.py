@@ -46,6 +46,7 @@ from app.core.seat_metrics import (
     SEAT_CONTENTION,
 )
 from app.core.config import get_settings, max_purchasable
+from app.core.logging import current_trace_id
 from app.core.exceptions import (
     InsufficientInventory,
     InventoryNotReconcilable,
@@ -355,6 +356,7 @@ async def seat_labels(
 # ARGV[4]=start  ARGV[5]=length
 # ARGV[6]=claim TTL  ARGV[7]=user_id  ARGV[8]=event_id
 # ARGV[9]=total_price_cents  ARGV[10]=idempotency_key  ARGV[11]=zone_id
+# ARGV[12]=每人限購張數  ARGV[13]=trace_id
 # 回傳:{'DUP'} | {'RETRY'} | {'BOUNDS'} | {'OK', stream_id, zone_remaining}
 _CLAIM_SEATS_LUA = """
 local function f(block, pos) return block .. ':' .. string.format('%d', pos) end
@@ -420,7 +422,9 @@ local stream_id = redis.call('XADD', KEYS[4], '*',
     'idempotency_key', ARGV[10],
     'zone_id', ARGV[11],
     'block_id', ARGV[1],
-    'start_pos', ARGV[4])
+    'start_pos', ARGV[4],
+    -- 跨 process 搬運追蹤 id,理由同 inventory.py 的那支腳本。
+    'trace_id', ARGV[13])
 redis.call('SET', KEYS[3], 'PENDING', 'EX', tonumber(ARGV[6]))
 
 return {'OK', stream_id, tostring(zone_remaining)}
@@ -619,6 +623,7 @@ async def reserve_seats_and_enqueue(
                 claim_ttl_seconds, user_id, event_id,
                 total_price_cents, idempotency_key, zone_id,
                 max_per_user,
+                current_trace_id() or "",      # ARGV[13]
             ],
             client=redis,
         )

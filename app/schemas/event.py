@@ -56,6 +56,44 @@ class EventCreate(BaseModel):
                 raise ValueError("票價不得為負")
         return self
 
+class EventUpdate(BaseModel):
+    """Request body for PATCH /v1/events/{id}(後台編輯)。
+
+    **version 是必填的**,而且必須是客戶端 GET 到的那個值。少了它,伺服器比對的
+    就只是自己幾毫秒前才讀出來的版本 —— 永遠吻合、永遠放行,樂觀鎖等於沒裝。
+    危險的間隔是使用者盯著編輯頁的那幾分鐘,它橫跨兩個請求。
+
+    `extra="forbid"`:PATCH 的欄位是「有給才改」,打錯欄位名在寬鬆模式下會被靜默
+    忽略 —— 管理員看到 200 卻什麼都沒變,是最難查的一種 bug。
+
+    刻意**不可**編輯的欄位,各有各的理由:
+      total_seats  庫存上限,Redis 那份已經照它初始化了;改它要連同庫存一起搬,
+                   不是一次 UPDATE 的事。
+      venue_id     等於抽換座位圖,而底下可能已經有 hold 與已售座位。
+      status       有自己的狀態機與端點(POST /{id}/publish)。
+      zone_prices  在另一張表(EventZonePrice),有自己的版本;混進來會讓一次
+                   PATCH 橫跨兩個樂觀鎖的粒度。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(ge=1, description="GET 回來的 version,原樣送回")
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    venue: str | None = Field(default=None, min_length=1, max_length=255)
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    sale_starts_at: datetime | None = None
+    sale_ends_at: datetime | None = None
+    price_cents: int | None = Field(default=None, ge=0)
+
+    # 這兩個在 DB 是 nullable,所以顯式傳 null 的意思是「清掉,回去用預設推導」。
+    # 服務層用 exclude_unset 而不是 exclude_none 取變更集,才分得出「沒給」跟
+    # 「給了 null」—— 用 exclude_none 的話這兩個欄位永遠清不掉。
+    queue_opens_at: datetime | None = None
+    queue_closes_at: datetime | None = None
+
+
 class EventResponse(BaseModel):
     """Event representation sent back to client."""
 
@@ -76,6 +114,10 @@ class EventResponse(BaseModel):
     status: EventStatus
     created_at: datetime
     updated_at: datetime
+
+    version: int
+    """樂觀鎖版本。後台編輯時要原樣放回 PATCH 的 body —— 不吐出來,前端就無從帶回,
+    整條鎖也就形同虛設。"""
 
 
 class QueueStatusResponse(BaseModel):

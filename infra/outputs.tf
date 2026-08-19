@@ -1,7 +1,7 @@
 # Printed after `terraform apply` — the repo URL you push the image to.
 output "ecr_repository_url" {
   description = "Docker push target, e.g. 992382571445.dkr.ecr.ap-northeast-2.amazonaws.com/justin-test"
-  value       = aws_ecr_repository.app.repository_url
+  value       = data.aws_ecr_repository.app.repository_url
 }
 
 # --- Network (Phase C) — referenced by RDS/ElastiCache/ECS in later phases ---
@@ -47,11 +47,11 @@ output "database_url" {
 }
 
 output "redis_endpoint" {
-  value = aws_elasticache_cluster.main.cache_nodes[0].address
+  value = aws_elasticache_replication_group.main.primary_endpoint_address
 }
 
 output "redis_url" {
-  value = "redis://${aws_elasticache_cluster.main.cache_nodes[0].address}:6379/0"
+  value = "redis://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379/0"
 }
 
 # --- Public entry point (Phase E) -------------------------------------------

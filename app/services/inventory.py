@@ -3,6 +3,8 @@
 Single source of truth for "how many seats remain". DB stores `events.total_seats`
 as configuration; this module manages live decrement during sale.
 """
+import time
+
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import  select, func
 
@@ -14,6 +16,7 @@ from dataclasses import dataclass
 
 from app.core.config import get_settings
 from app.core.exceptions import InsufficientInventory ,EventNotFound,InventoryNotReconcilable
+from app.core.logging import current_trace_id
 from app.models.event import Event
 from app.models.order import Order, OrderStatus
 from app.services.idempotency import _key as _claim_key
@@ -85,16 +88,55 @@ async def get_available(
         *,
         event_id: int,
 ) -> int:
-    """Read current available count. Returns 0 if key missing or negative (race)."""
+    """Read current available count. Returns 0 if key missing or negative (race).
+
+    熱路徑與等候室用這一支:把「鍵不見了」當成 0 是**安全的預設**(表現成售完,
+    不會超賣)。要區分兩者的地方用 `read_available`。
+    """
     val = await redis.get(_key(event_id))
     return max(0, int(val)) if val is not None else 0
+
+
+async def read_available(
+        redis: Redis,
+        *,
+        event_id: int,
+) -> int | None:
+    """讀庫存,**鍵不存在時回 None**。
+
+    為什麼需要跟 `get_available` 分開:那一支把缺鍵折成 0,於是「賣完了」與「Redis 把
+    庫存弄丟了」變成同一個值。前者是正常結局,後者是事故 —— 而事故的外觀會是「這場
+    突然完售」,沒有任何一個計數器不一致,所以不會有任何訊號亮起來。
+
+    對帳/偵測那一側必須看得到這個差別,才能決定是「重建」還是「告警」。
+    """
+    val = await redis.get(_key(event_id))
+    return None if val is None else int(val)
+
+
+async def oldest_intent_age_seconds(redis: Redis, *, now: float | None = None) -> float:
+    """stream 裡最舊那一筆 order intent 的年紀(秒)。空的話回 0。
+
+    **這個數字就是「Redis 現在死掉會丟掉多少」的量化值** —— 那些 intent 已經扣了庫存、
+    已經回了 202,但還沒進 Postgres。backlog 的**筆數**回答「積了多少」,年紀回答
+    「積了多久」,而後者才是耐久性的曝險窗:副本的非同步複寫只能保護最後幾百毫秒,
+    這個數字告訴你實際暴露的是幾百毫秒還是十分鐘。
+
+    不需要額外記帳:Redis 的 stream id 前半就是毫秒時間戳。
+    """
+    entries = await redis.xrange(ORDER_STREAM_KEY, count=1)
+    if not entries:
+        return 0.0
+    added_ms = int(entries[0][0].split("-")[0])
+    reference = time.time() if now is None else now
+    return max(0.0, reference - added_ms / 1000)
 
 # Atomic script: dedup + per-user cap + decrement stock + enqueue + write claim,
 # all-or-nothing.
 # KEYS[1]=stock key   KEYS[2]=claim key   KEYS[3]=stream key   KEYS[4]=purchased hash
 # ARGV[1]=quantity  ARGV[2]=claim TTL seconds  ARGV[3]=user_id
 # ARGV[4]=event_id  ARGV[5]=total_price_cents  ARGV[6]=idempotency_key
-# ARGV[7]=zone_id ('' = 無座位圖的場次)  ARGV[8]=每人限購張數
+# ARGV[7]=zone_id ('' = 無座位圖的場次)  ARGV[8]=每人限購張數  ARGV[9]=trace_id
 # Returns (a list on the Python side):
 #   {'DUP'}                            -> this idempotency_key was already processed
 #   {'SOLD_OUT', remaining}            -> not enough stock
@@ -135,13 +177,17 @@ redis.call('HINCRBY', KEYS[4], ARGV[3], qty)
 -- 5) Push the order intent into the stream, capture the auto-generated message id.
 --    zone_id 傳 '' 代表無座位圖的場次(worker 會還原成 NULL)。Redis stream 的
 --    欄位值只能是字串,沒有 nil,所以用空字串當哨兵。
+--    trace_id 是**跨 process 的手動搬運**:contextvar 只活在 API 的進程裡,
+--    消費者拿不到,所以它必須跟著訊息本身走(等同 HTTP 的 traceparent header)。
+--    有了它,「下單 → 落帳 → reclaim → 死信」在 log 裡是同一個 id 串起來的一條線。
 local stream_id = redis.call('XADD', KEYS[3], '*',
     'user_id', ARGV[3],
     'event_id', ARGV[4],
     'quantity', ARGV[1],
     'total_price_cents', ARGV[5],
     'idempotency_key', ARGV[6],
-    'zone_id', ARGV[7])
+    'zone_id', ARGV[7],
+    'trace_id', ARGV[9])
 
 -- 6) Write the claim (with TTL) so the next request with the same key is blocked at step 1.
 redis.call('SET', KEYS[2], 'PENDING', 'EX', tonumber(ARGV[2]))
@@ -407,6 +453,9 @@ async def reserve_and_enqueue(
             idempotency_key,                # ARGV[6]
             "" if zone_id is None else zone_id,   # ARGV[7]
             max_per_user,                   # ARGV[8]
+            # 沒有綁定 context 時是空字串(worker 直接呼叫、測試),消費者那邊
+            # 會退回 "-";不要傳 None,Redis 的欄位值只能是字串。
+            current_trace_id() or "",       # ARGV[9]
         ],
         client=redis,                       # current client (app or test)
     )

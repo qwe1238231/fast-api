@@ -6,16 +6,27 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import (
-    CurrentAdmin, CurrentUser, DbSession, Redis, StreamUser, enforce_ip_rate_limit,
+    CurrentAdmin, CurrentUser, DbSession, Redis, StreamUser, client_ip,
+    enforce_ip_rate_limit,
 )
 from app.core.config import get_settings
 from app.core.exceptions import EventNotFound
 from app.core.security import create_admission_token
 from app.crud.event import get_event, list_published_events
-from app.services.event_admin import create_event
+from app.db.optimistic import stale_data_as_conflict
+from app.services.event_admin import (
+    apply_event_update, create_event, update_zone_prices,
+)
+from app.services.audit import emit_event as emit_audit_event
+from app.services.event_cache import invalidate_event_meta
 from app.models.event import Event
-from app.schemas.event import EventCreate, EventResponse, QueueStatusResponse
-from app.schemas.seating import ZoneAvailability
+from app.models.seating import EventZonePrice
+from app.schemas.event import (
+    EventCreate, EventResponse, EventUpdate, QueueStatusResponse,
+)
+from app.schemas.seating import (
+    ZoneAvailability, ZonePriceResponse, ZonePricesUpdate,
+)
 from app.services.zones import list_zone_availability
 from app.services.publish_event import publish_event
 from app.services.queue_events import register as sse_register, unregister as sse_unregister
@@ -37,6 +48,105 @@ async def create_event_endpoint(
     event = await create_event(db, data)
     await db.commit()
     return event
+
+@router.patch("/{event_id}", response_model=EventResponse)
+async def update_event_endpoint(
+        event_id: int,
+        data: EventUpdate,
+        request: Request,
+        db: DbSession,
+        redis: Redis,
+        current_admin: CurrentAdmin,
+) -> Event:
+    """後台編輯場次。樂觀鎖:body 的 `version` 必須是 GET 回來的那個。
+
+    版本對不上回 409(重新載入、把改動套到新版本上再送一次就會過),不是 5xx。
+    兩道關卡都要有 —— apply_event_update 裡的比對擋「表單開太久」,這裡的
+    stale_data_as_conflict 擋「兩個管理員前後腳按下儲存」。
+
+    快取失效是 **post-commit** 的獨立步驟,理由跟座位釋放同一個:先清快取再
+    commit 的話,一次 rollback 就會讓 Redis 重新載入到「還沒生效的舊值」,而那個
+    順序看起來完全正常,不會有任何錯誤。price_cents 與售票窗都在 EventMeta 裡,
+    不清的話最多 60 秒內還會按舊價賣。
+
+    稽核同樣是 post-commit:記的是「已經發生的事」。被 409 擋下的那些沒有改變任何
+    東西,不進稽核 —— 想知道有沒有人一直撞版本衝突,那是日誌與監控的問題。
+    """
+    event = await get_event(db, event_id=event_id)
+    if event is None:
+        raise EventNotFound(event_id=event_id)
+
+    changes = apply_event_update(event, data)
+    if not changes:
+        return event                       # no-op:沒有欄位變動,不動版本也不清快取
+
+    async with stale_data_as_conflict(
+        db, resource="event", resource_id=event_id, expected_version=data.version
+    ):
+        await db.commit()
+    await invalidate_event_meta(redis, event_id=event_id)
+    await emit_audit_event(
+        redis,
+        event_type="event.updated",
+        actor_user_id=current_admin.id,
+        actor_ip=client_ip(request),
+        target_type="event",
+        target_id=str(event_id),
+        payload={"changes": changes},
+    )
+    # updated_at 是 server-side onupdate,ORM 不知道資料庫填了什麼,所以 flush 之後
+    # 那個屬性是 expired 的。少了這次 refresh,序列化回應時的屬性存取會變成一次
+    # lazy load —— 在 async 底下就是 MissingGreenlet,而不是一句「值不對」。
+    await db.refresh(event)
+    return event
+
+
+@router.patch("/{event_id}/zone-prices", response_model=list[ZonePriceResponse])
+async def update_zone_prices_endpoint(
+        event_id: int,
+        data: ZonePricesUpdate,
+        request: Request,
+        db: DbSession,
+        redis: Redis,
+        current_admin: CurrentAdmin,
+) -> list[EventZonePrice]:
+    """整批調整分區票價。逐列樂觀鎖:每一列各帶自己的 version。
+
+    整批進同一個 transaction —— 任何一列版本不符就全部退回,管理員不會拿到一份
+    改到一半的價格表。回傳的是**完整**的價格表(含沒改動的那幾列),因為下一次
+    儲存需要每一列的新版本。
+
+    只清 EventMeta 快取,不清選區畫面那份:前者 60 秒 TTL 而且是**下單算錢**要
+    讀的,慢一秒都是按錯的價格賣票;後者 2 秒 TTL、純顯示,讓它自然過期就好。
+    """
+    event = await get_event(db, event_id=event_id)
+    if event is None:
+        raise EventNotFound(event_id=event_id)
+
+    prices, changes = await update_zone_prices(db, event, data)
+    if not changes:
+        return prices
+
+    # resource 用複數、id 用 event_id:flush 撞上時只知道「這批裡有一列輸了」,
+    # 答不出是哪一列(rowcount 對不上而已)。逐列的那道才報得出 zone_id。
+    async with stale_data_as_conflict(
+        db, resource="event_zone_prices", resource_id=event_id
+    ):
+        await db.commit()
+    await invalidate_event_meta(redis, event_id=event_id)
+    # 改價是直接影響營收的操作,而 updated_at 只說得出「有人改過」。稽核的
+    # payload 是 {zone_id: {from, to}} —— 事後查帳要的是金額本身,不是時間戳。
+    await emit_audit_event(
+        redis,
+        event_type="event.zone_prices_updated",
+        actor_user_id=current_admin.id,
+        actor_ip=client_ip(request),
+        target_type="event",
+        target_id=str(event_id),
+        payload={"changes": changes},
+    )
+    return prices
+
 
 @router.post("/{event_id}/publish", response_model=EventResponse)
 async def publish_event_endpoint(

@@ -7,14 +7,25 @@ The client is created once in app lifespan and injected via Depends.
 """
 from stripe import StripeClient, HTTPXClient
 
+from app.core.config import get_settings
 
-def create_stripe_client(api_key: str) -> tuple[StripeClient, HTTPXClient]:
+
+def create_stripe_client(
+    api_key: str, *, timeout_seconds: float | None = None
+) -> tuple[StripeClient, HTTPXClient]:
     """Build an async Stripe client + its HTTP client.
 
     Returns both: the StripeClient for requests, and the HTTPXClient so lifespan
     can `await http.close_async()` on shutdown (StripeClient exposes no close).
+
+    **逾時一定要顯式給。** `HTTPXClient` 的預設是 80 秒,遠長於我們的請求逾時,所以
+    永遠是外層先放棄 —— 客戶端拿到 504,而 log 裡沒有任何一行說是 Stripe 慢了。
+    webhook 那條路更糟:去重標記已經提交,Stripe 重送會被視為處理過,那筆退款就靜靜
+    不見了。設定的 validator 會確保這個值小於請求逾時。
     """
-    http = HTTPXClient()                          # async backend; one pooled connection set
+    if timeout_seconds is None:
+        timeout_seconds = get_settings().STRIPE_TIMEOUT_SECONDS
+    http = HTTPXClient(timeout=timeout_seconds)   # async backend; one pooled connection set
     return StripeClient(api_key, http_client=http), http
 
 

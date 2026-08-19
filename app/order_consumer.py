@@ -7,9 +7,11 @@ replicas — the consumer group load-balances entries across them). The ARQ
 worker keeps the reclaim/dead-letter safety net on its cron.
 """
 import asyncio
+import logging
 import signal
 
 from app.core.config import get_settings
+from app.core.logging import configure_logging
 from app.core.redis import create_redis_client
 from app.worker import (
     ensure_consumer_group,
@@ -19,7 +21,11 @@ from app.worker import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 async def main() -> None:
+    configure_logging(component="ticket-consumer")
     redis = create_redis_client(get_settings().REDIS_URL)
     await ensure_consumer_group(redis, ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP)
 
@@ -28,12 +34,12 @@ async def main() -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, stop.set)
 
-    print("order consumer started")
+    logger.info("order consumer started", extra={"event": "consumer_started"})
     try:
         await run_order_consumer_loop(redis, stop_event=stop)
     finally:
         await redis.aclose()
-        print("order consumer stopped")
+        logger.info("order consumer stopped", extra={"event": "consumer_stopped"})
 
 
 if __name__ == "__main__":

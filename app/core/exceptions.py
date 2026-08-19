@@ -7,6 +7,35 @@ Translated to HTTP responses by handlers in app/api/exception_handlers.py.
 class DomainError(Exception):
     """Base for all business-logic errors."""
 
+
+class ConcurrentModification(DomainError):
+    """樂觀鎖擋下的寫入:讀出來之後、寫回去之前,有人先改過這一列。
+
+    這不是「錯誤」而是競態 —— 同一份 payload 重送不會過(它帶的版本已經舊了),
+    但重新載入、把改動套到新版本上再送一次就會過。回 409 而不是 5xx 的理由就在
+    這裡:狀態衝突,不是伺服器壞了。
+
+    current_version 可能是 None:兩道關卡(見 app/db/optimistic.py)只有前面那道
+    在比對時知道對方的版本;flush 撞上的那道只知道 rowcount=0,而為了回報再讀一次
+    也未必讀得到當下的值(它可能又被改了)。前端一律重新載入即可。
+    """
+    def __init__(
+            self,
+            *,
+            resource: str,
+            resource_id: int,
+            expected_version: int | None = None,
+            current_version: int | None = None,
+    ):
+        self.resource = resource
+        self.resource_id = resource_id
+        self.expected_version = expected_version
+        self.current_version = current_version
+        super().__init__(
+            f"{resource} {resource_id} was modified by someone else; reload and retry"
+        )
+
+
 class EventError(DomainError):
     """Base for Event-related errors."""
 
@@ -24,6 +53,17 @@ class EventCancelled(EventError):
     def __init__(self, event_id: int):
         self.event_id = event_id
         super().__init__(f"Event {event_id} is cancelled")
+
+class InvalidEventUpdate(EventError):
+    """後台編輯的內容本身不成立(不是併發衝突,重送幾次都一樣)。
+
+    reason 會原樣回給呼叫端:這是後台端點,管理員需要知道到底哪裡不對,
+    而不是一句「更新失敗」。
+    """
+    def __init__(self, event_id: int, reason: str):
+        self.event_id = event_id
+        self.reason = reason
+        super().__init__(f"Cannot update event {event_id}: {reason}")
 
 class ZoneRequired(EventError):
     """有座位圖的場次必須指定要買哪一區 —— 票價與配位都以 zone 為單位。"""
@@ -44,6 +84,27 @@ class ZoneNotForEvent(EventError):
         self.zone_id = zone_id
         self.reason = reason
         super().__init__(f"Zone {zone_id} is not sellable for event {event_id}: {reason}")
+
+class ZoneNotFound(EventError):
+    """後台按 id 找不到這個 zone。
+
+    跟 ZoneNotForEvent 是兩件事:那個是「這個 zone 不能賣給這個場次」(對外只回
+    泛用訊息,免得被拿來探測場館結構),這個是後台的 404。
+    """
+    def __init__(self, zone_id: int):
+        self.zone_id = zone_id
+        super().__init__(f"Zone {zone_id} not found")
+
+class ZoneNameTaken(EventError):
+    """同一個場館裡已經有同名的區(uq_zones_venue_name)。
+
+    不先 SELECT 檢查再寫:那是 TOCTOU —— 兩個管理員同時改成同一個名字,兩邊的
+    預檢都會過。唯一索引才是真正的權威,所以改成攔截它丟出來的 IntegrityError。
+    """
+    def __init__(self, venue_id: int, name: str):
+        self.venue_id = venue_id
+        self.name = name
+        super().__init__(f"Venue {venue_id} already has a zone named {name!r}")
 
 class VenueNotFound(EventError):
     def __init__(self, venue_id: int):

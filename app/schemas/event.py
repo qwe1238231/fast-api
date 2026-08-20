@@ -56,6 +56,22 @@ class EventCreate(BaseModel):
                 raise ValueError("票價不得為負")
         return self
 
+    @model_validator(mode="after")
+    def _check_window(self) -> "EventCreate":
+        """時間欄位的先後。DB 有對應的 CHECK(ck_events_show_window /
+        ck_events_sale_window),這裡是同一組規則的前置版本。
+
+        兩層都要有,但理由不是「保險」而是**錯誤碼**:少了這一層,倒過來的日期會
+        一路走到 INSERT 才被 Postgres 擋下,而專案沒有全域的 IntegrityError
+        handler —— 管理員收到的會是 500,不是「ends_at 必須晚於 starts_at」。
+        DB 那層擋的是繞過這個 schema 的寫入路徑(migration、修資料的手動 SQL)。
+        """
+        if self.starts_at >= self.ends_at:
+            raise ValueError("starts_at 必須早於 ends_at")
+        if self.sale_starts_at >= self.sale_ends_at:
+            raise ValueError("sale_starts_at 必須早於 sale_ends_at")
+        return self
+
 class EventUpdate(BaseModel):
     """Request body for PATCH /v1/events/{id}(後台編輯)。
 

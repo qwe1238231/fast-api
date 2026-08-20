@@ -57,7 +57,10 @@ async def make_event(db, redis):
         # 少了它,`_all_keys` 對這把 key 的「清乾淨了」斷言會因為它從未存在而空過。
         await redis.hset(_purchased_key(event.id), "1", "2")
         if ends_days_ago is not None:
+            # 兩個都要往回搬:只動 ends_at 會造出「結束早於開演」的場次,而那是
+            # ck_events_show_window 擋掉的東西 —— 真實世界裡也不存在。
             event.ends_at = now - timedelta(days=ends_days_ago)
+            event.starts_at = event.ends_at - timedelta(hours=2)
         await db.commit()
         return event.id, zone_id
 
@@ -153,6 +156,7 @@ async def test_unseated_event_keys_are_purged_too(db, redis, published_event) ->
     published_event.ends_at = datetime.now(timezone.utc) - timedelta(
         days=EVENT_KEY_RETENTION_DAYS + 1
     )
+    published_event.starts_at = published_event.ends_at - timedelta(hours=2)
     await db.commit()
     key = _event_available_key(published_event.id)
     assert await redis.exists(key)

@@ -19,6 +19,23 @@ class Event(Base):
         # trusts; a 0/negative from an admin typo would poison it. Guard at the DB.
         CheckConstraint("total_seats > 0", name="ck_events_total_seats_pos"),
         CheckConstraint("price_cents >= 0", name="ck_events_price_nonneg"),
+        # 時間欄位的先後關係。理由跟 total_seats > 0 完全一樣:管理員打錯一個日期
+        # 不會噴任何錯,只會讓整場永遠賣不出去(sale_ends_at 早於 sale_starts_at)
+        # 或讓等候室的時間窗算出負的長度 —— 而這種故障沒有任何告警看得出來,
+        # 只有「為什麼沒人買票」。
+        CheckConstraint("starts_at < ends_at", name="ck_events_show_window"),
+        CheckConstraint(
+            "sale_starts_at < sale_ends_at", name="ck_events_sale_window"
+        ),
+        # 兩個 queue 欄位都是 nullable(NULL = 用 sale_starts_at 推導預設值),
+        # 所以只在**兩個都給定**時才有先後可言。CHECK 回傳 NULL 視同通過,其實
+        # 寫成 `queue_opens_at < queue_closes_at` 也是同樣效果 —— 但顯式寫出
+        # NULL 分支才看得出那是設計而不是漏想。
+        CheckConstraint(
+            "queue_opens_at IS NULL OR queue_closes_at IS NULL "
+            "OR queue_opens_at < queue_closes_at",
+            name="ck_events_queue_window",
+        ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)

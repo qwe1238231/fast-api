@@ -73,6 +73,10 @@ async def create_event(db: AsyncSession, data: EventCreate) -> Event:
 #: 互有先後關係的四個時間欄位 —— 部分更新後要一起重驗。
 _WINDOW_FIELDS = ("starts_at", "ends_at", "sale_starts_at", "sale_ends_at")
 
+#: 等候室的時間窗。兩欄都 nullable(NULL = 由 sale_starts_at 推導),所以只有
+#: 同時給定時才有先後可言 —— 跟 DB 的 ck_events_queue_window 同一條規則。
+_QUEUE_WINDOW_FIELDS = ("queue_opens_at", "queue_closes_at")
+
 
 
 def apply_event_update(event: Event, data: EventUpdate) -> FieldDiff:
@@ -113,6 +117,21 @@ def apply_event_update(event: Event, data: EventUpdate) -> FieldDiff:
         raise InvalidEventUpdate(event.id, "starts_at 必須早於 ends_at")
     if merged["sale_starts_at"] >= merged["sale_ends_at"]:
         raise InvalidEventUpdate(event.id, "sale_starts_at 必須早於 sale_ends_at")
+
+    # 等候室的窗:PATCH 改得動這兩欄,但先前完全沒驗。同樣要看合併後的值 ——
+    # 只送一個 queue_closes_at 的請求單看 payload 永遠合法。
+    queue = {
+        field: changes.get(field, getattr(event, field))
+        for field in _QUEUE_WINDOW_FIELDS
+    }
+    if (
+        queue["queue_opens_at"] is not None
+        and queue["queue_closes_at"] is not None
+        and queue["queue_opens_at"] >= queue["queue_closes_at"]
+    ):
+        raise InvalidEventUpdate(
+            event.id, "queue_opens_at 必須早於 queue_closes_at"
+        )
 
     diff: FieldDiff = {}
     for field, value in changes.items():

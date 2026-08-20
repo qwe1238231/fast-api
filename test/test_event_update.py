@@ -133,6 +133,40 @@ async def test_window_is_validated_against_the_merged_result(client, admin, even
     assert "sale_starts_at" in resp.json()["reason"]
 
 
+async def test_queue_window_is_validated_against_the_merged_result(client, admin, event):
+    """等候室的兩個時間欄位先前完全沒驗 —— PATCH 改得動,卻沒有任何規則看著。
+
+    倒過來的窗會讓 waiting_room.window() 算出負長度的登記期:抽籤永遠不開,
+    而且沒有任何錯誤 —— 只有「為什麼沒人被放進來」。
+    """
+    opens = event.sale_starts_at
+    resp = await client.patch(
+        f"/v1/events/{event.id}",
+        json={
+            "version": 1,
+            "queue_opens_at": opens.isoformat(),
+            "queue_closes_at": (opens - timedelta(hours=1)).isoformat(),
+        },
+        headers=admin,
+    )
+    assert resp.status_code == 422
+    assert "queue_opens_at" in resp.json()["reason"]
+
+
+async def test_clearing_one_queue_bound_is_still_allowed(client, admin, event):
+    """只設一邊是合法的 —— 另一邊 NULL 代表「用 sale_starts_at 推導的預設」。
+
+    這是那條 CHECK 必須容忍 NULL 的原因,也是它擋不住的那個缺口(見 window()
+    的兩個 fallback 各自獨立計算)。
+    """
+    resp = await client.patch(
+        f"/v1/events/{event.id}",
+        json={"version": 1, "queue_opens_at": event.sale_starts_at.isoformat()},
+        headers=admin,
+    )
+    assert resp.status_code == 200
+
+
 async def test_total_seats_is_not_editable(client, admin, event):
     """庫存上限不能靠一次 UPDATE 改 —— Redis 那份已經照舊值初始化了。"""
     resp = await client.patch(

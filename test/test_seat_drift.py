@@ -194,5 +194,6 @@ async def test_long_finished_events_are_not_inspected(db, redis, seated) -> None
     event.ends_at = datetime.now(timezone.utc) - timedelta(
         days=EVENT_KEY_RETENTION_DAYS + 1
     )
+    event.starts_at = event.ends_at - timedelta(hours=2)
     await db.commit()
     assert await _drift(redis) == [], "已過保留期的場次不該再被檢查"

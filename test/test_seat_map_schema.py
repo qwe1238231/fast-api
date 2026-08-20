@@ -264,6 +264,84 @@ async def test_a_hold_ending_on_the_last_seat_is_allowed(db, seat_map) -> None:
     assert await db.scalar(select(SeatHold.last_pos)) == 9
 
 
+# ─ 訂單的 zone 必須屬於這個場次
+
+async def test_order_cannot_reference_a_zone_from_another_venue(db, seat_map) -> None:
+    """event 在場館 A,zone 在場館 B —— 單欄的 zone_id 外鍵完全看不出這有問題。
+
+    複合外鍵指向 event_zone_prices 的主鍵 (event_id, zone_id),而場館 B 的 zone
+    在這個場次沒有價格列,所以這一列進不去。擋的是「訂單指到別的場館的區」:
+    金額算錯、配位算到不存在的庫存、對帳兜不起來,全都從這裡開始。
+    """
+    other_venue = Venue(name="Someone Else's Arena")
+    db.add(other_venue)
+    await db.flush()
+    foreign_zone = Zone(venue_id=other_venue.id, name="別館搖滾區", display_order=0)
+    db.add(foreign_zone)
+    await db.flush()
+
+    db.add(
+        Order(
+            user_id=seat_map["user"].id,
+            event_id=seat_map["event"].id,
+            zone_id=foreign_zone.id,
+            quantity=1,
+            total_price_cents=5000,
+            status=OrderStatus.PENDING,
+            idempotency_key=uuid4(),
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await db.flush()
+
+
+async def test_order_cannot_reference_an_unpriced_zone(db, seat_map) -> None:
+    """同一個場館、但這個場次沒給這一區定價。
+
+    publish_event 的 ZonePricesIncomplete 已經在應用層擋過,但那只在發布的那一刻
+    檢查一次;之後新增的 zone 不會重跑。這條讓「賣一張沒有定價的票」在 DB 層就
+    不可能 —— 而 total_price_cents 是快照,錯了就沒有第二次機會回頭算對。
+    """
+    unpriced = Zone(venue_id=seat_map["venue"].id, name="臨時加開區", display_order=9)
+    db.add(unpriced)
+    await db.flush()
+
+    db.add(
+        Order(
+            user_id=seat_map["user"].id,
+            event_id=seat_map["event"].id,
+            zone_id=unpriced.id,
+            quantity=1,
+            total_price_cents=5000,
+            status=OrderStatus.PENDING,
+            idempotency_key=uuid4(),
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await db.flush()
+
+
+async def test_order_without_a_zone_is_unaffected(db, seat_map) -> None:
+    """zone_id 是 NULL 時複合外鍵整條放行(Postgres 預設的 MATCH SIMPLE)。
+
+    這正是這條約束能跟 nullable 的 zone_id 共存的原因。改成 MATCH FULL 的話,
+    因為 event_id 是 NOT NULL,zone_id 會變成實質必填 —— 無座位圖的場次全部下不了單。
+    這個測試就是那道防線。
+    """
+    order = Order(
+        user_id=seat_map["user"].id,
+        event_id=seat_map["event"].id,
+        zone_id=None,
+        quantity=1,
+        total_price_cents=1500,
+        status=OrderStatus.PENDING,
+        idempotency_key=uuid4(),
+    )
+    db.add(order)
+    await db.commit()
+    assert order.id is not None
+
+
 async def test_last_pos_is_generated_not_writable(db, seat_map) -> None:
     """生成欄位:寫進去的值會被忽略,由 DB 自己算 —— 否則它就只是另一個會漂移的
     反正規化欄位,而那正是這個設計要避開的東西。"""

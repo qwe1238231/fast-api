@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from uuid import UUID
 from sqlalchemy import Index, text
-from sqlalchemy import DateTime, ForeignKey, String, Uuid
+from sqlalchemy import DateTime, ForeignKey, ForeignKeyConstraint, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from sqlalchemy import Enum as SAEnum
@@ -62,6 +62,23 @@ class Order(Base):
             "status <> 'cancelled' OR cancelled_at IS NOT NULL",
             name="ck_orders_cancelled_at",
         ),
+        # (event_id, zone_id) 指向 event_zone_prices 的**主鍵**。取代原本的單欄
+        # fk_orders_zone_id —— 那條只保證「zone 存在」,擋不住「這一區根本不屬於
+        # 這場次的場館」。zone 的存在性由 event_zone_prices.zone_id 遞移保證,
+        # 所以單欄那條是冗餘的,留著只是在最熱的寫入路徑上多一次查表。
+        #
+        # 附帶保證:有訂單的 zone 一定有票價。少了價格列的 zone 算進 total_seats
+        # 卻永遠賣不掉(見 publish_event 的 ZonePricesIncomplete),現在連「訂單指
+        # 到沒定價的區」這條路也被 DB 封死。
+        #
+        # NULL 語意靠 Postgres 的預設 MATCH SIMPLE:任一參照欄位是 NULL 就整條放行。
+        # 所以無座位圖的場次(zone_id IS NULL)完全不受影響。**不要改成 MATCH FULL**
+        # —— event_id 是 NOT NULL,那會讓 zone_id 變成實質必填,把非座位場次全擋死。
+        ForeignKeyConstraint(
+            ["event_id", "zone_id"],
+            ["event_zone_prices.event_id", "event_zone_prices.zone_id"],
+            name="fk_orders_event_zone_price",
+        ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)  # covered by ix_orders_user_created
@@ -69,7 +86,8 @@ class Order(Base):
     # 買的是哪一區。分區票價下這是必要的來源資訊,但金額本身仍以
     # total_price_cents 的快照為準(所以之後改價動不到已成立的訂單,
     # webhook 的金額驗證也不必重算)。nullable:無座位圖的場次留空。
-    zone_id: Mapped[int | None] = mapped_column(ForeignKey("zones.id"), nullable=True)
+    # 外鍵是 __table_args__ 裡的複合 fk_orders_event_zone_price,不是單欄的。
+    zone_id: Mapped[int | None] = mapped_column(nullable=True)
     quantity: Mapped[int] = mapped_column(nullable=False)
     total_price_cents: Mapped[int] = mapped_column(nullable=False)
     status: Mapped[OrderStatus] = mapped_column(

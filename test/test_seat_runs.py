@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 
 from app.models.event import Event, EventStatus
-from app.models.seating import SeatBlock, SeatHold, Zone
+from app.models.seating import EventZonePrice, SeatBlock, SeatHold, Zone
 from app.models.user import User
 from app.models.order import Order, OrderStatus
 from app.scripts.seed_venue import RowSpec, VenueSpec, ZoneSpec, odd_even_labels, seed_venue
@@ -67,6 +67,16 @@ async def _make_event(db, venue_id: int, total_seats: int) -> Event:
         total_seats=total_seats, price_cents=100, status=EventStatus.PUBLISHED,
     )
     db.add(event)
+    await db.flush()
+    # 每個 zone 都要有票價 —— create_event 在生產路徑上就是這樣建的,而
+    # orders 的 fk_orders_event_zone_price 會擋下沒有價格列的 (event, zone)。
+    # 少了這幾列的 fixture 造得出真實系統造不出的狀態,測試就不再是在測真實系統。
+    db.add_all([
+        EventZonePrice(event_id=event.id, zone_id=zone_id, price_cents=100)
+        for zone_id in (
+            await db.scalars(select(Zone.id).where(Zone.venue_id == venue_id))
+        ).all()
+    ])
     await db.flush()
     return event
 

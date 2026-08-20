@@ -19,7 +19,10 @@ class BuyerInfo(Base):
 
     national_id_dek_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False,)
 
-    national_id_lookup_hash: Mapped[str] = mapped_column(LargeBinary, nullable=False, unique=True, index=True,)
+    # BYTEA,不是 str —— pii.lookup_hash() 回的是 raw digest。標註寫 str 的話
+    # type checker 對這個欄位就失效了,而它是查詢鍵:拿 str 去比對 bytea 不會
+    # 靜默失敗,是 asyncpg 直接丟型別錯誤,但那要跑到才知道。
+    national_id_lookup_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, unique=True, index=True,)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

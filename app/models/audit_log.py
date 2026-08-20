@@ -25,7 +25,7 @@ class AuditLog(Base):
         index=True,
     )
 
-    actor_ip: Mapped[int | None] = mapped_column(
+    actor_ip: Mapped[str | None] = mapped_column(
         String(45),  # Supports IPv4 and IPv6
         nullable=True,
     )

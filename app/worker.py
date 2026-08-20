@@ -12,12 +12,12 @@ from typing import ParamSpec, TypeVar
 
 import boto3
 from botocore.config import Config
-from datetime import timedelta, timezone, datetime
+from datetime import date, timedelta, timezone, datetime
 from uuid import UUID
 
 from arq import cron
 from arq.connections import RedisSettings
-from sqlalchemy import select, delete
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,7 +31,7 @@ from app.services.orders import expire_order, release_order_seat
 from app.crud.order import create_order, get_order_by_idempotency_key
 from app.crud.refresh_token import purge_expired
 from app.crud.stripe_event import cutoff_for, purge_events_older_than
-from app.models.audit_log import AuditLog
+from app.models.audit_log import DEFAULT_PARTITION, AuditLog, partition_name
 from app.services.audit import AUDIT_STREAM_KEY
 from app.models.event import Event, EventStatus
 from app.services.inventory import (
@@ -184,11 +184,73 @@ async def purge_expired_refresh_tokens(ctx: dict) -> None:
                 extra={"event": "refresh_token_purge_failed"},
             )
 
+#: 月分區要預先建幾個月。1 就夠讓跨月不掉進 DEFAULT,3 是留給「cron 掛了兩個月
+#: 沒人發現」的緩衝 —— 而補建分區的代價幾乎是零(空表一張)。
+AUDIT_PARTITION_LOOKAHEAD_MONTHS = 3
+
+
+def _month_range(year: int, month: int) -> tuple[str, str]:
+    """半開區間 [start, end) 的兩個日期字串。"""
+    start = date(year, month, 1)
+    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return start.isoformat(), end.isoformat()
+
+
+def _add_months(anchor: date, offset: int) -> tuple[int, int]:
+    year, month = divmod(anchor.month - 1 + offset, 12)
+    return anchor.year + year, month + 1
+
+
+@cron_job
+async def ensure_audit_log_partitions(ctx: dict) -> None:
+    """為當月與接下來幾個月預先建好 audit_logs 的分區。
+
+    **一定要事先建。** DEFAULT 分區一旦收下了某個月的列,再想為那個月建分區會被
+    Postgres 直接拒絕(既有列會違反新分區的約束)—— 而那時候唯一的出路是把列搬出來
+    再搬回去,在正式環境上就是一次計畫外的停機。所以這支 job 的價值不在它做了什麼,
+    在它讓 DEFAULT 永遠是空的。
+
+    DEFAULT 不是備援方案,是**告警**:裡面有列就代表這支 job 沒跑成功。
+    """
+    today = datetime.now(timezone.utc).date()
+    async with AsyncSessionLocal() as db:
+        for offset in range(AUDIT_PARTITION_LOOKAHEAD_MONTHS):
+            year, month = _add_months(today, offset)
+            name = partition_name(year, month)
+            start, end = _month_range(year, month)
+            try:
+                # 每個分區各自一個交易:某一個月失敗(例如 DEFAULT 已經收了那個月的
+                # 列)不該讓其他月份也建不成。
+                await db.execute(
+                    text(
+                        f"CREATE TABLE IF NOT EXISTS {name} PARTITION OF audit_logs "
+                        f"FOR VALUES FROM ('{start}') TO ('{end}')"
+                    )
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                logger.exception(
+                    "failed to create audit log partition",
+                    extra={
+                        "event": "audit_partition_create_failed",
+                        "partition": name,
+                    },
+                )
+
+
 @cron_job
 async def purge_old_audit_logs(ctx: dict) -> None:
-    """Cron job: hard delete audit_logs older than retention window.
-    
+    """Cron job: drop audit_logs partitions past the retention window.
+
     GDPR data minimization — audit events past investigation horizon get purged.
+
+    以前這裡是 `DELETE ... WHERE created_at < cutoff`,單一交易、無批次。那會讓
+    WAL 暴衝、複寫延遲,而且死列要等 autovacuum 慢慢回收 —— 表在磁碟上不會縮。
+    改成 DROP 整個分區之後,同一件事是 O(1) 的目錄操作:不產生 WAL,也沒有 vacuum。
+
+    只 DROP **整段都在保留窗之外**的月份。跨在邊界上的那個月一列都不動 —— 少留
+    幾天資料不算問題,提早刪掉還在保留期內的稽核紀錄才是。
     """
     settings = get_settings()
     cutoff = datetime.now(timezone.utc) - timedelta(
@@ -196,25 +258,102 @@ async def purge_old_audit_logs(ctx: dict) -> None:
     )
     async with AsyncSessionLocal() as db:
         try:
-            result = await db.execute(
-                delete(AuditLog).where(AuditLog.created_at < cutoff)
+            rows = (
+                await db.execute(
+                    text(
+                        """
+                        SELECT c.relname,
+                               pg_get_expr(c.relpartbound, c.oid)
+                        FROM pg_inherits i
+                        JOIN pg_class c ON c.oid = i.inhrelid
+                        WHERE i.inhparent = 'audit_logs'::regclass
+                          AND c.relname <> :default_name
+                        """
+                    ),
+                    {"default_name": DEFAULT_PARTITION},
+                )
+            ).all()
+        except Exception:
+            logger.exception(
+                "failed to list audit log partitions",
+                extra={"event": "audit_log_purge_failed"},
             )
-            await db.commit()
-            if result.rowcount > 0:
-                logger.info(
-                    "purged old audit logs",
+            return
+
+        dropped: list[str] = []
+        for name, bounds in rows:
+            # 分區名就是它的範圍(見 app/models/audit_log.py 的 PARTITION_NAME_FORMAT),
+            # 但這裡刻意不從名字反推 —— 名字是慣例,relpartbound 是事實。手動建過的
+            # 分區如果範圍跟名字對不上,信名字就會刪錯資料。
+            upper = _partition_upper_bound(bounds)
+            if upper is None or upper > cutoff:
+                continue
+            try:
+                await db.execute(text(f"DROP TABLE {name}"))
+                await db.commit()
+                dropped.append(name)
+            except Exception:
+                await db.rollback()
+                logger.exception(
+                    "failed to drop audit log partition",
                     extra={
-                        "event": "audit_logs_purged",
-                        "purged": result.rowcount,
-                        "retention_days": settings.AUDIT_LOG_RETENTION_DAYS,
+                        "event": "audit_log_purge_failed",
+                        "partition": name,
                     },
                 )
+
+        # DEFAULT 分區不能整個 DROP(它是「沒有對應月份」那些列的唯一去處),所以
+        # 裡面過期的列還是得用 DELETE 清。正常情況它是空的 —— 有東西就代表
+        # ensure_audit_log_partitions 曾經漏建過分區,那本身值得看見。
+        try:
+            leftover = await db.execute(
+                text(
+                    f"DELETE FROM {DEFAULT_PARTITION} WHERE created_at < :cutoff"
+                ),
+                {"cutoff": cutoff},
+            )
+            await db.commit()
         except Exception:
             await db.rollback()
             logger.exception(
-                "failed to purge audit logs",
+                "failed to purge the default audit partition",
                 extra={"event": "audit_log_purge_failed"},
             )
+            return
+
+        if dropped or leftover.rowcount:
+            logger.info(
+                "purged old audit logs",
+                extra={
+                    "event": "audit_logs_purged",
+                    "dropped_partitions": dropped,
+                    "deleted_from_default": leftover.rowcount,
+                    "retention_days": settings.AUDIT_LOG_RETENTION_DAYS,
+                },
+            )
+
+
+def _partition_upper_bound(bounds: str) -> datetime | None:
+    """從 `FOR VALUES FROM ('...') TO ('...')` 取出上界。
+
+    回 None 代表看不懂(例如 DEFAULT,或手動建的怪形狀)—— 呼叫端一律當成「不要動」。
+    寧可留著不該留的分區,也不要刪掉看不懂的東西。
+    """
+    marker = "TO ("
+    start = bounds.find(marker)
+    if start == -1:
+        return None
+    inner = bounds[start + len(marker):].strip()
+    if not inner.startswith("'"):
+        return None
+    end = inner.find("'", 1)
+    if end == -1:
+        return None
+    try:
+        parsed = datetime.fromisoformat(inner[1:end])
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 @cron_job
 async def purge_old_stripe_events(ctx: dict) -> None:
@@ -1227,6 +1366,9 @@ class WorkerSettings:
         cron(report_queue_depth, minute={i for i in range(60)}),
         # 每分鐘都要發(包含 0),否則預熱的告警會停在 INSUFFICIENT_DATA 而不是 OK。
         cron(publish_prewarm_signal, minute={i for i in range(60)}),
+        # 建分區排在 purge 之前:同一次維護窗裡先把未來鋪好、再回收過去。順序反過來
+        # 也不會壞,但「先確保有地方寫」是比較好的直覺。
+        cron(ensure_audit_log_partitions, hour={2}, minute={15}),
         cron(purge_old_audit_logs, hour={2}, minute={30}),
         cron(purge_old_stripe_events, hour={2}, minute={45}),
         cron(detect_inventory_drift, minute=set(range(0, 60, 5))),

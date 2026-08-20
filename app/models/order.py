@@ -81,7 +81,14 @@ class Order(Base):
         ),
     )
     id: Mapped[int] = mapped_column(primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)  # covered by ix_orders_user_created
+    # RESTRICT 不是預設值的同義詞,是一句宣告:**訂單不隨使用者消失**。訂單是會計
+    # 憑證(商業會計法要求保存五年),個資法的刪除請求不凌駕法定保存義務,所以
+    # 「抹除使用者」的正解是匿名化而不是連坐刪除 —— 見 app/services/erasure.py。
+    # 這條 FK 的作用是讓任何人想抄捷徑時,資料庫會先擋下來。
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT", name="fk_orders_user_id"),
+        nullable=False,
+    )  # covered by ix_orders_user_created
     event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)  # covered by ix_orders_active (event_id, status)
     # 買的是哪一區。分區票價下這是必要的來源資訊,但金額本身仍以
     # total_price_cents 的快照為準(所以之後改價動不到已成立的訂單,

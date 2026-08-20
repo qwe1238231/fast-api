@@ -7,8 +7,11 @@ from app.db.base import Base
 class BuyerInfo(Base):
     __tablename__ = "buyer_info"
     id: Mapped[int] = mapped_column(primary_key=True)
+    # CASCADE:這一列**就是**個資。使用者真的被刪掉時它沒有任何留下來的理由,
+    # 而且刪掉它等於 crypto-shred —— ciphertext 與被 KEK 包住的 DEK 一起消失,
+    # KEK 還在也解不開(見 app/services/pii.py 的信封加密)。
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id"),
+        ForeignKey("users.id", ondelete="CASCADE", name="fk_buyer_info_user_id"),
         nullable=False,
         unique=True,
     )

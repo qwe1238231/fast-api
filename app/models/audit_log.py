@@ -19,8 +19,12 @@ class AuditLog(Base):
         index=True,
     )
     
+    # SET NULL:稽核紀錄必須比它記錄的那個人活得久 —— 「誰在什麼時候改了什麼」
+    # 的價值恰恰在事後,而 CASCADE 會讓「刪掉帳號」變成「湮滅自己的紀錄」。
+    # 這一欄本來就 nullable(系統自身的動作沒有 actor),所以 SET NULL 不需要
+    # 任何 schema 讓步:actor 消失了,事件本身還在。
     actor_user_id: Mapped[int | None] = mapped_column(
-        ForeignKey("users.id"),
+        ForeignKey("users.id", ondelete="SET NULL", name="fk_audit_logs_actor_user_id"),
         nullable=True,
         index=True,
     )

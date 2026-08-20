@@ -1,11 +1,20 @@
 from fastapi import APIRouter, HTTPException, Request, status
 from sqlalchemy.exc import IntegrityError
 
-from app.api.deps import DbSession, CurrentUser, Redis, enforce_ip_rate_limit
+from app.api.deps import (
+    CurrentAdmin,
+    CurrentUser,
+    DbSession,
+    Redis,
+    client_ip,
+    enforce_ip_rate_limit,
+)
 from app.core.config import get_settings
-from app.crud.user import create_user
+from app.crud.user import create_user, get_user_by_id
 from app.models import User
 from app.schemas.user import UserCreate, UserResponse
+from app.services.audit import emit_event as emit_audit_event
+from app.services.erasure import erase_user, is_erased
 
 router = APIRouter(prefix="/users", tags=["users"])
 
@@ -42,3 +51,46 @@ async def register_user(
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: CurrentUser) -> User:
     return current_user
+
+
+@router.delete("/{user_id}", response_model=UserResponse)
+async def erase_user_endpoint(
+    user_id: int,
+    request: Request,
+    db: DbSession,
+    redis: Redis,
+    current_admin: CurrentAdmin,
+) -> User:
+    """個資抹除請求。**匿名化,不是刪除** —— 見 app/services/erasure.py。
+
+    走管理員而不是 `/me`,兩個理由:個資法的刪除請求是向資料控管者提出的,而且
+    這個動作要留下一筆說得出「誰執行的」的稽核紀錄。使用者自助抹除自己的話,
+    actor 就是那個剛剛被匿名化的人。
+
+    回 200 帶匿名化後的 user 而不是 204:呼叫端需要看到結果長什麼樣才能確認
+    抹除真的生效了。重複請求是 no-op 也回 200 —— 抹除是冪等的,第二次收到 404
+    或 409 只會讓重試邏輯變複雜,而抹除請求本來就可能被重送。
+    """
+    user = await get_user_by_id(db, user_id)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+        )
+    if is_erased(user):
+        return user
+
+    await erase_user(db, user=user)
+    await db.commit()
+    # 稽核在 commit 之後,理由跟事件快取失效同一條:先送出、後 rollback 的話,
+    # 紀錄裡會有一次從未發生的抹除。actor_user_id 記的是執行的管理員,
+    # target 才是被抹除的人 —— 而這筆紀錄會活得比那個帳號久(SET NULL 只在
+    # 管理員自己被刪掉時生效,被抹除的人是 target,不受影響)。
+    await emit_audit_event(
+        redis,
+        event_type="user.erased",
+        actor_user_id=current_admin.id,
+        actor_ip=client_ip(request),
+        target_type="user",
+        target_id=str(user_id),
+    )
+    return user

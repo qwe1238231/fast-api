@@ -33,8 +33,9 @@ class RefreshToken(Base):
         nullable=True,
     )
 
+    # CASCADE:session 離開了它的主人就沒有意義,留著只是一堆指不到人的雜湊。
     user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id"),
+        ForeignKey("users.id", ondelete="CASCADE", name="fk_refresh_tokens_user_id"),
         nullable=False,
         index=True,
     )

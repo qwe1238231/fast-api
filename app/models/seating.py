@@ -13,6 +13,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     DDL,
+    BigInteger,
     CheckConstraint,
     Computed,
     DateTime,
@@ -213,10 +214,15 @@ class SeatHold(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    # BIGINT:這張表跟著有座位的訂單成長,所以它的序列消耗速率跟 orders 同級。
+    # event_id / block_id 維持 int4 —— 那兩張是有界的目錄型資料,跟著變寬只是
+    # 讓每一列與每一個索引項多背 4 bytes,換來永遠用不到的餘裕。
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)
     block_id: Mapped[int] = mapped_column(ForeignKey("seat_blocks.id"), nullable=False)
-    order_id: Mapped[int] = mapped_column(ForeignKey("orders.id"), nullable=False)
+    order_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("orders.id"), nullable=False
+    )
     start_pos: Mapped[int] = mapped_column(nullable=False)
     length: Mapped[int] = mapped_column(nullable=False)
     last_pos: Mapped[int] = mapped_column(

@@ -1,6 +1,6 @@
 from datetime import datetime
 from uuid import UUID , uuid4
-from sqlalchemy import Uuid, DateTime, ForeignKey , String
+from sqlalchemy import BigInteger, Uuid, DateTime, ForeignKey , String
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from app.db.base import Base
@@ -8,7 +8,10 @@ from app.db.base import Base
 
 class RefreshToken(Base):
     __tablename__ = "refresh_tokens"
-    id: Mapped[int] = mapped_column(primary_key=True)
+    # BIGINT,而且**這張表是四張裡燒得最快的**。序列消耗跟登入次數不成比例:
+    # 每次登入開一條,之後每一次 rotation 再開一條,而清理 job 刪掉的列不會把
+    # 序列值還回來。100 萬次登入/天 × 10 次輪替 ≈ 1000 萬/天,int4 撐約 210 天。
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
     family_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -28,7 +31,10 @@ class RefreshToken(Base):
         server_default=func.now(),
     )
 
+    # 跟著 id 一起變 BIGINT —— 自我外鍵的兩端型別必須一致,不然 RI 檢查每次都要
+    # 隱式轉型,索引也用不上。
     parent_id: Mapped[int | None] = mapped_column(
+        BigInteger,
         ForeignKey("refresh_tokens.id"),
         nullable=True,
     )

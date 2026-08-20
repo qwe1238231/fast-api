@@ -86,6 +86,32 @@ jobs:
           PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
         run: alembic check
 
+      # `alembic check` 比對欄位、索引、約束,但**看不到 sequence 的型別**。
+      # 那正好是加寬主鍵時最容易漏的一步:ALTER TABLE ... TYPE BIGINT 不會動到
+      # 它所擁有的 sequence,所以欄位變成 bigint 而序列仍在 21 億封頂 —— 一支
+      # 顯示成功、實際上什麼都沒修好的 migration,而且要到真的滿了才會發現。
+      #
+      # 這一步同樣進不了 pytest:測試是 metadata.create_all 建的,SQLAlchemy 一定
+      # 會配對正確的序列型別,所以在那裡永遠是綠的。只有跑過 migration 的資料庫
+      # 才看得見這種漂移。
+      - name: Check sequences match their columns
+        run: |
+          drift=$(psql "postgresql://justinhu@localhost:5432/testdb" -tA -c "
+            SELECT s.seqrelid::regclass || ': sequence is ' ||
+                   format_type(s.seqtypid, NULL) || ' but ' ||
+                   a.attrelid::regclass || '.' || a.attname || ' is ' ||
+                   format_type(a.atttypid, a.atttypmod)
+            FROM pg_sequence s
+            JOIN pg_depend d ON d.objid = s.seqrelid AND d.deptype = 'a'
+            JOIN pg_attribute a
+              ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+            WHERE s.seqtypid <> a.atttypid;")
+          if [ -n "$drift" ]; then
+            echo "序列型別與欄位型別不一致 —— 加寬主鍵時漏了 ALTER SEQUENCE:"
+            echo "$drift"
+            exit 1
+          fi
+
       - name: Run pytest
         env:
           DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb

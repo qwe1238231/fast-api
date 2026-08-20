@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from uuid import UUID
 from sqlalchemy import Index, text
-from sqlalchemy import DateTime, ForeignKey, ForeignKeyConstraint, String, Uuid
+from sqlalchemy import BigInteger, DateTime, ForeignKey, ForeignKeyConstraint, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from sqlalchemy import Enum as SAEnum
@@ -80,7 +80,10 @@ class Order(Base):
             name="fk_orders_event_zone_price",
         ),
     )
-    id: Mapped[int] = mapped_column(primary_key=True)
+    # BIGINT。int4 的 21 億上限對訂單不是理論值:**失敗的 INSERT 一樣吃掉序列值**,
+    # 而搶票系統的 idempotency 衝突與各種被擋下的下單都會走到那一步。真的滿了才改
+    # 是一次全表重寫的停機,現在改是毫秒。
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     # RESTRICT 不是預設值的同義詞,是一句宣告:**訂單不隨使用者消失**。訂單是會計
     # 憑證(商業會計法要求保存五年),個資法的刪除請求不凌駕法定保存義務,所以
     # 「抹除使用者」的正解是匿名化而不是連坐刪除 —— 見 app/services/erasure.py。

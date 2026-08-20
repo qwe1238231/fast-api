@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any
-from sqlalchemy import DateTime, ForeignKey, String
+from sqlalchemy import BigInteger, DateTime, ForeignKey, String
 from sqlalchemy.dialects.postgresql import JSONB 
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func 
@@ -11,7 +11,9 @@ from app.db.base import Base
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
-    id: Mapped[int] = mapped_column(primary_key=True)
+    # BIGINT。每一次管理動作與每一次認證事件都是一列,而這張表沒有保留策略,
+    # 是全庫唯一真正無界成長的那張(見待辦的 audit_logs 分區)。
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
 
     event_type: Mapped[str] = mapped_column(
         String(64),

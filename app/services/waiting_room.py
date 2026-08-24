@@ -61,13 +61,32 @@ async def set_admission_paused(redis: Redis, paused: bool, *, ttl_seconds: int =
     await publish_global_poke(redis)   # nudge every waiting SSE connection to re-read status()
 
 
+def effective_window(
+    sale_starts_at: datetime,
+    queue_opens_at: datetime | None,
+    queue_closes_at: datetime | None,
+) -> tuple[datetime, datetime]:
+    """登記窗的實際邊界:顯式欄位優先,NULL 的那側用 sale_starts_at 減去設定的
+    lead / buffer 推導(行為 A)。
+
+    抽成純函式(而不是只有吃 Event 的版本)是給 event_admin 的 PATCH 驗證用的:
+    兩個 fallback 各自獨立計算,所以「opens 設在預設 closes 之後、closes 留 NULL」
+    能組出倒過來的有效窗,而**兩個欄位各自都合法** —— DB 的 ck_events_queue_window
+    只在兩欄都非 NULL 時有先後可言,這個缺口只能由「用同一條公式驗合併後的值」補。
+    驗證跟執行共用這一個函式,兩邊才不會漂移。
+    """
+    s = get_settings()
+    opens = queue_opens_at or sale_starts_at - timedelta(seconds=s.QUEUE_LEAD_TIME_SECONDS)
+    closes = queue_closes_at or sale_starts_at - timedelta(seconds=s.QUEUE_ADMISSION_BUFFER_SECONDS)
+    return opens, closes
+
+
 def window(event: Event) -> tuple[datetime, datetime]:
     """(opens_at, closes_at) for registration. Explicit columns win; otherwise
     fall back to sale_starts_at minus the configured lead / buffer (behaviour A)."""
-    s = get_settings()
-    opens = event.queue_opens_at or event.sale_starts_at - timedelta(seconds=s.QUEUE_LEAD_TIME_SECONDS)
-    closes = event.queue_closes_at or event.sale_starts_at - timedelta(seconds=s.QUEUE_ADMISSION_BUFFER_SECONDS)
-    return opens, closes
+    return effective_window(
+        event.sale_starts_at, event.queue_opens_at, event.queue_closes_at
+    )
 
 
 async def _ensure_salt(redis: Redis, event_id: int) -> str:

@@ -28,6 +28,13 @@ down_revision: Union[str, Sequence[str], None] = 'b7e2c94a10f3'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+BACKWARD_INCOMPATIBLE = """\
+換掉四條指向 users 的外鍵的 ON DELETE 政策(drop 再 add)。守門測試的原生 SQL 掃描
+會標 ADD FOREIGN KEY —— 但這裡參照關係本身沒變,只有**刪除行為**變了,而舊程式碼
+根本沒有任何刪 users 的路徑(當時連刪除端點都不存在)。舊 task 不可能觸發這四條
+政策的任何分支,更寫不出違反參照的列(欄位與目標都與舊約束相同)。\
+"""
+
 
 #: (table, column, 舊的 PG 預設名, 新名, ON DELETE)
 _FKS: tuple[tuple[str, str, str, str, str], ...] = (

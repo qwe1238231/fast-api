@@ -1,6 +1,6 @@
 name: deploy
 
-# Push to main → build the image, push to ECR, roll the ECS services.
+# Push to main → run the tests, build the image, migrate, roll the ECS services.
 on:
   push:
     branches: [main]
@@ -10,6 +10,13 @@ permissions:
   id-token: write
   contents: read
 
+# 部署不可以有兩份同時跑:兩次快速推送會讓兩組 migration 與兩組 update-service 交錯,
+# 最後線上跑的是哪一個 SHA 變成賽跑結果。cancel-in-progress 是 false —— 取消一個跑到
+# 一半的部署(migration 已經下去、服務還沒滾)比讓它跑完更糟。
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
 env:
   AWS_REGION: ap-northeast-2
   CLUSTER: justin-test
@@ -17,10 +24,22 @@ env:
   ROLE_ARN: arn:aws:iam::992382571445:role/justin-test-github-actions
 
 jobs:
+  # 測試是部署的**第一關**,不是平行跑的另一支工作流。舊寫法是 test.yml 與 deploy.yml
+  # 各自被 push 觸發,所以「測試紅了」跟「已經部署上去了」可以同時成立 —— 而且部署
+  # 通常先完成,因為它不必裝 Rust toolchain。
+  test:
+    uses: ./.github/workflows/test.yml
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest # x86_64 runner → native build (task defs are X86_64)
     steps:
+      # fetch-depth: 0 是為了下面那步能跟「上一次部署的 commit」比較,判斷這次推送
+      # 有沒有帶新的 migration。預設的淺 clone(depth 1)拿不到那個 commit,而拿不到
+      # 的後果會是「每次都拍快照」或「每次都不拍」—— 兩個都不對。
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # Swap the OIDC token for 15-min AWS creds — no stored access keys.
       - name: Configure AWS credentials (OIDC)
@@ -32,19 +51,211 @@ jobs:
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Tag with the commit SHA (identifiable/rollback-able) AND latest (what the
-      # task defs pull). Native x86 build on the runner — no QEMU.
+      # `latest` 還是推(手動 run-task、本機 pull 會用到),但**服務不再靠它**。
+      # 服務改指向釘住 SHA 的 task def 修訂版,理由有兩個:
+      #   - 可回滾:回上一版就是 update-service 指回上一個修訂版,不必重推 image。
+      #   - 可知道現在跑的是誰:describe-services 直接看得到 SHA。靠 :latest 的話,
+      #     一個在半夜被替換掉的任務會安靜地拉到「當時的」:latest —— 那可能已經不是
+      #     當初部署的那一版,而且沒有任何紀錄顯示它換過。
       - name: Build & push image
         run: |
           docker build -t "$ECR_REPO:$GITHUB_SHA" -t "$ECR_REPO:latest" .
           docker push "$ECR_REPO:$GITHUB_SHA"
           docker push "$ECR_REPO:latest"
 
-      # force-new-deployment makes each service pull the new :latest and roll.
+      # 照抄現行定義、只換 image,再註冊成新修訂版。「照抄」是重點:祕密、環境變數、
+      # log 設定全部由 Terraform 擁有,CI 不該有第二份規格 —— 那份副本一定會漂。
+      - name: Register SHA-pinned task definitions
+        id: taskdefs
+        run: |
+          set -euo pipefail
+          for s in api consumer worker; do
+            aws ecs describe-task-definition --task-definition "$CLUSTER-$s" \
+              --query taskDefinition --output json > "td-$s.json"
+            jq --arg img "$ECR_REPO:$GITHUB_SHA" '
+              .containerDefinitions[0].image = $img
+              | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                    .compatibilities, .registeredAt, .registeredBy, .deregisteredAt)
+            ' "td-$s.json" > "new-$s.json"
+            arn=$(aws ecs register-task-definition \
+              --cli-input-json "file://new-$s.json" \
+              --query 'taskDefinition.taskDefinitionArn' --output text)
+            echo "$s=$arn" >> "$GITHUB_OUTPUT"
+            echo "registered $arn"
+          done
+
+      # **帶 migration 的部署必須先有一個還原點。**
+      #
+      # PITR 本身已經打開(rds.tf 的 backup_retention_period),理論上可以還原到
+      # migration 之前的任何一秒 —— 但那要求事後有人知道「那一秒是幾點」。一張以
+      # commit SHA 命名的快照把它變成一個**看得見的、指名的**還原點:
+      #
+      #     aws rds describe-db-snapshots --db-snapshot-identifier justin-test-db-premigration-<sha>
+      #
+      # schema 可以用 alembic downgrade 退回去,但**資料回不來** —— 一支把欄位算錯的
+      # UPDATE 跑完之後,downgrade 只會把欄位刪掉。所以還原點是 migration 的安全網,
+      # 不是 downgrade。
+      #
+      # 只在這次推送真的改了 `alembic/versions/` 時才拍(等快照 available 要好幾分鐘,
+      # 不值得每次部署都付)。判斷不出來時**當成有改** —— 多花幾分鐘 vs 少一個還原點,
+      # 前者便宜太多了。
+      #
+      # 快照從 Multi-AZ 的待命實例產生,所以對正在服務的實例沒有 I/O 影響(這是
+      # multi_az = true 的附帶好處,也是為什麼開賣期間也能安全地拍)。
+      - name: Snapshot the database before migrating
+        id: presnapshot
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            echo "cannot diff against '$before' — assuming migrations changed (fail-safe)"
+            changed=1
+          else
+            changed=$(git diff --name-only "$before" "$GITHUB_SHA" -- alembic/versions/ | wc -l | tr -d ' ')
+            echo "migration files changed in this push: $changed"
+          fi
+
+          # PITR 的備用座標:即使沒拍快照,也把「migration 之前」這個時間點記在
+          # 部署紀錄裡。事後要還原時,這一行就是那個 --restore-time。
+          echo "pre-migration UTC timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          if [ "$changed" = "0" ]; then
+            echo "no new migrations — skipping the snapshot"
+            exit 0
+          fi
+
+          snap="$CLUSTER-db-premigration-${GITHUB_SHA:0:8}"
+          # 已存在就沿用(重跑同一個 SHA 的部署不該失敗)。
+          if aws rds describe-db-snapshots --db-snapshot-identifier "$snap" >/dev/null 2>&1; then
+            echo "snapshot $snap already exists — reusing it"
+          else
+            # 刻意**不帶** --tags:那會需要 rds:AddTagsToResource,而這個專案已經被
+            # 「plan 綠、apply 因為缺 Tag 權限而炸」咬過一次(見 variables.tf 的
+            # enable_consumer_autoscaling)。實例的 tag 會由 copy_tags_to_snapshot 帶過來。
+            aws rds create-db-snapshot \
+              --db-instance-identifier "$CLUSTER-db" \
+              --db-snapshot-identifier "$snap" >/dev/null
+          fi
+          echo "waiting for $snap to become available…"
+          aws rds wait db-snapshot-available --db-snapshot-identifier "$snap"
+          echo "restore point ready: $snap"
+          echo "snapshot=$snap" >> "$GITHUB_OUTPUT"
+
+      # 網路設定直接抄 api 服務自己的 —— 不要在這裡重打 subnet / SG 清單,那會是第三份
+      # 會漂掉的規格(Terraform 一份、服務一份、CI 一份)。
+      - name: Run database migrations (one-off task; must succeed before the roll)
+        run: |
+          set -euo pipefail
+          net=$(aws ecs describe-services --cluster "$CLUSTER" --services "$CLUSTER-api" \
+            --query 'services[0].networkConfiguration.awsvpcConfiguration' --output json)
+          subnets=$(echo "$net" | jq -r '.subnets | join(",")')
+          groups=$(echo "$net" | jq -r '.securityGroups | join(",")')
+
+          # startedBy 上限是 36 字元,"deploy-" 加上完整的 40 字 SHA 是 47 —— API 會
+          # 直接拒絕,而錯誤訊息跟遷移本身完全無關。取前 8 碼夠人辨認了。
+          task_arn=$(aws ecs run-task \
+            --cluster "$CLUSTER" \
+            --task-definition "${{ steps.taskdefs.outputs.worker }}" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$groups],assignPublicIp=ENABLED}" \
+            --overrides '{"containerOverrides":[{"name":"worker","command":["alembic","upgrade","head"]}]}' \
+            --started-by "deploy-${GITHUB_SHA:0:8}" \
+            --query 'tasks[0].taskArn' --output text)
+          echo "migration task: $task_arn"
+
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$task_arn"
+          exit_code=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task_arn" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+
+          if [ "$exit_code" != "0" ]; then
+            echo "::error::migration failed (exit $exit_code) — services NOT rolled"
+            # 印出容器 log,否則 Actions 上只看得到一個退出碼,要開 console 才知道
+            # 是哪一句 SQL 炸了。
+            aws logs get-log-events \
+              --log-group-name "/ecs/$CLUSTER" \
+              --log-stream-name "worker/worker/${task_arn##*/}" \
+              --query 'events[].message' --output text || true
+            exit 1
+          fi
+          echo "migrations applied"
+
+      # 順序是刻意的:**先遷移、再換程式碼**。不能靠把這兩步對調來解決 —— 反過來的話
+      # 新程式碼會在舊 schema 上跑,那個窗口裡壞的正好是剛部署的東西。
+      #
+      # 代價是 migration 必須向後相容:滾動部署期間新舊 task 同時打同一個資料庫,所以
+      # 舊程式碼會在新 schema 上再跑幾十秒。破壞性變更要拆成兩次部署(expand 先加、
+      # 雙寫;contract 下一次才刪)。
+      # **這條規則由 test/test_deploy_pipeline.py 執行,不是靠這段註解** ——
+      # 註解不會變紅,而這正是它要防的那種「看起來部署成功了」的失敗。
       - name: Roll ECS services
         run: |
-          for s in api consumer worker; do
-            aws ecs update-service --cluster "$CLUSTER" --service "$CLUSTER-$s" \
-              --force-new-deployment --region "$AWS_REGION" >/dev/null
-            echo "rolled $CLUSTER-$s"
+          set -euo pipefail
+          roll() {
+            aws ecs update-service --cluster "$CLUSTER" --service "$CLUSTER-$1" \
+              --task-definition "$2" >/dev/null
+            echo "rolled $CLUSTER-$1 → $2"
+          }
+          roll api      "${{ steps.taskdefs.outputs.api }}"
+          roll consumer "${{ steps.taskdefs.outputs.consumer }}"
+          roll worker   "${{ steps.taskdefs.outputs.worker }}"
+
+      # 沒有這一步的話,工作流在 update-service 回傳的那一刻就變綠 —— 而那只代表
+      # 「ECS 收到了指令」。新任務一路 crash-loop,CI 仍然是綠的,部署失敗只能靠使用者
+      # 告訴你。服務上有 deployment_circuit_breaker(rollback=true),所以這裡失敗的
+      # 意思是「已經自動回滾了」而不是「線上現在是壞的」—— 那是可以安心讀的訊號。
+      - name: Wait for services to stabilise
+        run: |
+          set -euo pipefail
+          aws ecs wait services-stable --cluster "$CLUSTER" \
+            --services "$CLUSTER-api" "$CLUSTER-consumer" "$CLUSTER-worker"
+          echo "waiter says stable"
+
+          # **waiter 回 0 不代表部署成功。** 它的條件是「只有一個 deployment 且
+          # running == desired」—— 而斷路器**回滾成功之後服務也滿足這個條件**,只是
+          # 滿足在舊版本上。
+          #
+          # 2026-08-14 實測(ap-northeast-2, desiredCount=1):壞版本 15:43:00 部署、
+          # 斷路器 15:52:29 跳、回滾 15:53:29 完成,而 waiter 的 600 秒上限在 15:53:00
+          # —— 只差 29 秒它就會回 0,CI 就會在一次失敗的部署上變綠。desiredCount 調大
+          # 之後失敗平行累積、回滾更快,那 29 秒會變成負的。
+          #
+          # 也就是說「waiter 抓得到」這件事建立在「復原比它慢」上面 —— 那是反過來的。
+          # 所以這裡明確確認線上跑的就是我們部署的那一版,不靠時序。
+          fail=0
+          confirm() {
+            live=$(aws ecs describe-services --cluster "$CLUSTER" --services "$CLUSTER-$1" \
+              --query 'services[0].taskDefinition' --output text)
+            if [ "$live" != "$2" ]; then
+              echo "::error::$CLUSTER-$1 is running ${live##*/} but we deployed ${2##*/} — it rolled back"
+              fail=1
+            else
+              echo "$CLUSTER-$1 confirmed on ${2##*/}"
+            fi
+          }
+          confirm api      "${{ steps.taskdefs.outputs.api }}"
+          confirm consumer "${{ steps.taskdefs.outputs.consumer }}"
+          confirm worker   "${{ steps.taskdefs.outputs.worker }}"
+          [ "$fail" = "0" ] || exit 1
+          echo "all services stable AND running $GITHUB_SHA"
+
+      # ALB 的健康檢查是**淺的**(只證明 process 服務得了 HTTP,理由見 app/main.py 的
+      # health())。所以「跑起來了但連不到 DB / Redis」在這裡還看不出來 —— 靠這一步。
+      #
+      # 放在最後而不是拿去當 ALB 的檢查路徑,是因為 ALB 的檢查會驅動任務替換:資料庫
+      # 一抖就殺掉全部任務,只會讓恢復更慢。部署後跑一次是剛好的位置 —— 這時候「新版本
+      # 連不到依賴」還是我們自己造成的,而且回滾是正確的反應。
+      - name: Smoke-test the dependencies through the ALB
+        run: |
+          set -euo pipefail
+          dns=$(aws elbv2 describe-load-balancers --names "$CLUSTER-alb" \
+            --query 'LoadBalancers[0].DNSName' --output text)
+          for attempt in $(seq 1 10); do
+            body=$(curl -sS --max-time 10 -w '\n%{http_code}' "http://$dns/health/deps" || echo $'\n000')
+            code=$(echo "$body" | tail -1)
+            echo "attempt $attempt → $code $(echo "$body" | head -n -1)"
+            [ "$code" = "200" ] && exit 0
+            sleep 15
           done
+          echo "::error::/health/deps never returned 200 — the new version is up but cannot reach its dependencies"
+          exit 1

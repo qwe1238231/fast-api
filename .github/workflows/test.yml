@@ -1,8 +1,13 @@
 name: tests
 on:
   push:
-    branches: [main, feat/*]
+    branches: [feat/*]
   pull_request:
+  # deploy.yml 用 `uses:` 叫這支,所以 main 上的測試是**部署管線的第一關**而不是
+  # 一條平行的工作流。`main` 刻意不在上面的 push 清單裡:留著的話 main 上每次推送
+  # 會跑兩次同樣的測試,而且真正危險的是舊寫法 —— 兩支工作流各自被 push 觸發、
+  # 平行跑,於是「測試還在跑」跟「已經部署完了」可以同時成立。
+  workflow_call:
 
 jobs:
   test:
@@ -65,6 +70,47 @@ jobs:
           PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
           PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
         run: alembic upgrade head
+
+      # 測試是走 metadata.create_all 建表的,完全不經過 migration —— 所以「model 改了
+      # 但沒補 migration」這一類漂移,整套測試一個都抓不到,會一路綠到部署當下才炸。
+      # `alembic check` 拿剛剛 upgrade 出來的 schema 跟 model metadata 對照,有差就退非零。
+      #
+      # 一定要在 pytest **之前**:pytest 的 create_all 會把缺的表直接補進同一個資料庫,
+      # 補完之後再檢查就永遠是乾淨的 —— 那正是這一步要抓的東西被蓋掉。
+      - name: Check migrations match the models
+        env:
+          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
+          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
+          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
+          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
+          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
+        run: alembic check
+
+      # `alembic check` 比對欄位、索引、約束,但**看不到 sequence 的型別**。
+      # 那正好是加寬主鍵時最容易漏的一步:ALTER TABLE ... TYPE BIGINT 不會動到
+      # 它所擁有的 sequence,所以欄位變成 bigint 而序列仍在 21 億封頂 —— 一支
+      # 顯示成功、實際上什麼都沒修好的 migration,而且要到真的滿了才會發現。
+      #
+      # 這一步同樣進不了 pytest:測試是 metadata.create_all 建的,SQLAlchemy 一定
+      # 會配對正確的序列型別,所以在那裡永遠是綠的。只有跑過 migration 的資料庫
+      # 才看得見這種漂移。
+      - name: Check sequences match their columns
+        run: |
+          drift=$(psql "postgresql://justinhu@localhost:5432/testdb" -tA -c "
+            SELECT s.seqrelid::regclass || ': sequence is ' ||
+                   format_type(s.seqtypid, NULL) || ' but ' ||
+                   a.attrelid::regclass || '.' || a.attname || ' is ' ||
+                   format_type(a.atttypid, a.atttypmod)
+            FROM pg_sequence s
+            JOIN pg_depend d ON d.objid = s.seqrelid AND d.deptype = 'a'
+            JOIN pg_attribute a
+              ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+            WHERE s.seqtypid <> a.atttypid;")
+          if [ -n "$drift" ]; then
+            echo "序列型別與欄位型別不一致 —— 加寬主鍵時漏了 ALTER SEQUENCE:"
+            echo "$drift"
+            exit 1
+          fi
 
       - name: Run pytest
         env:

@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta,timezone
 from typing import Any
 
+import anyio.to_thread
 import jwt
 import ticket_secrets
 
@@ -15,6 +16,21 @@ def verify_password(plain_password: str ,hashed_password:str) -> bool:
 
 def get_password_hash(password:str) -> str:
     return ticket_secrets.hash_password(password)
+
+
+async def hash_password_async(password: str) -> str:
+    """Argon2 但不擋住 event loop。
+
+    OWASP 參數下實測一次雜湊 ~220ms 純 CPU。在 async 端點裡直接呼叫同步版本,那
+    220ms 之內**整個 worker process 的所有請求**都停住 —— 開賣瞬間別人的下單、
+    SSE 心跳、健康檢查全都跟著卡。登入路徑早就用 threadpool 了,註冊卻沒有,而註冊
+    是無認證端點:誰都能免費徵用你的 CPU。
+
+    用 anyio 而不是 `fastapi.concurrency.run_in_threadpool`,是為了讓 core/ 維持
+    零 FastAPI 依賴(crud 層也要呼叫這個)。Rust binding 會放掉 GIL,所以真的是
+    平行跑而不只是讓出。
+    """
+    return await anyio.to_thread.run_sync(ticket_secrets.hash_password, password)
 
 
 def create_access_token(

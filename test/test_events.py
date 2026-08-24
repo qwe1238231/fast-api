@@ -83,25 +83,28 @@ async def test_reconcile_rebuilds_inventory_after_redis_loss(client, db, redis, 
     event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
     await client.post(f"/v1/events/{event_id}/publish", headers=headers)        # 庫存 100
 
-    # 下 3 筆共 30 張 → Redis 立刻剩 70,worker 漆帳後 DB 有 30 的 pending 訂單
-    for _ in range(3):
+    # 三個買家各 4 張 = 12 張 → Redis 立刻剩 88,worker 落帳後 DB 有 12 的 pending。
+    # 三個人而不是同一個人下三筆:每人限購 4,同一個人第二筆就會被擋 —— 那時測到的
+    # 是限購而不是 reconcile 的算術。
+    for name in ("buyer1", "buyer2", "buyer3"):
+        buyer = await _make_admin_and_login(client, db, username=name)
         r = await client.post(
             "/v1/orders/",
-            json={"event_id": event_id, "quantity": 10},
-            headers=await _order_headers(db, headers, event_id),
+            json={"event_id": event_id, "quantity": 4},
+            headers=await _order_headers(db, buyer, event_id, username=name),
         )
-        assert r.status_code == 202
-    assert await get_available(redis, event_id=event_id) == 70
-    await drain_orders()                                                        # 30 筆寫進 Postgres
+        assert r.status_code == 202, r.text
+    assert await get_available(redis, event_id=event_id) == 88
+    await drain_orders()                                                        # 12 筆寫進 Postgres
 
     # 模擬 Redis 遺失那個 key
     await redis.delete(f"event:{event_id}:available")
     assert await get_available(redis, event_id=event_id) == 0
 
-    # reconcile 從 Postgres 重建:100 - 30 = 70
+    # reconcile 從 Postgres 重建:100 - 12 = 88
     available = await reconcile_inventory(db, redis, event_id=event_id)
-    assert available == 70
-    assert await get_available(redis, event_id=event_id) == 70
+    assert available == 88
+    assert await get_available(redis, event_id=event_id) == 88
 
 @pytest.mark.asyncio
 async def test_reconcile_refuses_when_stream_not_drained(client, db, redis):
@@ -136,6 +139,32 @@ async def test_reconcile_force_bypasses_guard(client, db, redis):
     # force=True → 即使沒排空也不 raise,正常回傳
     available = await reconcile_inventory(db, redis, event_id=event_id, force=True)
     assert isinstance(available, int)
+
+@pytest.mark.asyncio
+async def test_safety_net_not_disabled_by_dead_letter(client, db, redis):
+    """dead>0 (with backlog==0) is inventory-settled, so it must NOT disable the
+    safety net. Regression for the 'one poison disables reconcile/drift forever'
+    gap: reconcile proceeds and drift detection runs despite a dead-letter entry."""
+    from app.services.inventory import queue_depth, ORDER_DEAD_LETTER_KEY
+    from app.worker import detect_inventory_drift
+
+    headers = await _make_admin_and_login(client, db)
+    event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
+    await client.post(f"/v1/events/{event_id}/publish", headers=headers)   # 庫存 100
+
+    # park a dead-letter entry; the order stream is drained -> backlog==0, dead>0
+    await redis.xadd(ORDER_DEAD_LETTER_KEY, {"idempotency_key": "poison", "event_id": str(event_id), "quantity": "1"})
+    backlog, dead = await queue_depth(redis)
+    assert backlog == 0 and dead >= 1
+
+    # reconcile PROCEEDS (previously raised because dead>0)
+    assert await reconcile_inventory(db, redis, event_id=event_id) == 100
+
+    # drift detection RUNS (not skipped): make Redis wrong -> it must report drift
+    await redis.set(f"event:{event_id}:available", 42)
+    assert await detect_inventory_drift({"redis_client": redis}) == [
+        {"event_id": event_id, "expected": 100, "actual": 42}
+    ]
 
 @pytest.mark.asyncio
 async def test_detect_inventory_drift(client, db, redis):
@@ -247,6 +276,62 @@ async def test_queue_admits_after_window_closes(client, db, redis):
 
 
 @pytest.mark.asyncio
+async def test_queue_stream_pushes_admission(client, db, redis):
+    """The SSE stream emits the admission (+ token) then closes — the push
+    alternative to polling /queue/status."""
+    import json
+
+    event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
+    await client.post(f"/v1/events/{event_id}/queue", headers=headers)          # rank 0
+    past = (datetime.now(timezone.utc) - timedelta(seconds=10)).timestamp()
+    await redis.set(wr._admit_start_key(event_id), past)                        # rank 0 admitted
+
+    async with client.stream("GET", f"/v1/events/{event_id}/queue/stream", headers=headers) as resp:
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        payload = None
+        async for line in resp.aiter_lines():
+            if line.startswith("data: "):
+                payload = json.loads(line[len("data: "):])
+                break
+
+    assert payload is not None
+    assert payload["admitted"] is True
+    assert payload["access_token"]                                             # token pushed on the stream
+
+
+@pytest.mark.asyncio
+async def test_queue_stream_authenticates_via_query_token(client, db, redis):
+    """A browser's native EventSource can't send an Authorization header, so the
+    stream also accepts the JWT as ?access_token=."""
+    import json
+
+    event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
+    await client.post(f"/v1/events/{event_id}/queue", headers=headers)          # rank 0
+    past = (datetime.now(timezone.utc) - timedelta(seconds=10)).timestamp()
+    await redis.set(wr._admit_start_key(event_id), past)                        # rank 0 admitted
+
+    token = headers["Authorization"].removeprefix("Bearer ")
+    # NO Authorization header — the token rides in the query string
+    async with client.stream("GET", f"/v1/events/{event_id}/queue/stream?access_token={token}") as resp:
+        assert resp.status_code == 200
+        payload = None
+        async for line in resp.aiter_lines():
+            if line.startswith("data: "):
+                payload = json.loads(line[len("data: "):])
+                break
+
+    assert payload is not None and payload["admitted"] is True
+
+
+@pytest.mark.asyncio
+async def test_queue_stream_rejects_without_token(client, db):
+    event_id, _ = await _publish_event(client, db, _payload_sale_in(300))
+    resp = await client.get(f"/v1/events/{event_id}/queue/stream")   # no header, no query
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
 async def test_queue_registration_closed(client, db):
     # sale already started → fallback close (sale-30s) is in the past → registration closed
     event_id, headers = await _publish_event(client, db, _payload_sale_in(0))
@@ -286,9 +371,8 @@ async def test_queue_admission_paused_by_circuit_breaker(client, db, redis):
 
 
 @pytest.mark.asyncio
-async def test_queue_join_rate_limited(client, db, monkeypatch):
-    from app.core.config import get_settings
-    monkeypatch.setattr(get_settings(), "QUEUE_JOIN_LIMIT_PER_MINUTE", 2)
+async def test_queue_join_rate_limited(client, db, monkeypatch, rate_limiting):
+    monkeypatch.setattr(rate_limiting, "QUEUE_JOIN_LIMIT_PER_MINUTE", 2)
     event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
 
     codes = [

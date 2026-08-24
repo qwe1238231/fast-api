@@ -24,6 +24,7 @@ from app.core.config import get_settings
 from app.core.exceptions import AdmissionDenied
 from app.models.event import Event
 from app.services.inventory import get_available
+from app.services.queue_events import publish_global_poke
 
 
 def _draw_key(event_id: int) -> str:
@@ -57,6 +58,7 @@ async def set_admission_paused(redis: Redis, paused: bool, *, ttl_seconds: int =
         await redis.set(_paused_key(), "1", ex=ttl_seconds)
     else:
         await redis.delete(_paused_key())
+    await publish_global_poke(redis)   # nudge every waiting SSE connection to re-read status()
 
 
 def window(event: Event) -> tuple[datetime, datetime]:
@@ -131,11 +133,61 @@ async def status(redis: Redis, *, event_id: int, user_id: int) -> QueueState:
     return QueueState(admitted=False, people_ahead=rank - admitted_count)
 
 
-async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: int) -> None:
+async def admit_deadline(redis: Redis, *, event_id: int, user_id: int) -> float | None:
+    """Wall-clock epoch seconds at which this user's rank crosses the admission
+    cutoff — or None if they're not registered / admission isn't scheduled yet.
+
+    Both inputs are frozen once the registration window closes (no new
+    registrations can change the rank; the rate is config), so the SSE stream
+    computes this ONCE and sleeps precisely until it instead of polling for it.
+
+    Derivation from _admitted_count / status():
+        admitted  <=>  rank < int(elapsed * RATE)
+                  <=>  elapsed >= (rank + 1) / RATE
+        =>  admit_at = admit_start + (rank + 1) / RATE
+    """
+    start = await redis.get(_admit_start_key(event_id))
+    if start is None:
+        return None
+    rank = await redis.zrank(_draw_key(event_id), str(user_id))
+    if rank is None:
+        return None
+    rate = get_settings().QUEUE_ADMISSION_RATE
+    return float(start) + (rank + 1) / rate
+
+
+def _used_key(jti: str) -> str:
+    """Single-use marker for one admission token."""
+    return f"admission_used:{jti}"
+
+
+async def refund_admission(redis: Redis, jti: str) -> None:
+    """把單次入場券還回去。**只在確定沒有任何訂單意圖成立時**呼叫。
+
+    為什麼需要這個:SETNX 必須發生在扣庫存之前 —— 否則同一張 token 的兩個並發
+    請求都會通過檢查,一張入場券換到兩張票。但這樣一來,凡是下單失敗(售完、
+    配不出座位、活動不在販售窗、帶錯 zone)都會連帶燒掉入場券,使用者得回去
+    重新排隊才能改個張數再試。
+
+    售完是終局的所以以前看不出問題,但「配不出這個張數」本質上是可重試的
+    (改成 2 張就成立),而在讀-算-CAS 的配位架構下重試更是常態路徑。所以失敗
+    必須把券還回去。
+
+    冪等:DEL 不存在的 key 是 no-op。
+    """
+    await redis.delete(_used_key(jti))
+
+
+async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: int) -> str:
     """Raise AdmissionDenied unless `token` is a valid, in-scope, unused admission pass.
 
     Checks signature/expiry (jwt), type, that it was issued for this event and this
     user, and that it hasn't been used before (single-use via SETNX on the jti).
+
+    回傳 jti,讓呼叫端能在訂單最終沒有成立時用 `refund_admission` 還回去。
+    SETNX 留在這裡而不是搬到下單成功之後,是為了保住單次性的原子性:改成
+    「先 EXISTS 檢查、成功後才 SETNX」會開一個窗口讓同一張 token 的兩個並發
+    請求都通過。
     """
     settings = get_settings()
     try:
@@ -151,6 +203,7 @@ async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: 
 
     jti = payload.get("jti")
     ttl = max(1, int(payload["exp"] - datetime.now(timezone.utc).timestamp()))
-    first_use = await redis.set(f"admission_used:{jti}", "1", nx=True, ex=ttl)
+    first_use = await redis.set(_used_key(jti), "1", nx=True, ex=ttl)
     if not first_use:
         raise AdmissionDenied("admission token already used")
+    return jti

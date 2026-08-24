@@ -2,14 +2,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.event import Event, EventStatus
-from app.schemas.event import EventCreate
 
-async def create_event(db: AsyncSession, data:EventCreate) -> Event:
-    """Insert a new event (status defaults to draft). Caller commits."""
-    event = Event(**data.model_dump())
-    db.add(event)
-    await db.flush()
-    return event
+# create_event 搬去 app/services/event_admin.py:座位場次需要驗證場館與 zone_prices、
+# 並從座位圖推導 total_seats,那些是領域規則而不是單純的 DB 寫入。
 
 async def get_event(db: AsyncSession, event_id:int) -> Event | None:
     return await db.get(Event, event_id)

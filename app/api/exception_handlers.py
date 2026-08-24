@@ -3,16 +3,21 @@
 Domain layer raises business concepts (EventNotFound, InsufficientInventory etc.).
 This module is the only place that knows how each maps to HTTP status + body.
 """
+import logging
+
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
+from app.core.logging import alert
 from app.core.exceptions import (
+    ConcurrentModification,
     DomainError,
     DuplicateOrderRequest,
     EventCancelled,
     EventNotFound,
     EventNotOnSale,
     InsufficientInventory,
+    InvalidEventUpdate,
     InvalidOrderTransition,
     OrderNotFound,
     OrderNotOwned,
@@ -21,7 +26,21 @@ from app.core.exceptions import (
     BuyerInfoAlreadyExists,
     BuyerInfoNotFound,
     NationalIdAlreadyRegistered,
+    NoSeatsAvailable,
+    PurchaseLimitExceeded,
+    SeatContention,
+    SeatPlacementOutOfRun,
+    SeatsNotAssigned,
+    VenueNotFound,
+    ZoneNameTaken,
+    ZoneNotFound,
+    ZoneNotForEvent,
+    ZonePricesInvalid,
+    ZoneRequired,
 )
+
+logger = logging.getLogger(__name__)
+
 
 def register_exception_handlers(app: FastAPI) -> None:
     """Wire all domain → HTTP translators into the FastAPI app."""
@@ -39,6 +58,70 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(exc), "event_id": exc.event_id},
         )
+    @app.exception_handler(ZoneNotFound)
+    async def _zone_not_found(request: Request, exc: ZoneNotFound):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": str(exc), "zone_id": exc.zone_id},
+        )
+
+    @app.exception_handler(ZoneNameTaken)
+    async def _zone_name_taken(request: Request, exc: ZoneNameTaken):
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": str(exc), "venue_id": exc.venue_id, "name": exc.name},
+        )
+
+    @app.exception_handler(VenueNotFound)
+    async def _venue_not_found(request: Request, exc: VenueNotFound):
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": str(exc), "venue_id": exc.venue_id},
+        )
+
+    @app.exception_handler(ZonePricesInvalid)
+    async def _zone_prices_invalid(request: Request, exc: ZonePricesInvalid):
+        # 回 missing / unknown 讓管理員知道要補哪一區 —— 這是後台錯誤,不是面向
+        # 終端使用者的,所以細節有用而非洩漏。
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={
+                "detail": str(exc),
+                "venue_id": exc.venue_id,
+                "missing_zone_ids": exc.missing,
+                "unknown_zone_ids": exc.unknown,
+            },
+        )
+
+    # 兩種 zone 錯誤都是「請求帶錯了」而不是「狀態衝突」,所以 422 而非 409。
+    @app.exception_handler(ZoneRequired)
+    async def _zone_required(request: Request, exc: ZoneRequired):
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": str(exc), "event_id": exc.event_id},
+        )
+
+    @app.exception_handler(ZoneNotForEvent)
+    async def _zone_not_for_event(request: Request, exc: ZoneNotForEvent):
+        # 只回泛用訊息,不回 exc.reason —— 別讓外部藉由錯誤差異探測場館結構。
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={
+                "detail": f"Zone {exc.zone_id} is not available for event {exc.event_id}",
+                "event_id": exc.event_id,
+                "zone_id": exc.zone_id,
+            },
+        )
+
+    @app.exception_handler(InvalidEventUpdate)
+    async def _invalid_event_update(request: Request, exc: InvalidEventUpdate):
+        # 422 而非 409:409 的意思是「現在不行,重新載入再試」,但這裡重送幾次都
+        # 一樣 —— 是請求內容本身不成立。跟兩個 zone 錯誤同一個理由。
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": str(exc), "event_id": exc.event_id, "reason": exc.reason},
+        )
+
     @app.exception_handler(EventNotOnSale)
     async def _event_not_on_sale(request: Request, exc: EventNotOnSale):
         return JSONResponse(
@@ -89,6 +172,76 @@ def register_exception_handlers(app: FastAPI) -> None:
             },
         )
     
+    @app.exception_handler(PurchaseLimitExceeded)
+    async def _purchase_limit_exceeded(request: Request, exc: PurchaseLimitExceeded):
+        # 409 而非 429:429 的語意是「太快了,等一下再試」,而客戶端與各種 SDK 會照著
+        # Retry-After 自動重送 —— 但這個限制重送一萬次也不會過。回 remaining 讓前端能
+        # 說「你還可以買 1 張」而不是一句「超過限購」讓人反覆按。
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": str(exc),
+                "event_id": exc.event_id,
+                "requested": exc.requested,
+                "limit": exc.limit,
+                "already_held": exc.already,
+                "remaining": exc.remaining,
+            },
+        )
+
+    @app.exception_handler(NoSeatsAvailable)
+    async def _no_seats_available(request: Request, exc: NoSeatsAvailable):
+        # 409 而非 sold-out:這個區還有位子,只是湊不出這個張數的連號。回可行張數
+        # 讓前端能給出「改成 2 張?」而不是一句售完 —— 明明看得到空位卻被告知
+        # 售完是客服災難的來源。
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": str(exc),
+                "event_id": exc.event_id,
+                "zone_id": exc.zone_id,
+                "requested": exc.quantity,
+                "available_quantities": exc.feasible,
+            },
+        )
+
+    @app.exception_handler(SeatContention)
+    async def _seat_contention(request: Request, exc: SeatContention):
+        # 503 + Retry-After:純暫時性,原樣重送就會成功。用 409 會讓客戶端誤以為
+        # 是業務衝突而不重試。
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": str(exc), "event_id": exc.event_id, "zone_id": exc.zone_id},
+            headers={"Retry-After": "1"},
+        )
+
+    @app.exception_handler(SeatPlacementOutOfRun)
+    async def _seat_placement_out_of_run(request: Request, exc: SeatPlacementOutOfRun):
+        # 這是我們的 bug,所以 500(不是 409/503 —— 那會讓客戶端以為重送有用)。
+        # 但它仍是 DomainError,所以下單端點會把單次入場券退還:使用者不該為我們的
+        # bug 重新排隊。
+        alert(
+            logger,
+            "allocator bug: placement fell outside the run it was cut from",
+            event="allocator_bug",
+            event_id=exc.event_id,
+            zone_id=exc.zone_id,
+            block_id=exc.block_id,
+            start=exc.start,
+            length=exc.length,
+        )
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "seat allocation failed unexpectedly"},
+        )
+
+    @app.exception_handler(SeatsNotAssigned)
+    async def _seats_not_assigned(request: Request, exc: SeatsNotAssigned):
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": str(exc), "order_id": exc.order_id},
+        )
+
     @app.exception_handler(BuyerInfoNotFound)
     async def _buyer_info_not_found(request: Request, exc: BuyerInfoNotFound):
         return JSONResponse(
@@ -124,6 +277,25 @@ def register_exception_handlers(app: FastAPI) -> None:
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             content={"detail": str(exc)},
             headers=headers,
+        )
+
+    @app.exception_handler(ConcurrentModification)
+    async def _concurrent_modification(request: Request, exc: ConcurrentModification):
+        # 409 而非 412:412 是 If-Match 條件請求的專屬語意,而我們的版本走 request
+        # body 不走 header。也不是 5xx —— 原樣重送不會過,但重新載入後再送會過,
+        # 那正是 409 說的「跟目前資源狀態衝突」。
+        #
+        # 回 expected/current 兩個版本,前端才有辦法說「這筆資料已被他人更新」而不是
+        # 一句沒頭沒尾的衝突;current 為 null 時就是純粹的「重新載入」。
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "detail": str(exc),
+                "resource": exc.resource,
+                "resource_id": exc.resource_id,
+                "expected_version": exc.expected_version,
+                "current_version": exc.current_version,
+            },
         )
 
     @app.exception_handler(DomainError)

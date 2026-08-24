@@ -1,16 +1,20 @@
-"""比對「migration 建出來的索引」與「model metadata 建出來的索引」。
+"""比對「migration 建出來的 schema」與「model metadata 建出來的 schema」。
 
-用法: python -m app.scripts.check_index_drift        (退出碼非零代表有漂移)
+用法: python -m app.scripts.check_schema_drift       (退出碼非零代表有漂移)
 
-**為什麼 `alembic check` 不夠。** 它比對欄位、約束、外鍵的 ON DELETE,但**看不到
-索引定義的細節**。實測確認至少漏掉:
+目前涵蓋 `alembic check` 看不到的兩類:
 
-    postgresql_include=[...]   把 model 的 INCLUDE 拿掉,alembic check 照樣說乾淨
+    索引定義        postgresql_include、opclass、排序方向、表達式的內容
+    表的儲存參數    reloptions,也就是 per-table 的 autovacuum 調校
 
-同一類還有 opclass、排序方向(DESC / NULLS LAST)、表達式索引的內容。這些漂移的
-共同點是**不會有任何測試變紅**:測試走 metadata.create_all,所以它們看到的永遠是
-model 那一份;而正式環境跑的是 migration 那一份。兩份不一致時,你在本機量到的
-查詢計畫跟線上跑的不是同一個東西。
+**為什麼 `alembic check` 不夠。** 它比對欄位、約束、外鍵的 ON DELETE,但這兩類都
+不在它的比對範圍內。實測確認:把 model 的 `postgresql_include` 拿掉,alembic check
+照樣回報「No new upgrade operations detected」。
+
+這些漂移的共同點是**不會有任何測試變紅**:測試走 metadata.create_all,所以它們看到
+的永遠是 model 那一份;而正式環境跑的是 migration 那一份。兩份不一致時,你在本機
+量到的查詢計畫跟線上跑的不是同一個東西 —— 而 orders 的 autovacuum 設定正是「差一個
+參數就讓覆蓋索引失效」的那種東西。
 
 做法是拿 Postgres 自己的 `pg_get_indexdef` 當共同語言:把 metadata 建進一個乾淨的
 參考資料庫,兩邊各自問一次,逐字比對。這樣連 opclass 這種很難自己實作比對的東西
@@ -49,20 +53,38 @@ _INDEX_QUERY = text(
 )
 
 
-async def _index_defs(url: str) -> dict[str, set[str]]:
+_RELOPTIONS_QUERY = text(
+    """
+    SELECT c.relname, unnest(coalesce(c.reloptions, '{}'))
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'public'
+      AND c.relkind IN ('r', 'p')
+      AND NOT c.relispartition
+    """
+)
+
+
+async def _snapshot(url: str) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    """回傳 (每張表的索引定義, 每張表的 reloptions)。"""
     engine = create_async_engine(url, pool_pre_ping=False)
     try:
         async with engine.connect() as conn:
-            rows = (await conn.execute(_INDEX_QUERY)).all()
+            index_rows = (await conn.execute(_INDEX_QUERY)).all()
+            option_rows = (await conn.execute(_RELOPTIONS_QUERY)).all()
     finally:
         await engine.dispose()
 
-    defs: dict[str, set[str]] = {}
-    for table, indexdef in rows:
-        if table in _IGNORED_TABLES:
-            continue
-        defs.setdefault(table, set()).add(indexdef)
-    return defs
+    indexes: dict[str, set[str]] = {}
+    for table, indexdef in index_rows:
+        if table not in _IGNORED_TABLES:
+            indexes.setdefault(table, set()).add(indexdef)
+
+    options: dict[str, set[str]] = {}
+    for table, option in option_rows:
+        if table not in _IGNORED_TABLES:
+            options.setdefault(table, set()).add(option)
+    return indexes, options
 
 
 async def _build_reference(admin_url: str, ref_url: str, ref_name: str) -> None:
@@ -92,15 +114,19 @@ async def _drop_reference(admin_url: str, ref_name: str) -> None:
         await admin.dispose()
 
 
-def _report(migrated: dict[str, set[str]], reference: dict[str, set[str]]) -> list[str]:
+def _report(
+        kind: str,
+        migrated: dict[str, set[str]],
+        reference: dict[str, set[str]],
+) -> list[str]:
     problems: list[str] = []
     for table in sorted(set(migrated) | set(reference)):
         only_db = migrated.get(table, set()) - reference.get(table, set())
         only_model = reference.get(table, set()) - migrated.get(table, set())
-        for indexdef in sorted(only_db):
-            problems.append(f"  [只在資料庫裡] {indexdef}")
-        for indexdef in sorted(only_model):
-            problems.append(f"  [只在 model 裡] {indexdef}")
+        for item in sorted(only_db):
+            problems.append(f"  [{kind}] [只在資料庫裡] {item}")
+        for item in sorted(only_model):
+            problems.append(f"  [{kind}] [只在 model 裡] {item}")
     return problems
 
 
@@ -113,23 +139,29 @@ async def main() -> int:
 
     await _build_reference(admin_url, ref_url, ref_name)
     try:
-        migrated = await _index_defs(url)
-        reference = await _index_defs(ref_url)
+        db_indexes, db_options = await _snapshot(url)
+        ref_indexes, ref_options = await _snapshot(ref_url)
     finally:
         await _drop_reference(admin_url, ref_name)
 
-    problems = _report(migrated, reference)
+    problems = (
+        _report("索引", db_indexes, ref_indexes)
+        + _report("儲存參數", db_options, ref_options)
+    )
     if problems:
-        print("索引定義漂移 —— migration 與 model 對不上:", file=sys.stderr)
+        print("schema 漂移 —— migration 與 model 對不上:", file=sys.stderr)
         print("\n".join(problems), file=sys.stderr)
         print(
-            "\n這一類 alembic check 抓不到(它不比對 INCLUDE / opclass / 排序方向),"
-            "\n而測試走 metadata.create_all,所以也不會紅。",
+            "\n這一類 alembic check 抓不到(它不比對 INCLUDE / opclass / 排序方向 /"
+            " reloptions),\n而測試走 metadata.create_all,所以也不會紅。",
             file=sys.stderr,
         )
         return 1
 
-    print(f"索引定義一致({sum(len(v) for v in migrated.values())} 個索引)")
+    print(
+        f"schema 一致({sum(len(v) for v in db_indexes.values())} 個索引、"
+        f"{sum(len(v) for v in db_options.values())} 個儲存參數)"
+    )
     return 0
 
 

@@ -122,7 +122,7 @@ async def test_structure_that_is_not_the_db_complement_is_detected(
     db.add(order)
     await db.flush()
     db.add(SeatHold(
-        event_id=event_id, block_id=block_id, order_id=order.id,
+        event_id=event_id, zone_id=zone_id, block_id=block_id, order_id=order.id,
         start_pos=4, length=4,
     ))
     await db.commit()

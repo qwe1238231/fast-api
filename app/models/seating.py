@@ -122,6 +122,10 @@ class SeatBlock(Base):
     __tablename__ = "seat_blocks"
     __table_args__ = (
         UniqueConstraint("zone_id", "row_label", "block_index", name="uq_seat_blocks_pos"),
+        # (zone_id, id) 對 PK 而言是冗餘的唯一性,存在的唯一理由是給 seat_holds 的
+        # fk_seat_holds_zone_block 一個可指的目標 —— 複合外鍵要求被參照側有完全
+        # 對應的唯一索引。這張表是場館幾何(幾百列、幾乎不寫),成本可忽略。
+        UniqueConstraint("zone_id", "id", name="uq_seat_blocks_zone_id"),
         CheckConstraint("capacity > 0", name="ck_seat_blocks_capacity_pos"),
         CheckConstraint(
             "quality_edge >= 0 AND quality_edge <= quality_base AND quality_base <= 1",
@@ -221,6 +225,26 @@ class SeatHold(Base):
         # 兩個索引各司其職:GiST 負責「範圍不得重疊」(btree 表達不了),btree 負責
         # 「這個場次這幾個 block 現在被誰佔著」。
         Index("ix_seat_holds_event_block", "event_id", "block_id"),
+        # 「hold 的 block 屬於別的場館」原本是 DB 容得下的狀態:event_id 與 block_id
+        # 各自的外鍵獨立成立,中間「events.venue_id = zones.venue_id」那條沒人看。
+        # 把 zone_id 冗餘進來之後,兩條複合外鍵就能純宣告地封掉這個洞:
+        #
+        #   fk_seat_holds_zone_block   block 必須屬於 hold 的 zone
+        #   fk_seat_holds_event_zone   hold 的 zone 必須是該場次有定價的 zone ——
+        #                              而 event_zone_prices 只收該場館的 zone
+        #                              (create_event 驗過),所以「同場館」被遞移保證
+        #
+        # 跟 orders 的 fk_orders_event_zone_price 是同一個手法、指向同一個主鍵。
+        ForeignKeyConstraint(
+            ["zone_id", "block_id"],
+            ["seat_blocks.zone_id", "seat_blocks.id"],
+            name="fk_seat_holds_zone_block",
+        ),
+        ForeignKeyConstraint(
+            ["event_id", "zone_id"],
+            ["event_zone_prices.event_id", "event_zone_prices.zone_id"],
+            name="fk_seat_holds_event_zone",
+        ),
     )
 
     # BIGINT:這張表跟著有座位的訂單成長,所以它的序列消耗速率跟 orders 同級。
@@ -228,6 +252,10 @@ class SeatHold(Base):
     # 讓每一列與每一個索引項多背 4 bytes,換來永遠用不到的餘裕。
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)
+    # 反正規化欄位:block 已經知道自己的 zone。它存在的唯一理由是給上面兩條複合
+    # 外鍵當支點 —— 而它自己不會漂移,因為 fk_seat_holds_zone_block 恰好就把
+    # 「zone_id 必須是 block 真正的 zone」也鎖住了。
+    zone_id: Mapped[int] = mapped_column(nullable=False)
     block_id: Mapped[int] = mapped_column(ForeignKey("seat_blocks.id"), nullable=False)
     order_id: Mapped[int] = mapped_column(
         BigInteger, ForeignKey("orders.id"), nullable=False
@@ -247,3 +275,68 @@ class SeatHold(Base):
         DateTime(timezone=True), nullable=True
     )
     """非 NULL = 已付款確認,座號已對外公開,從此不可移動。"""
+
+
+#: seat_holds ↔ orders 的跨表相等關係,唯一一個用 trigger 而不是宣告式約束表達的
+#: 不變量 —— 因為它值不起宣告式的價錢:複合外鍵 (order_id, event_id, length) →
+#: orders (id, event_id, quantity) 需要 orders 上一個實測 60 MB 的唯一索引,而且
+#: 每一筆下單都要維護它。trigger 把成本搬到「建 hold」那一側:用 orders_pkey 查
+#: 一筆(那個索引本來就熱),零儲存。
+#:
+#: 它擋的是 worker.py 建 hold 時那個註解自己招認的隱含耦合:「stream 的 quantity
+#: 欄位同時是張數與區間長度,兩者今天恆等,但若哪天出現買 2 送 1 個座位之類的規則,
+#: 這裡會靜默錯掉」。有了這個 trigger,錯掉的那天它會炸,不會靜默。
+#:
+#: ERRCODE 23514(check_violation)是刻意的:asyncpg 會把它轉成 CheckViolationError,
+#: SQLAlchemy 包成 IntegrityError —— 於是 worker._persist_intent 既有的
+#: except IntegrityError 分支直接接手,走 dead-letter 流程,不需要任何新的錯誤處理。
+#:
+#: 訂單查不到時直接放行:order_id 的外鍵會用更準的錯誤訊息擋下,這裡不搶戲。
+#: UPDATE 只掛在這四個欄位上 —— compaction 滑動 hold 只動 start_pos,不會重跑。
+SEAT_HOLD_MATCH_FUNCTION_SQL = """\
+CREATE OR REPLACE FUNCTION seat_holds_match_order() RETURNS trigger AS $$
+DECLARE
+    o RECORD;
+BEGIN
+    SELECT event_id, zone_id, quantity INTO o FROM orders WHERE id = NEW.order_id;
+    IF NOT FOUND THEN
+        RETURN NEW;
+    END IF;
+    IF o.event_id <> NEW.event_id THEN
+        RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = format(
+            'seat hold event_id %s != order event_id %s (order %s)',
+            NEW.event_id, o.event_id, NEW.order_id);
+    END IF;
+    IF o.zone_id IS DISTINCT FROM NEW.zone_id THEN
+        RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = format(
+            'seat hold zone_id %s != order zone_id %s (order %s)',
+            NEW.zone_id, o.zone_id, NEW.order_id);
+    END IF;
+    IF o.quantity <> NEW.length THEN
+        RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = format(
+            'seat hold length %s != order quantity %s (order %s)',
+            NEW.length, o.quantity, NEW.order_id);
+    END IF;
+    RETURN NEW;
+END
+$$ LANGUAGE plpgsql\
+"""
+
+SEAT_HOLD_MATCH_TRIGGER_SQL = """\
+CREATE OR REPLACE TRIGGER trg_seat_holds_match_order
+BEFORE INSERT OR UPDATE OF order_id, event_id, zone_id, length ON seat_holds
+FOR EACH ROW EXECUTE FUNCTION seat_holds_match_order()\
+"""
+
+# 兩條路徑都要拿到同一個 trigger:migration 走 op.execute,測試走 create_all ——
+# 跟 btree_gist(檔案開頭)與 orders 的 autovacuum(order.py)同一個理由。
+# 一定要拆成兩個 listener:asyncpg 不接受一次執行多條語句。
+#
+# `%` 要跳脫成 `%%`:DDL() 會對字串做 Python 的 % 插值,而函式本體裡 plpgsql 的
+# format('... %s ...') 會被它當成格式化佔位符。migration 的 op.execute 走 text(),
+# 沒有這個問題 —— 所以常數保持乾淨,只在這裡跳脫。
+event.listen(
+    SeatHold.__table__, "after_create",
+    DDL(SEAT_HOLD_MATCH_FUNCTION_SQL.replace("%", "%%")),
+)
+event.listen(SeatHold.__table__, "after_create", DDL(SEAT_HOLD_MATCH_TRIGGER_SQL))

@@ -64,7 +64,8 @@ async def _persisted_order(db, *, event_id: int, user_id: int, qty: int,
     now = datetime.now(timezone.utc)
     stamps = {
         OrderStatus.PAID: {"paid_at": now},
-        OrderStatus.CONFIRMED: {"confirmed_at": now},
+        # CONFIRMED 只能從 PAID 來,所以它帶著**兩個**時間戳 —— 不是選一個。
+        OrderStatus.CONFIRMED: {"paid_at": now, "confirmed_at": now},
         OrderStatus.EXPIRED: {"expired_at": now},
         OrderStatus.CANCELLED: {"cancelled_at": now},
     }.get(status, {})

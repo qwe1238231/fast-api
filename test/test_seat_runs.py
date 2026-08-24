@@ -155,7 +155,7 @@ async def test_rebuild_takes_the_complement_of_existing_holds(db, redis, zone_fi
     db.add(order)
     await db.flush()
     db.add(SeatHold(
-        event_id=event.id, block_id=block.id, order_id=order.id,
+        event_id=event.id, zone_id=zone_id, block_id=block.id, order_id=order.id,
         start_pos=4, length=4,
     ))
     await db.commit()
@@ -319,7 +319,7 @@ async def test_release_merges_left_right_and_both(db, redis, zone_fixture) -> No
         db.add(order)
         await db.flush()
         db.add(SeatHold(
-            event_id=event.id, block_id=block.id, order_id=order.id,
+            event_id=event.id, zone_id=zone_id, block_id=block.id, order_id=order.id,
             start_pos=start, length=2,
         ))
     await db.commit()

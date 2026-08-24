@@ -26,6 +26,7 @@ from app.models.seating import EventZonePrice, SeatBlock, Venue, Zone
 from app.schemas.event import EventCreate, EventUpdate
 from app.schemas.seating import ZonePricesUpdate
 from app.services.audit import FieldDiff
+from app.services.waiting_room import effective_window
 
 
 async def create_event(db: AsyncSession, data: EventCreate) -> Event:
@@ -118,19 +119,25 @@ def apply_event_update(event: Event, data: EventUpdate) -> FieldDiff:
     if merged["sale_starts_at"] >= merged["sale_ends_at"]:
         raise InvalidEventUpdate(event.id, "sale_starts_at 必須早於 sale_ends_at")
 
-    # 等候室的窗:PATCH 改得動這兩欄,但先前完全沒驗。同樣要看合併後的值 ——
-    # 只送一個 queue_closes_at 的請求單看 payload 永遠合法。
+    # 等候室的窗:PATCH 改得動這兩欄,同樣要看合併後的值。但光比對兩個顯式值不夠 ——
+    # NULL 的那側會在執行期用 sale_starts_at 推導預設,而兩個 fallback 各自獨立計算,
+    # 所以「opens 設在預設 closes 之後、closes 留 NULL」是兩欄各自合法、組起來卻
+    # 倒過來的窗。倒過來的登記期長度為負:抽籤永遠不開,而且沒有任何錯誤 —— 只有
+    # 「為什麼沒人被放進來」。所以這裡用**跟執行期同一條公式**(effective_window)
+    # 驗合併後的實效值;DB 的 ck_events_queue_window 只顧得了兩欄都顯式的情況。
     queue = {
         field: changes.get(field, getattr(event, field))
         for field in _QUEUE_WINDOW_FIELDS
     }
-    if (
-        queue["queue_opens_at"] is not None
-        and queue["queue_closes_at"] is not None
-        and queue["queue_opens_at"] >= queue["queue_closes_at"]
-    ):
+    opens, closes = effective_window(
+        merged["sale_starts_at"], queue["queue_opens_at"], queue["queue_closes_at"]
+    )
+    if opens >= closes:
         raise InvalidEventUpdate(
-            event.id, "queue_opens_at 必須早於 queue_closes_at"
+            event.id,
+            "等候室登記窗倒了:實效 queue_opens_at "
+            f"({opens.isoformat()}) 不早於實效 queue_closes_at ({closes.isoformat()});"
+            "NULL 的那側是由 sale_starts_at 推導的預設值",
         )
 
     diff: FieldDiff = {}

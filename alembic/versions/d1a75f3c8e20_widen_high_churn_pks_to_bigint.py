@@ -36,6 +36,13 @@ down_revision: Union[str, Sequence[str], None] = 'c8f4a2e6b193'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+BACKWARD_INCOMPATIBLE = """\
+ALTER COLUMN TYPE 會被守門測試的原生 SQL 掃描標出來 —— 但 int4 → int8 是純加寬:
+asyncpg 兩種都回 Python int,舊程式碼的讀寫語意完全不變。真正的風險是 ALTER 期間
+的 ACCESS EXCLUSIVE 全表重寫,而那是「現在做是毫秒、以後做是停機」—— 正是這支
+migration 趁表還小先做的理由。\
+"""
+
 
 #: 主鍵要加寬的表。順序有意義:被參照的 orders / refresh_tokens 先改,
 #: 指向它們的欄位(下面 _REFERENCING)後改。

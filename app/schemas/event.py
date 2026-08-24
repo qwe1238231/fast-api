@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Annotated
 
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, ConfigDict, model_validator
 from app.models.event import EventStatus
 
 
@@ -19,10 +19,14 @@ class EventCreate(BaseModel):
 
     name: str
     venue: str
-    starts_at: datetime
-    ends_at: datetime
-    sale_starts_at: datetime
-    sale_ends_at: datetime
+    # AwareDatetime:無時區的 ISO 字串直接 422,不進系統。DB 側全是 timestamptz
+    # (aware),讓 naive 值進來的話,任何「payload 值 vs DB 推導值」的比較都是
+    # TypeError —— 而那會以 500 浮出,錯誤訊息跟「你少給了時區」毫無關係。
+    # asyncpg 對 naive 的行為是「當本地時間轉 UTC」,那是隱式猜測,不是語意。
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    sale_starts_at: AwareDatetime
+    sale_ends_at: AwareDatetime
 
     venue_id: int | None = None
     """給了就是座位場次。座位圖屬於場館,佔用屬於場次。"""
@@ -97,17 +101,19 @@ class EventUpdate(BaseModel):
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
     venue: str | None = Field(default=None, min_length=1, max_length=255)
-    starts_at: datetime | None = None
-    ends_at: datetime | None = None
-    sale_starts_at: datetime | None = None
-    sale_ends_at: datetime | None = None
+    # AwareDatetime 的理由同 EventCreate —— PATCH 這邊更要緊:apply_event_update
+    # 會拿 payload 值跟 DB 推導出的 aware 值算實效等候室窗,naive 混進去是 TypeError。
+    starts_at: AwareDatetime | None = None
+    ends_at: AwareDatetime | None = None
+    sale_starts_at: AwareDatetime | None = None
+    sale_ends_at: AwareDatetime | None = None
     price_cents: int | None = Field(default=None, ge=0)
 
     # 這兩個在 DB 是 nullable,所以顯式傳 null 的意思是「清掉,回去用預設推導」。
     # 服務層用 exclude_unset 而不是 exclude_none 取變更集,才分得出「沒給」跟
     # 「給了 null」—— 用 exclude_none 的話這兩個欄位永遠清不掉。
-    queue_opens_at: datetime | None = None
-    queue_closes_at: datetime | None = None
+    queue_opens_at: AwareDatetime | None = None
+    queue_closes_at: AwareDatetime | None = None
 
 
 class EventResponse(BaseModel):

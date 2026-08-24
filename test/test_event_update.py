@@ -153,18 +153,38 @@ async def test_queue_window_is_validated_against_the_merged_result(client, admin
     assert "queue_opens_at" in resp.json()["reason"]
 
 
-async def test_clearing_one_queue_bound_is_still_allowed(client, admin, event):
-    """只設一邊是合法的 —— 另一邊 NULL 代表「用 sale_starts_at 推導的預設」。
+async def test_setting_one_queue_bound_is_allowed_when_the_effective_window_holds(
+    client, admin, event
+):
+    """只設一邊是合法的 —— 另一邊 NULL 代表「用 sale_starts_at 推導的預設」,
+    只要組出來的實效窗仍然是正的。"""
+    opens = event.sale_starts_at - timedelta(hours=2)   # 遠早於預設 closes(sale-30s)
+    resp = await client.patch(
+        f"/v1/events/{event.id}",
+        json={"version": 1, "queue_opens_at": opens.isoformat()},
+        headers=admin,
+    )
+    assert resp.status_code == 200
 
-    這是那條 CHECK 必須容忍 NULL 的原因,也是它擋不住的那個缺口(見 window()
-    的兩個 fallback 各自獨立計算)。
+
+async def test_one_explicit_bound_that_inverts_the_effective_window_is_rejected(
+    client, admin, event
+):
+    """兩欄各自合法、組起來卻倒過來的窗:opens 顯式設在 sale_starts_at,closes 留
+    NULL(執行期推導成 sale − 30s)→ 實效窗長度為負。
+
+    DB 的 ck_events_queue_window 看不到這種(它只在兩欄都非 NULL 時有先後可言),
+    先前的應用層驗證也只比對兩個顯式值 —— 這正是 test_event_constraints 那條
+    half-open 測試裡點名「只能在應用層補」的缺口。倒過來的窗沒有任何錯誤訊號,
+    只有「為什麼沒人被放進來」。
     """
     resp = await client.patch(
         f"/v1/events/{event.id}",
         json={"version": 1, "queue_opens_at": event.sale_starts_at.isoformat()},
         headers=admin,
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 422
+    assert "queue_opens_at" in resp.json()["reason"]
 
 
 async def test_total_seats_is_not_editable(client, admin, event):
@@ -242,3 +262,20 @@ async def test_a_price_change_invalidates_the_cached_meta(client, admin, event, 
 
     after = await get_event_meta(redis, db, event_id=event_id)
     assert after.price_cents == 2000
+
+
+async def test_a_naive_datetime_is_rejected_with_422_not_500(client, admin, event):
+    """schema 層要求 AwareDatetime:無時區的 ISO 字串直接 422。
+
+    這條擋的是一個真實的回歸路徑:DB 側全是 timestamptz(aware),而實效窗驗證
+    會拿 payload 值跟 DB 推導值比較 —— naive 混進去是 TypeError,以 500 浮出,
+    錯誤訊息跟「你少給了時區」毫無關係。HTML 的 datetime-local 輸出的正是這種
+    無 offset 格式,管理員第一次從表單設時間就會踩中。
+    """
+    resp = await client.patch(
+        f"/v1/events/{event.id}",
+        json={"version": 1, "queue_opens_at": "2026-09-01T10:00:00"},   # 無時區
+        headers=admin,
+    )
+    assert resp.status_code == 422
+    assert "timezone" in str(resp.json()).lower()

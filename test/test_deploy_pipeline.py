@@ -200,17 +200,108 @@ _PRE_RULE_MIGRATIONS = {
 
 #: 滾動部署期間會讓**舊程式碼**壞掉的操作。判準是「舊 task 還在跑,它做得到的事
 #: 會不會因為這次 schema 變更而失敗」。
-#: drop_index / create_index / create_table / add_column(nullable=True) 不在裡面 ——
-#: 那些舊程式碼完全感覺不到。
+#: drop_index / create_table / add_column(nullable=True) 不在裡面 —— 那些舊程式碼
+#: 完全感覺不到。create_index 只有 unique=True 才算(非 unique 的索引舊程式碼寫不壞)。
 _BREAKING_OPS = {"drop_column", "drop_table", "rename_table"}
 
+#: op.execute 原生 SQL 裡的破壞性語句。AST 比對 `op.<name>()` 看不到這些 ——
+#: 而這個盲點已經漏掉過兩支真實的 migration(a3d5f81c 的 FK、e5b93c17 的整表重建,
+#: 兩支都是自己補了 BACKWARD_INCOMPATIBLE 才留下紀錄)。
+#:
+#: (pattern 片語們, 說明, 建表豁免)。豁免 = 語句的目標表是**同一支 migration 建的**
+#: 就不算破壞:舊程式碼根本不知道那張表,約束加在上面傷不到它(c41f8a2d5b70 的
+#: EXCLUDE 就是這種)。DROP 與 RENAME 不豁免 —— e5b93c17 的 RENAME 目標雖是新表,
+#: 但改名的結果是換掉舊程式碼正在用的名字,那正是破壞本身。
+#: RENAME 要求同句有 ALTER TABLE:ALTER INDEX ... RENAME 不影響任何程式碼。
+#: ALTER TABLE ... SET (storage 參數) 不在裡面,所以只認 SET NOT NULL 全詞。
+_BREAKING_SQL: tuple[tuple[tuple[str, ...], str, bool], ...] = (
+    (("DROP TABLE",), "DROP TABLE — 舊程式碼還在讀/寫它", False),
+    (("DROP COLUMN",), "DROP COLUMN — 舊程式碼還在讀/寫它", False),
+    (("ALTER TABLE", "RENAME"), "ALTER TABLE RENAME — 對舊程式碼等於同時砍掉又新增", False),
+    (("SET NOT NULL",), "SET NOT NULL — 舊程式碼可能還在寫 NULL", True),
+    (("ALTER COLUMN", " TYPE "), "ALTER COLUMN TYPE — 型別改變,舊程式碼的讀寫可能失敗", True),
+    (("ADD CONSTRAINT", "CHECK"), "ADD CHECK — 舊程式碼可能寫出違反它的列", True),
+    (("ADD CONSTRAINT", "FOREIGN KEY"), "ADD FOREIGN KEY — 舊程式碼可能寫出違反它的列", True),
+    (("ADD CONSTRAINT", "EXCLUDE"), "ADD EXCLUDE — 舊程式碼可能寫出違反它的列", True),
+    (("CREATE UNIQUE INDEX",), "CREATE UNIQUE INDEX — 舊程式碼可能寫出違反它的列", True),
+    (("CREATE TRIGGER",), "CREATE TRIGGER — 對舊程式碼等於新的寫入約束", True),
+    (("CREATE OR REPLACE TRIGGER",), "CREATE TRIGGER — 對舊程式碼等於新的寫入約束", True),
+)
 
-def _breaking_operations(upgrade: ast.FunctionDef) -> set[str]:
-    found: set[str] = set()
-    for node in ast.walk(upgrade):
+#: 從一句 SQL 撈出它動到的表,給建表豁免用。撈不到就當「不豁免」——
+#: 寧可多標一條要人申報,不要少標。
+_SQL_TARGET = re.compile(
+    r"(?:ALTER\s+TABLE|CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?\S+\s+ON|TRIGGER\s+\S+[\s\S]*?\bON)\s+(\w+)",
+    re.IGNORECASE,
+)
+
+
+def _downgrade_lines(tree: ast.Module) -> set[int]:
+    """downgrade 函式體的行號範圍 —— 它本來就該裝著反向操作,不掃。"""
+    lines: set[int] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "downgrade":
+            lines.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+    return lines
+
+
+def _literal_sql(node: ast.expr) -> str:
+    """把 op.execute 的第一個參數還原成可比對的字串。
+
+    f-string(JoinedStr)的變數部分換成佔位符 —— 我們比對的是 SQL 動詞,不是值。
+    比對不了的形狀(變數名、函式呼叫)回空字串:那是這個掃描的已知盲點,連同
+    「SQL 常數 import 自別的模組」一起,守不到的就靠 BACKWARD_INCOMPATIBLE 的
+    自覺申報(e8f0a3d5 的 trigger 就是這種)。
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(
+            v.value if isinstance(v, ast.Constant) else "{}" for v in node.values
+        )
+    return ""
+
+
+def _created_tables(tree: ast.Module) -> set[str]:
+    """這支 migration 自己建的表(op.create_table + 原生 CREATE TABLE)。"""
+    created: set[str] = set()
+    for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
             continue
+        if node.func.attr == "create_table" and node.args:
+            first = node.args[0]
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                created.add(first.value.upper())
+        elif node.func.attr == "execute" and node.args:
+            for m in re.finditer(
+                r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
+                _literal_sql(node.args[0]), re.IGNORECASE,
+            ):
+                created.add(m.group(1).upper())
+    return created
+
+
+def _breaking_operations(tree: ast.Module) -> set[str]:
+    """掃整個模組(除了 downgrade)的 op.* 呼叫與 op.execute 字面 SQL。
+
+    範圍是整個模組而不是只有 upgrade():兩支真實的 migration(c8f4a2e6、e5b93c17)
+    都把操作包在模組層的 helper 裡,只看 upgrade() 就漏了 —— 而這個教訓對 op.*
+    與原生 SQL **兩邊都成立**,不能只修一半。
+    """
+    skip = _downgrade_lines(tree)
+    created = _created_tables(tree)
+    found: set[str] = set()
+
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.lineno not in skip
+        ):
+            continue
         name, src = node.func.attr, ast.unparse(node)
+
         if name in _BREAKING_OPS:
             found.add(f"{name}() — 舊程式碼還在讀/寫它")
         elif name == "add_column" and "nullable=False" in src and "server_default" not in src:
@@ -222,6 +313,27 @@ def _breaking_operations(upgrade: ast.FunctionDef) -> set[str]:
                 found.add("改欄位名 — 對舊程式碼等於同時砍掉又新增")
         elif name == "create_check_constraint":
             found.add("create_check_constraint — 舊程式碼可能寫出違反它的列")
+        elif name in ("create_index", "create_unique_constraint") and (
+            name == "create_unique_constraint" or "unique=True" in src
+        ):
+            # 唯一性約束加在既有表上,舊程式碼可能寫出重複列。加在同一支 migration
+            # 剛建的表上則豁免 —— 舊程式碼根本不知道那張表。
+            table = next(
+                (a.value for a in node.args[1:2]
+                 if isinstance(a, ast.Constant) and isinstance(a.value, str)),
+                None,
+            )
+            if table is None or table.upper() not in created:
+                found.add("唯一性約束/索引 — 舊程式碼可能寫出重複列")
+        elif name == "execute" and node.args:
+            sql = _literal_sql(node.args[0]).upper()
+            if not sql:
+                continue
+            target = _SQL_TARGET.search(sql)
+            target_created = target is not None and target.group(1).upper() in created
+            for needles, label, exemptable in _BREAKING_SQL:
+                if all(n in sql for n in needles) and not (exemptable and target_created):
+                    found.add(label)
     return found
 
 
@@ -250,13 +362,7 @@ def test_new_migrations_survive_a_rolling_deploy() -> None:
         revision = filename.split("_")[0]
         if revision in _PRE_RULE_MIGRATIONS:
             continue
-        upgrade = next(
-            (n for n in tree.body
-             if isinstance(n, ast.FunctionDef) and n.name == "upgrade"), None
-        )
-        if upgrade is None:
-            continue
-        breaking = _breaking_operations(upgrade)
+        breaking = _breaking_operations(tree)
         if not breaking:
             continue
         acknowledged = any(
@@ -286,11 +392,7 @@ def test_the_grandfather_list_does_not_rot() -> None:
     by_revision = {name.split("_")[0]: tree for name, tree in _migrations()}
     for revision in _PRE_RULE_MIGRATIONS:
         assert revision in by_revision, f"{revision} 已經不存在 —— 從清單移除"
-        upgrade = next(
-            (n for n in by_revision[revision].body
-             if isinstance(n, ast.FunctionDef) and n.name == "upgrade"), None
-        )
-        assert upgrade is not None and _breaking_operations(upgrade), (
+        assert _breaking_operations(by_revision[revision]), (
             f"{revision} 已經沒有破壞性操作 —— 從豁免清單移除,否則它會遮住未來的改動"
         )
 

@@ -95,6 +95,7 @@ async def _order(db, seat_map, *, quantity: int, zone_id: int) -> Order:
 async def _hold(db, seat_map, order, block, *, start_pos: int, length: int) -> SeatHold:
     hold = SeatHold(
         event_id=seat_map["event"].id,
+        zone_id=block.zone_id,
         block_id=block.id,
         order_id=order.id,
         start_pos=start_pos,
@@ -348,11 +349,97 @@ async def test_last_pos_is_generated_not_writable(db, seat_map) -> None:
     block = seat_map["blocks"][0]
     order = await _order(db, seat_map, quantity=2, zone_id=block.zone_id)
     hold = SeatHold(
-        event_id=seat_map["event"].id, block_id=block.id, order_id=order.id,
-        start_pos=2, length=2,
+        event_id=seat_map["event"].id, zone_id=block.zone_id, block_id=block.id,
+        order_id=order.id, start_pos=2, length=2,
     )
     db.add(hold)
     await db.commit()
     assert await db.scalar(
         select(SeatHold.last_pos).where(SeatHold.id == hold.id)
     ) == 3
+
+
+# ─ hold 必須跟它的訂單一致(trigger),block 必須屬於場次的場館(兩條複合 FK)
+
+async def test_a_hold_whose_length_differs_from_the_order_quantity_is_rejected(
+    db, seat_map
+) -> None:
+    """worker 建 hold 的註解自己招認過:「stream 的 quantity 欄位同時是張數與區間
+    長度,兩者今天恆等,但若哪天出現買 2 送 1,這裡會靜默錯掉」。有了 trigger,
+    錯掉的那天它會炸 —— 不會靜默。"""
+    block = seat_map["blocks"][0]
+    order = await _order(db, seat_map, quantity=4, zone_id=block.zone_id)
+    with pytest.raises(IntegrityError) as excinfo:
+        await _hold(db, seat_map, order, block, start_pos=0, length=2)
+    assert "seat hold length 2 != order quantity 4" in str(excinfo.value)
+
+
+async def test_a_hold_in_a_zone_other_than_the_orders_is_rejected(db, seat_map) -> None:
+    """買 A 區的票、座位配在 B 區 —— 金額對不上座位價值,對帳兜不起來。"""
+    block_a, block_b = seat_map["blocks"]
+    order = await _order(db, seat_map, quantity=2, zone_id=block_a.zone_id)
+    with pytest.raises(IntegrityError) as excinfo:
+        await _hold(db, seat_map, order, block_b, start_pos=0, length=2)
+    assert "zone_id" in str(excinfo.value)
+
+
+async def test_a_hold_for_another_event_is_rejected(db, seat_map) -> None:
+    """hold 指到訂單以外的場次:座位被鎖在 A 場,錢收在 B 場。"""
+    block = seat_map["blocks"][0]
+    other = Event(
+        name="Other Show", venue="Seat Map Arena", venue_id=seat_map["venue"].id,
+        starts_at=seat_map["event"].starts_at + timedelta(days=1),
+        ends_at=seat_map["event"].ends_at + timedelta(days=1),
+        sale_starts_at=seat_map["event"].sale_starts_at,
+        sale_ends_at=seat_map["event"].sale_ends_at,
+        total_seats=20, price_cents=1500, status=EventStatus.PUBLISHED,
+    )
+    db.add(other)
+    await db.flush()
+    db.add_all([
+        EventZonePrice(event_id=other.id, zone_id=b.zone_id, price_cents=1000)
+        for b in seat_map["blocks"]
+    ])
+    await db.flush()
+    order = await _order(db, seat_map, quantity=2, zone_id=block.zone_id)
+
+    hold = SeatHold(
+        event_id=other.id,               # 訂單掛在 seat_map["event"],hold 指到 other
+        zone_id=block.zone_id, block_id=block.id, order_id=order.id,
+        start_pos=0, length=2,
+    )
+    db.add(hold)
+    with pytest.raises(IntegrityError) as excinfo:
+        await db.flush()
+    assert "event_id" in str(excinfo.value)
+
+
+async def test_a_hold_whose_zone_is_not_the_blocks_zone_is_rejected(db, seat_map) -> None:
+    """zone_id 是反正規化欄位,fk_seat_holds_zone_block 鎖住它必須是 block 真正的
+    zone —— 否則它自己就是新的漂移來源。"""
+    block_a, block_b = seat_map["blocks"]
+    order = await _order(db, seat_map, quantity=2, zone_id=block_b.zone_id)
+    hold = SeatHold(
+        event_id=seat_map["event"].id,
+        zone_id=block_b.zone_id,          # 跟訂單一致(trigger 放行)…
+        block_id=block_a.id,              # …但 block 是別區的
+        order_id=order.id, start_pos=0, length=2,
+    )
+    db.add(hold)
+    with pytest.raises(IntegrityError) as excinfo:
+        await db.flush()
+    assert "fk_seat_holds_zone_block" in str(excinfo.value)
+
+
+async def test_compaction_does_not_retrigger_the_order_match(db, seat_map) -> None:
+    """trigger 只掛在 order_id / event_id / zone_id / length 的 UPDATE 上 ——
+    compaction 滑動 hold 只動 start_pos,不該為每一步付一次 orders 查詢。
+    這條測的是「移動一個 hold 不會炸」,也就是 trigger 的 UPDATE OF 清單沒被寫壞。"""
+    block = seat_map["blocks"][0]
+    order = await _order(db, seat_map, quantity=2, zone_id=block.zone_id)
+    hold = await _hold(db, seat_map, order, block, start_pos=0, length=2)
+    await db.commit()
+
+    hold.start_pos = 6
+    await db.commit()
+    assert (await db.scalar(select(SeatHold.start_pos))) == 6

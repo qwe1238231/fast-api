@@ -108,6 +108,28 @@ class Order(Base):
             "status <> 'cancelled' OR cancelled_at IS NOT NULL",
             name="ck_orders_cancelled_at",
         ),
+        # 上面四條是 forward correspondence(status → 時間戳)。反過來那一半原本沒有,
+        # 於是一列可以同時帶著 expired_at 與 cancelled_at —— 而狀態機裡三個終態互斥,
+        # 到得了其中一個就到不了另一個。這種列不會讓任何程式碼出錯,它只會讓對帳報表
+        # 把同一筆算兩次,而那種錯誤沒有人會在當下發現。
+        CheckConstraint(
+            "expired_at IS NULL OR cancelled_at IS NULL",
+            name="ck_orders_terminal_exclusive",
+        ),
+        # CONFIRMED 只能從 PAID 來(見 crud/order.py 的 _VALID_TRANSITIONS),所以
+        # 「已確認但從沒付款」是狀態機到不了的狀態。
+        CheckConstraint(
+            "confirmed_at IS NULL OR paid_at IS NOT NULL",
+            name="ck_orders_confirmed_needs_paid",
+        ),
+        CheckConstraint(
+            "confirmed_at IS NULL OR paid_at <= confirmed_at",
+            name="ck_orders_paid_before_confirmed",
+        ),
+        # **刻意沒有**加「expired/cancelled 就不可能有 paid_at」。今天的狀態機確實
+        # 保證了(PAID 只能往 CONFIRMED),但那是一條會變的營運規則 —— 哪天要支援
+        # 已付款訂單的退款/作廢,PAID → CANCELLED 就會變合法,而那時這條 CHECK 會
+        # 變成擋路的東西。上面三條則是不管退款怎麼做都成立的。
         # (event_id, zone_id) 指向 event_zone_prices 的**主鍵**。取代原本的單欄
         # fk_orders_zone_id —— 那條只保證「zone 存在」,擋不住「這一區根本不屬於
         # 這場次的場館」。zone 的存在性由 event_zone_prices.zone_id 遞移保證,

@@ -707,6 +707,10 @@ async def _persist_intent(fields: dict) -> str:
                 # rebuild_zone_runs(絕不是「退還」那段區間,見該函式的說明)。
                 db.add(SeatHold(
                     event_id=int(fields["event_id"]),
+                    # 有 block 就一定有 zone(配位是按 zone 做的)。這一欄是
+                    # fk_seat_holds_zone_block / fk_seat_holds_event_zone 的支點,
+                    # 缺了會被 NOT NULL 擋下 —— 那是對的,不要在這裡補預設值。
+                    zone_id=int(zone_id),
                     block_id=int(block_id),
                     order_id=order.id,
                     start_pos=int(fields["start_pos"]),

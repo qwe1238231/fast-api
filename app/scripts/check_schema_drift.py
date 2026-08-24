@@ -2,10 +2,11 @@
 
 用法: python -m app.scripts.check_schema_drift       (退出碼非零代表有漂移)
 
-目前涵蓋 `alembic check` 看不到的兩類:
+目前涵蓋 `alembic check` 看不到的三類:
 
     索引定義        postgresql_include、opclass、排序方向、表達式的內容
     表的儲存參數    reloptions,也就是 per-table 的 autovacuum 調校
+    trigger         定義與它呼叫的函式本體(seat_holds ↔ orders 的一致性靠它)
 
 **為什麼 `alembic check` 不夠。** 它比對欄位、約束、外鍵的 ON DELETE,但這兩類都
 不在它的比對範圍內。實測確認:把 model 的 `postgresql_include` 拿掉,alembic check
@@ -65,26 +66,41 @@ _RELOPTIONS_QUERY = text(
 )
 
 
-async def _snapshot(url: str) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
-    """回傳 (每張表的索引定義, 每張表的 reloptions)。"""
+_TRIGGER_QUERY = text(
+    """
+    SELECT t.relname,
+           pg_get_triggerdef(g.oid) || E'\\n' || pg_get_functiondef(g.tgfoid)
+    FROM pg_trigger g
+    JOIN pg_class t ON t.oid = g.tgrelid
+    JOIN pg_namespace n ON n.oid = t.relnamespace
+    WHERE n.nspname = 'public'
+      AND NOT g.tgisinternal        -- 外鍵的 RI 檢查也是 trigger,那些不歸這裡管
+      AND NOT t.relispartition
+    """
+)
+
+
+async def _snapshot(
+        url: str,
+) -> tuple[dict[str, set[str]], dict[str, set[str]], dict[str, set[str]]]:
+    """回傳 (每張表的索引定義, 每張表的 reloptions, 每張表的 trigger+函式本體)。"""
     engine = create_async_engine(url, pool_pre_ping=False)
     try:
         async with engine.connect() as conn:
             index_rows = (await conn.execute(_INDEX_QUERY)).all()
             option_rows = (await conn.execute(_RELOPTIONS_QUERY)).all()
+            trigger_rows = (await conn.execute(_TRIGGER_QUERY)).all()
     finally:
         await engine.dispose()
 
-    indexes: dict[str, set[str]] = {}
-    for table, indexdef in index_rows:
-        if table not in _IGNORED_TABLES:
-            indexes.setdefault(table, set()).add(indexdef)
+    def bucket(rows) -> dict[str, set[str]]:
+        out: dict[str, set[str]] = {}
+        for table, item in rows:
+            if table not in _IGNORED_TABLES:
+                out.setdefault(table, set()).add(item)
+        return out
 
-    options: dict[str, set[str]] = {}
-    for table, option in option_rows:
-        if table not in _IGNORED_TABLES:
-            options.setdefault(table, set()).add(option)
-    return indexes, options
+    return bucket(index_rows), bucket(option_rows), bucket(trigger_rows)
 
 
 async def _build_reference(admin_url: str, ref_url: str, ref_name: str) -> None:
@@ -139,28 +155,30 @@ async def main() -> int:
 
     await _build_reference(admin_url, ref_url, ref_name)
     try:
-        db_indexes, db_options = await _snapshot(url)
-        ref_indexes, ref_options = await _snapshot(ref_url)
+        db_indexes, db_options, db_triggers = await _snapshot(url)
+        ref_indexes, ref_options, ref_triggers = await _snapshot(ref_url)
     finally:
         await _drop_reference(admin_url, ref_name)
 
     problems = (
         _report("索引", db_indexes, ref_indexes)
         + _report("儲存參數", db_options, ref_options)
+        + _report("trigger", db_triggers, ref_triggers)
     )
     if problems:
         print("schema 漂移 —— migration 與 model 對不上:", file=sys.stderr)
         print("\n".join(problems), file=sys.stderr)
         print(
             "\n這一類 alembic check 抓不到(它不比對 INCLUDE / opclass / 排序方向 /"
-            " reloptions),\n而測試走 metadata.create_all,所以也不會紅。",
+            " reloptions / trigger),\n而測試走 metadata.create_all,所以也不會紅。",
             file=sys.stderr,
         )
         return 1
 
     print(
         f"schema 一致({sum(len(v) for v in db_indexes.values())} 個索引、"
-        f"{sum(len(v) for v in db_options.values())} 個儲存參數)"
+        f"{sum(len(v) for v in db_options.values())} 個儲存參數、"
+        f"{sum(len(v) for v in db_triggers.values())} 個 trigger)"
     )
     return 0
 

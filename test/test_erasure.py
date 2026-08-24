@@ -64,7 +64,8 @@ async def subject(db) -> User:
         Order(
             user_id=user.id, event_id=event.id, quantity=2,
             total_price_cents=3000, status=OrderStatus.CONFIRMED,
-            confirmed_at=now, idempotency_key=uuid4(),
+            # CONFIRMED 只能從 PAID 來,所以兩個時間戳都要有。
+            paid_at=now, confirmed_at=now, idempotency_key=uuid4(),
         )
     )
     await db.commit()

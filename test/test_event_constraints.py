@@ -120,3 +120,38 @@ async def test_post_rejects_inverted_windows_with_422(client, db) -> None:
     resp = await client.post("/v1/events/", json=payload, headers=headers)
     assert resp.status_code == 422
     assert "ends_at" in str(resp.json())
+
+
+# ─ 價格來源:非座位場次必有單一票價,座位場次必為 NULL
+
+@pytest.mark.asyncio
+async def test_db_rejects_a_seated_event_with_a_flat_price(db) -> None:
+    """以前座位場次塞哨兵值 0,而 0 通過 ck_events_price_nonneg ——「忘記設價」、
+    「真的免費場」、「座位場次」三者在 DB 裡長一樣。互斥 CHECK 讓價格來源變成
+    schema 說得出口的事。"""
+    from app.models.seating import Venue
+    venue = Venue(name="Price Source Arena")
+    db.add(venue)
+    await db.flush()
+    db.add(_event(venue_id=venue.id, price_cents=0))
+    with pytest.raises(IntegrityError) as excinfo:
+        await db.flush()
+    assert "ck_events_price_source" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_db_rejects_a_plain_event_without_a_price(db) -> None:
+    db.add(_event(price_cents=None))
+    with pytest.raises(IntegrityError) as excinfo:
+        await db.flush()
+    assert "ck_events_price_source" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_free_unseated_event_is_still_legal(db) -> None:
+    """price_cents=0 對非座位場次仍是合法的「免費場」—— 互斥 CHECK 管的是
+    「哪個來源有效」,不是「能不能免費」。"""
+    event = _event(price_cents=0)
+    db.add(event)
+    await db.commit()
+    assert event.id is not None

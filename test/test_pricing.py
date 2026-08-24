@@ -121,7 +121,7 @@ async def test_load_zone_prices_skips_zones_from_another_venue(db) -> None:
         name="Home Show", venue="Home Arena", venue_id=home.id,
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
-        total_seats=10, price_cents=100, status=EventStatus.PUBLISHED,
+        total_seats=10, price_cents=None, status=EventStatus.PUBLISHED,
     )
     db.add(event)
     await db.flush()
@@ -165,7 +165,7 @@ async def test_cached_zone_prices_keep_integer_keys(db, redis) -> None:
         name="Cached Show", venue="Cache Arena", venue_id=venue.id,
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
-        total_seats=10, price_cents=100, status=EventStatus.PUBLISHED,
+        total_seats=10, price_cents=None, status=EventStatus.PUBLISHED,
     )
     db.add(event)
     await db.flush()
@@ -212,7 +212,7 @@ async def test_seated_order_persists_zone_and_zone_price(
         name="E2E Show", venue="E2E Arena", venue_id=venue.id,
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
-        total_seats=20, price_cents=100, status=EventStatus.DRAFT,
+        total_seats=20, price_cents=None, status=EventStatus.DRAFT,
     )
     db.add(event)
     await db.flush()
@@ -284,7 +284,7 @@ async def test_order_with_a_foreign_zone_is_rejected(client, db, redis) -> None:
         name="Guard Show", venue="Guard Home", venue_id=home.id,
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
-        total_seats=10, price_cents=100, status=EventStatus.PUBLISHED,
+        total_seats=10, price_cents=None, status=EventStatus.PUBLISHED,
     )
     db.add(event)
     await db.flush()

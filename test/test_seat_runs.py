@@ -64,7 +64,7 @@ async def _make_event(db, venue_id: int, total_seats: int) -> Event:
         name="Seated", venue="X", venue_id=venue_id,
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
-        total_seats=total_seats, price_cents=100, status=EventStatus.PUBLISHED,
+        total_seats=total_seats, price_cents=None, status=EventStatus.PUBLISHED,
     )
     db.add(event)
     await db.flush()

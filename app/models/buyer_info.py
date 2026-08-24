@@ -6,14 +6,14 @@ from app.db.base import Base
 
 class BuyerInfo(Base):
     __tablename__ = "buyer_info"
-    id: Mapped[int] = mapped_column(primary_key=True)
+    # user_id 直接當主鍵:這張表是嚴格 1:1(一個人一份實名),surrogate id 只是
+    # 多一個序列跟多一個索引,而全 repo 沒有任何地方引用過它。
     # CASCADE:這一列**就是**個資。使用者真的被刪掉時它沒有任何留下來的理由,
     # 而且刪掉它等於 crypto-shred —— ciphertext 與被 KEK 包住的 DEK 一起消失,
     # KEK 還在也解不開(見 app/services/pii.py 的信封加密)。
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE", name="fk_buyer_info_user_id"),
-        nullable=False,
-        unique=True,
+        primary_key=True,
     )
     
     real_name: Mapped[str] = mapped_column(String(64), nullable=False,)

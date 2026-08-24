@@ -19,6 +19,14 @@ class Event(Base):
         # trusts; a 0/negative from an admin typo would poison it. Guard at the DB.
         CheckConstraint("total_seats > 0", name="ck_events_total_seats_pos"),
         CheckConstraint("price_cents >= 0", name="ck_events_price_nonneg"),
+        # 「哪個價格來源有效」由 schema 說出口:非座位場次必有單一票價,座位場次
+        # 必為 NULL(價格在 event_zone_prices)。以前座位場次塞哨兵值 0,而 0 剛好
+        # 通過 ck_events_price_nonneg —— 「忘記設價」跟「座位場次」在 DB 裡長一樣,
+        # 「真的免費場」跟「座位場次」也長一樣。NULL 讓三者可區分。
+        CheckConstraint(
+            "(venue_id IS NULL) = (price_cents IS NOT NULL)",
+            name="ck_events_price_source",
+        ),
         # 時間欄位的先後關係。理由跟 total_seats > 0 完全一樣:管理員打錯一個日期
         # 不會噴任何錯,只會讓整場永遠賣不出去(sale_ends_at 早於 sale_starts_at)
         # 或讓等候室的時間窗算出負的長度 —— 而這種故障沒有任何告警看得出來,
@@ -40,10 +48,10 @@ class Event(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     venue: Mapped[str] = mapped_column(String(255), nullable=False)
-    # 座位圖要掛在正規化的場館上,自由字串沒地方掛 block/seat。刻意先做成
-    # nullable 的加法:沒有座位圖的舊場次(以及只用 total_seats 計數的路徑)
-    # 照常運作,座位功能只對 venue_id 有值的場次生效。等座位流程完整上線、
-    # 舊資料回填完成,才把 venue 字串下架。
+    # venue 字串是**顯示欄位**,不是過渡欄位(2026-08-24 拍板,不下架):
+    # 非座位場次沒有 venue_id,這個字串是它們唯一的場地資訊 —— 下架等於逼所有
+    # 場次建 venue 列,那是功能決策不是 schema 清理。座位場次以 venue_id 為準,
+    # 字串僅供顯示,兩者不同步時以 venue_id 那條鏈為權威。
     venue_id: Mapped[int | None] = mapped_column(
         ForeignKey("venues.id"), nullable=True, index=True
     )
@@ -56,7 +64,8 @@ class Event(Base):
     queue_opens_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     queue_closes_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     total_seats: Mapped[int] = mapped_column(nullable=False)
-    price_cents: Mapped[int] = mapped_column(nullable=False)
+    # NULL ⇔ 座位場次(見 ck_events_price_source)。單一票價只服務無座位圖的舊路徑。
+    price_cents: Mapped[int | None] = mapped_column(nullable=True)
     status: Mapped[EventStatus] = mapped_column(
         SAEnum(
             EventStatus,

@@ -67,6 +67,22 @@ def test_ci_runs_the_migration_steps_in_production_shape() -> None:
         )
 
 
+def test_pushing_to_dev_actually_runs_the_tests() -> None:
+    """分支流程是 feat → dev → main,先上 dev 確認沒問題才進 main。
+
+    但那句話只有在「推 dev 真的會跑 CI」時才成立 —— 而它曾經不成立:push 的分支
+    清單只有 `feat/*`,直接推 dev 什麼都不會觸發,於是「dev 綠了」是一個沒有對應
+    run 的說法。規則用「推」來描述,觸發條件就必須跟著「推」走。
+
+    `main` 反過來,刻意不在清單裡:deploy.yml 用 `uses:` 呼叫這整支,所以 main 上的
+    測試是部署管線的第一關而不是平行的工作流。
+    """
+    on = yaml.safe_load(WORKFLOW.read_text())[True]     # YAML 把裸 `on:` 解析成 True
+    branches = on["push"]["branches"]
+    assert "dev" in branches, "推 dev 不會觸發 CI —— 分支流程的中間那一關是空的"
+    assert "main" not in branches, "main 由 deploy.yml 以 workflow_call 帶起,不要重複觸發"
+
+
 @pytest.mark.parametrize("required", ["DATABASE_URL", "STRIPE_WEBHOOK_SECRET"])
 def test_the_env_is_declared_once_at_job_level(required: str) -> None:
     """env 必須在 job 層級宣告一次,不要每個步驟各複製一份。

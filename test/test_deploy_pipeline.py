@@ -87,6 +87,38 @@ def test_the_called_workflow_actually_runs_the_tests() -> None:
     assert "pytest" in runs
 
 
+def test_ci_checks_that_the_terraform_is_even_valid() -> None:
+    """HCL 合不合法要在部署之前有人檢查。
+
+    這個檔案裡其他的 infra 斷言掃的都是**文字**(「這個屬性有沒有被設成這個值」),
+    它們對「這份 HCL 根本不合法」完全無感 —— 屬性名打錯、型別給錯、引用一個不存在的
+    資源,全都能一路綠到 `terraform apply`,而 apply 只發生在部署當下、對著真的 AWS。
+
+    跑在哪個 job 不重要(所以這裡掃全部的 job),重要的是它在這支工作流裡 —— 因為
+    deploy.yml 是靠 `uses:` 呼叫整支來當閘門的。
+    """
+    called = yaml.safe_load(TEST_YML.read_text())
+    runs = " ".join(
+        step.get("run", "")
+        for job in called["jobs"].values()
+        for step in job.get("steps", [])
+    )
+
+    # 用正規表達式而不是子字串:實際的指令是 `terraform -chdir="$dir" validate`,
+    # 中間夾著旗標。找 "terraform validate" 這個字面值會漏掉它。
+    assert re.search(r"\bterraform\b[^\n]*\bvalidate\b", runs), (
+        "CI 沒有跑 terraform validate —— `.tf` 的語法/型別錯誤要到部署當下的 apply 才會現形"
+    )
+    assert re.search(r"\bterraform\b[^\n]*\bfmt\b[^\n]*-check", runs), (
+        "CI 沒有跑 terraform fmt -check(少了 -check 的話 fmt 只會改檔案然後回 0)"
+    )
+    assert "infra/bootstrap" in runs, (
+        "validate 沒有涵蓋 infra/bootstrap。它是**另一個 root module**(自己的 state 與 "
+        "lock),在 infra/ 底下跑的 validate 看不到它 —— 而它壞掉的後果是重建環境的前提"
+        "沒了(見 infra/bootstrap/main.tf 的說明)。"
+    )
+
+
 def test_only_one_deploy_can_run_at_a_time(deploy) -> None:
     """兩次快速推送會讓兩組 migration 與兩組 update-service 交錯,最後線上跑的是
     哪個 SHA 變成賽跑結果。而且不能 cancel-in-progress:取消一個「migration 已經
@@ -636,6 +668,195 @@ def test_the_metric_names_the_alarms_read_are_the_ones_the_app_publishes() -> No
         if name.islower() and name not in published        # AWS/ECS 的指標是駝峰
     }
     assert not orphans, f"這些指標有告警但程式碼發不出來:{sorted(orphans)}"
+
+
+# ─ ALB:健康檢查通過的意思,以及「一條 SSE 是一個永不結束的請求」
+
+ALB_TF = (ROOT / "infra" / "alb.tf").read_text()
+MAIN_PY = APP / "main.py"
+SSE_MODULE = APP / "api" / "v1" / "events.py"
+
+# 一個死掉的 target 還能收到流量多久 = interval × unhealthy_threshold。搶票的尖峰
+# 常常只有幾十秒,所以這個上界是照著業務的時間尺度定的,不是照著 AWS 的預設值。
+_DEAD_TARGET_TRAFFIC_CEILING_SECONDS = 30
+
+# 這個專案的依賴一律走 DI 標註進來(app/api/deps.py),所以標註就是契約。
+_SHARED_DEPENDENCY_ANNOTATIONS = {"DbSession", "Redis", "AsyncSession"}
+
+
+def _health_check() -> dict[str, str]:
+    """把 alb.tf 的 health_check 區塊解析成 key -> value(值都當字串)。"""
+    block = _code(ALB_TF).split("health_check {")[1].split("}")[0]
+    return dict(re.findall(r'(\w+)\s*=\s*"?([\w/\-]+)"?', block))
+
+
+def _route_handler(path: str) -> ast.FunctionDef:
+    """找出 main.py 裡掛在 `path` 上的處理函式。
+
+    找不到本身就是一個嚴重的失效:ALB 探測一條不存在的路徑會拿到 404,於是**每一個**
+    target 都變 unhealthy —— 服務其實是好的,但沒有後端收得到流量。
+    """
+    tree = ast.parse(MAIN_PY.read_text(), filename=str(MAIN_PY))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for deco in node.decorator_list:
+            if (
+                isinstance(deco, ast.Call)
+                and isinstance(deco.func, ast.Attribute)
+                and deco.func.attr == "get"
+                and deco.args
+                and isinstance(deco.args[0], ast.Constant)
+                and deco.args[0].value == path
+            ):
+                return node
+    raise AssertionError(
+        f"alb.tf 探測 {path},但 {MAIN_PY.name} 沒有這條 GET 路由。ALB 會拿到 404,"
+        "於是所有 target 同時 unhealthy —— 程式是好的,流量卻沒有後端可以送。"
+        "(路由若搬到 router 底下,連同這條測試的搜尋範圍一起改。)"
+    )
+
+
+def test_the_endpoint_the_alb_polls_touches_no_shared_dependency() -> None:
+    """ALB 探測的那支端點**不能**碰 DB 或 Redis,而且 matcher 必須是單一的 200。
+
+    這兩件事是同一個決定的兩半。
+
+    深度:健康檢查同時決定「送不送流量」與(接上 ECS 之後)「殺不殺這個任務」。DB 是
+    共用的,所以深度檢查會在資料庫一抖時讓**每一個** target 同時 unhealthy:ALB 沒有
+    後端可送(完全中斷),而 ECS 把所有任務殺掉重啟,重啟再回頭捶正在恢復的資料庫。
+    一次依賴抖動被放大成全面停機加驚群。這條擋的是好意的改動 —— 「健康檢查不查資料庫
+    也太淺了吧」是一個非常自然的念頭,而它會在最壞的時刻生效。
+
+    matcher:舊設定是 path="/" + matcher="200-399",而 "/" 回 307 轉去 /docs ——
+    「健康」的實際判準變成「那個轉址還在」。範圍型的 matcher 會讓語意搭在一個沒人
+    當成契約的行為上。單一 200 是明確的契約。
+
+    深度檢查在 /health/deps(它**應該**碰依賴),消費者是值班的人與部署後的煙霧測試。
+    """
+    hc = _health_check()
+
+    assert hc["matcher"] == "200", (
+        f"matcher={hc['matcher']!r} 是範圍。範圍會讓「健康」的判準搭上轉址之類沒人當成"
+        "契約的行為 —— 那正是 path=\"/\" + 200-399 的舊設定出過的問題。"
+    )
+
+    handler = _route_handler(hc["path"])
+
+    # 舊設定真正的失效是這個:探測的那支回 307。matcher 收緊成 200 之後,把 path 改回
+    # 一支會轉址的端點就等於讓所有 target 一起 unhealthy —— 而改 path 的那一行 diff
+    # 看不出來這件事。
+    assert "RedirectResponse" not in ast.unparse(handler), (
+        f"{handler.name}() 會轉址,但 ALB 探測它而且只接受 200 —— 所有 target 會同時"
+        "unhealthy。ALB 要探的是一支專屬的存活端點,不是任何剛好存在的路由。"
+    )
+
+    offenders = {
+        arg.arg: ast.unparse(arg.annotation)
+        for arg in handler.args.args + handler.args.kwonlyargs
+        if arg.annotation is not None
+        and ast.unparse(arg.annotation) in _SHARED_DEPENDENCY_ANNOTATIONS
+    }
+    assert not offenders, (
+        f"{handler.name}() 收了共用依賴 {offenders} —— 但 ALB 正在探測它。資料庫抖一下,"
+        "所有 target 會同時 unhealthy(完全中斷)而且被 ECS 全部重啟,重啟再去捶正在"
+        "恢復的資料庫。任務重啟只治得好「這個 process 自己壞了」。要做深度檢查請放到 "
+        "/health/deps,不要放進 ALB 探測的這一支。"
+    )
+
+
+def test_a_dead_target_stops_getting_traffic_quickly() -> None:
+    """`interval × unhealthy_threshold` 是一個死掉的 target 還能繼續吃流量的時間。
+
+    AWS 的預設(30 × 3 = 90 秒)對一般服務沒問題,對搶票不行 —— 一整段開賣可能還撐
+    不到 90 秒,那等於整場都有一台在丟請求。而這個代價是不對稱的:探測變密只是多幾個
+    HTTP 請求,而那支端點不碰任何依賴(見上一條),所以幾乎沒有成本。
+    """
+    hc = _health_check()
+    interval, unhealthy = int(hc["interval"]), int(hc["unhealthy_threshold"])
+    window = interval * unhealthy
+
+    assert window <= _DEAD_TARGET_TRAFFIC_CEILING_SECONDS, (
+        f"interval={interval} × unhealthy_threshold={unhealthy} = {window} 秒,超過 "
+        f"{_DEAD_TARGET_TRAFFIC_CEILING_SECONDS} 秒的上界:一台死掉的 task 會吃掉這麼久的"
+        "流量。探測密一點的成本只有多幾個 /health 請求,而那支不碰依賴。"
+    )
+    # ALB 自己就要求 timeout < interval。寫在這裡是為了讓它在 plan 之前就紅 ——
+    # 這種錯目前的 CI 抓不到(沒有跑 terraform validate)。
+    assert int(hc["timeout"]) < interval, "timeout 必須小於 interval"
+
+
+def _sse_max_seconds() -> int:
+    """從 events.py 取 `_SSE_MAX_SECONDS`,而且用 AST 不用正規表達式。
+
+    理由跟 `needs_human` 那次一樣:文字掃描會掃到註解與字串,而這個常數那一行後面
+    正好跟著一段解釋。AST 只看真的賦值。
+    """
+    tree = ast.parse(SSE_MODULE.read_text(), filename=str(SSE_MODULE))
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and any(getattr(t, "id", None) == "_SSE_MAX_SECONDS" for t in node.targets)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, int)
+        ):
+            return node.value.value
+    raise AssertionError(
+        f"{SSE_MODULE.name} 找不到 _SSE_MAX_SECONDS 的整數賦值 —— 少了它,SSE 連線沒有"
+        "壽命上限,而部署的排空時間也就失去了上界"
+    )
+
+
+def test_the_sse_lifetime_cap_is_actually_enforced() -> None:
+    """常數存在不等於它還在管事。
+
+    這條擋的是「有人把 `while` 條件改掉、常數卻留在原地」—— 那會讓下面那條不變式
+    在對照一個已經沒有效力的數字,而兩條測試都還是綠的。
+    """
+    source = SSE_MODULE.read_text()
+    assert source.count("_SSE_MAX_SECONDS") >= 2, (
+        "_SSE_MAX_SECONDS 只出現在賦值處,沒有任何地方讀它 —— 連線壽命上限已經失效"
+    )
+
+
+def test_the_drain_window_stays_inside_the_sse_lifetime() -> None:
+    """`deregistration_delay` 必須**小於** `_SSE_MAX_SECONDS`。
+
+    對 ALB 來說一條 SSE 就是一個永遠不結束的請求,所以下線一個 target 時,排空會等
+    這些串流。真正生效的是 `min(deregistration_delay, 串流剩餘壽命)`,而它只有兩種
+    形態,兩種形態就是兩個不同的決定:
+
+      delay >= 上限  串流永遠不會被硬切,每條都自己走完;部署最久等滿「上限」。
+      delay <  上限  活超過 delay 的串流被強制關閉;部署最久等 delay。
+
+    這裡刻意選後者:重連在**這個** app 是安全的,因為重連後第一個 frame 就是
+    queue_status 的權威狀態,而入場是時間的純函數 —— 連線本身不保存任何東西。
+    換一個把狀態放在連線裡的系統,同樣的數字就是錯的。所以要鎖的不是「60」,是
+    「60 落在 300 的哪一邊」。
+
+    為什麼非得用測試鎖:三種改壞的方式(把 SSE 上限拉到 900、降到 30、或把
+    deregistration_delay 刪掉吃預設值)**兩邊各自看都是對的**,每次的 diff 都只有
+    一行,審的人看不到另一個檔案。這個關係不在任何型別、任何 plan、任何 diff 裡,
+    只寫在 alb.tf 的一段註解 —— 而註解不會失敗。
+    """
+    match = re.search(r"deregistration_delay\s*=\s*(\d+)", _code(ALB_TF))
+    assert match, (
+        "alb.tf 沒有設 deregistration_delay。預設值 300 秒剛好等於 _SSE_MAX_SECONDS,"
+        "於是每次部署都為了排空長連線等滿五分鐘 —— 而那個五分鐘看起來會像 ECS 很慢,"
+        "不像一個設定。要維持預設也請明確寫出來。"
+    )
+
+    delay, sse_max = int(match.group(1)), _sse_max_seconds()
+
+    assert delay < sse_max, (
+        f"deregistration_delay={delay} 沒有小於 _SSE_MAX_SECONDS={sse_max}:每次部署都會"
+        f"為了等 SSE 自己結束而多花最多 {sse_max} 秒,而那個延遲的原因在 events.py,"
+        "不在任何 Terraform 檔案裡。要改成「等串流走完」是一個合理的決定,但請連同 "
+        "alb.tf 的註解一起改 —— 不要只把數字調到這條測試變綠。"
+    )
+    assert delay > 0, (
+        "0 = 不排空,連一般的 POST /orders 都會在部署當下被硬切"
+    )
 
 
 # ─ 資料耐久性:這些設定被改回「dev 值」不會讓任何功能壞掉,只會讓復原能力消失

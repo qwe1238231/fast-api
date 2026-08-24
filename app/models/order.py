@@ -1,13 +1,42 @@
 from datetime import datetime
 from enum import Enum
 from uuid import UUID
-from sqlalchemy import Index, text
+from sqlalchemy import DDL, Index, event, text
 from sqlalchemy import BigInteger, DateTime, ForeignKey, ForeignKeyConstraint, String, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy import Index, text, CheckConstraint
 from app.db.base import Base
+
+#: orders 的 autovacuum 調校。**沒有這個,上面那個 INCLUDE 覆蓋索引是白加的。**
+#:
+#: Index Only Scan 需要 visibility map 標記頁面 all-visible,而只有 vacuum 會設那個
+#: 位元。實測(200 萬列,對帳查詢):
+#:     VACUUM 之後    VM 100%   heap fetches   0    22 blocks   0.28 ms
+#:     +4 萬筆未清     VM  98%   heap fetches  81   103 blocks   0.48 ms
+#:     +40 萬筆未清    VM  83%   heap fetches 801   827 blocks   1.90 ms
+#:
+#: 40 萬正好是**預設值**的觸發點(1000 + 0.2 × 200 萬)—— 不調的話穩態就是最後那一列,
+#: 覆蓋索引的效果被吃掉 37 倍。
+#:
+#: scale_factor 一律設 0、只留固定 threshold:scale_factor 在大表上是陷阱,它讓觸發點
+#: 跟著表一起長,2000 萬列時就算設 0.02 也回到 40 萬。固定值才能讓「落後多少」與表
+#: 大小脫鉤。
+#:
+#: 調勤不會等比例變貴 —— vacuum 自己也用 VM 跳過乾淨的頁面,成本跟髒頁數成正比而不是
+#: 表大小:實測 40 萬筆髒頁 51ms、4 萬筆 19ms、完全乾淨 18ms。
+#:
+#: 代價:訂單還不到兩萬筆的階段幾乎不會被 autovacuum 碰。那時候沒有東西值得清,
+#: analyze 的門檻設得低一些讓查詢計畫仍然跟得上。
+ORDERS_AUTOVACUUM = {
+    "autovacuum_vacuum_insert_threshold": 20000,
+    "autovacuum_vacuum_insert_scale_factor": 0,
+    "autovacuum_vacuum_threshold": 20000,
+    "autovacuum_vacuum_scale_factor": 0,
+    "autovacuum_analyze_threshold": 10000,
+    "autovacuum_analyze_scale_factor": 0,
+}
 
 
 
@@ -148,3 +177,21 @@ class Order(Base):
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# SQLAlchemy 的 postgresql_with 只支援 Index,Table 沒有對應的 kwarg —— 所以 table
+# storage parameter 只能靠 after_create 的 DDL。跟 seating.py 建 btree_gist、
+# audit_log.py 建 DEFAULT 分區是同一個手法。
+#
+# 掛在 model 上而不是只寫進 migration,是為了讓兩條建表路徑得到同一份設定:migration
+# 走 ALTER TABLE,測試走 metadata.create_all。少了這個,「model 說的」跟「線上跑的」
+# 又多一個會無聲分岔的面 —— 而那正是 app/scripts/check_schema_drift.py 在守的東西。
+event.listen(
+    Order.__table__,
+    "after_create",
+    DDL(
+        "ALTER TABLE orders SET ("
+        + ", ".join(f"{k} = {v}" for k, v in ORDERS_AUTOVACUUM.items())
+        + ")"
+    ),
+)

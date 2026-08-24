@@ -375,7 +375,7 @@ async def seated(db, redis):
         name="Limit Show", venue=spec.name, venue_id=venue.id,
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
-        total_seats=24, price_cents=100, status=EventStatus.DRAFT,
+        total_seats=24, price_cents=None, status=EventStatus.DRAFT,
     )
     db.add(event)
     await db.flush()

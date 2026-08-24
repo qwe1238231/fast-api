@@ -131,7 +131,8 @@ class EventResponse(BaseModel):
     ends_at: datetime
     sale_starts_at: datetime
     sale_ends_at: datetime
-    price_cents: int
+    price_cents: int | None
+    """None ⇔ 座位場次,票價看 /zones。"""
     total_seats: int
     status: EventStatus
     created_at: datetime

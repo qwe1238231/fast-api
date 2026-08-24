@@ -58,7 +58,7 @@ async def create_event(db: AsyncSession, data: EventCreate) -> Event:
         .join(Zone, Zone.id == SeatBlock.zone_id)
         .where(Zone.venue_id == data.venue_id)
     )
-    payload["price_cents"] = 0        # 座位場次不用單一票價,但欄位仍 NOT NULL
+    payload["price_cents"] = None     # 座位場次的價格在 event_zone_prices(ck_events_price_source)
 
     event = Event(**payload)
     db.add(event)

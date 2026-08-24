@@ -55,7 +55,7 @@ def unit_price(
     event_id: int,
     venue_id: int | None,
     zone_prices: Mapping[int, int],
-    fallback_price_cents: int,
+    fallback_price_cents: int | None,
     zone_id: int | None,
 ) -> int:
     """一張票的單價。純函式 —— 參數全部來自已快取的 EventMeta。
@@ -67,6 +67,10 @@ def unit_price(
     if venue_id is None:
         if zone_id is not None:
             raise ZoneNotForEvent(event_id, zone_id, reason="event has no seat map")
+        if fallback_price_cents is None:
+            # ck_events_price_source 保證非座位場次必有單一票價 —— 走到這裡代表
+            # 快取裡躺著違反約束的資料。炸出來,不要默默賣 0 元。
+            raise RuntimeError(f"event {event_id} has no price and no seat map")
         return fallback_price_cents
 
     if zone_id is None:
@@ -83,7 +87,7 @@ def order_total(
     event_id: int,
     venue_id: int | None,
     zone_prices: Mapping[int, int],
-    fallback_price_cents: int,
+    fallback_price_cents: int | None,
     zone_id: int | None,
     quantity: int,
 ) -> int:

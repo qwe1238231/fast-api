@@ -46,7 +46,7 @@ async def _seated_event(db, redis, *, blocks: tuple[int, ...], price: int = 2000
         name="Flow Show", venue=spec.name, venue_id=venue.id,
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
-        total_seats=sum(blocks), price_cents=100, status=EventStatus.DRAFT,
+        total_seats=sum(blocks), price_cents=None, status=EventStatus.DRAFT,
     )
     db.add(event)
     await db.flush()
@@ -309,7 +309,7 @@ async def test_publish_refuses_a_mismatched_total_seats(db, redis) -> None:
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
         total_seats=100,                      # 座位圖只有 12 席
-        price_cents=100, status=EventStatus.DRAFT,
+        price_cents=None, status=EventStatus.DRAFT,
     )
     db.add(event)
     await db.flush()
@@ -349,7 +349,7 @@ async def test_publish_refuses_an_unpriced_zone(db, redis) -> None:
         name="Unpriced Show", venue=spec.name, venue_id=venue.id,
         starts_at=now + timedelta(days=1), ends_at=now + timedelta(days=1, hours=2),
         sale_starts_at=now - timedelta(hours=1), sale_ends_at=now + timedelta(hours=1),
-        total_seats=12, price_cents=100, status=EventStatus.DRAFT,
+        total_seats=12, price_cents=None, status=EventStatus.DRAFT,
     )
     db.add(event)
     await db.flush()

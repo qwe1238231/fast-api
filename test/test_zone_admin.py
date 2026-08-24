@@ -45,7 +45,7 @@ async def seated(db):
         name="座位場次", venue=venue.name, venue_id=venue.id,
         starts_at=now + timedelta(days=30), ends_at=now + timedelta(days=30, hours=3),
         sale_starts_at=now + timedelta(days=1), sale_ends_at=now + timedelta(days=2),
-        total_seats=34, price_cents=0, status=EventStatus.DRAFT,
+        total_seats=34, price_cents=None, status=EventStatus.DRAFT,
     )
     db.add(event)
     await db.flush()

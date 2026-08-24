@@ -60,7 +60,7 @@ async def seat_map(db):
         sale_starts_at=now - timedelta(days=1),
         sale_ends_at=now + timedelta(days=1),
         total_seats=20,
-        price_cents=1500,
+        price_cents=None,
         status=EventStatus.PUBLISHED,
     )
     user = User(username="seatbuyer", hashed_password="x")
@@ -392,7 +392,7 @@ async def test_a_hold_for_another_event_is_rejected(db, seat_map) -> None:
         ends_at=seat_map["event"].ends_at + timedelta(days=1),
         sale_starts_at=seat_map["event"].sale_starts_at,
         sale_ends_at=seat_map["event"].sale_ends_at,
-        total_seats=20, price_cents=1500, status=EventStatus.PUBLISHED,
+        total_seats=20, price_cents=None, status=EventStatus.PUBLISHED,
     )
     db.add(other)
     await db.flush()

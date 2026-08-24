@@ -25,8 +25,9 @@ class EventMeta:
     status: EventStatus
     sale_starts_at: datetime
     sale_ends_at: datetime
-    price_cents: int
-    """單一票價。只在 venue_id is None(無座位圖)時使用。"""
+    price_cents: int | None
+    """單一票價。只在 venue_id is None(無座位圖)時使用;座位場次是 None
+    (ck_events_price_source)。"""
 
     venue_id: int | None = None
     zone_prices: dict[int, int] = field(default_factory=dict)

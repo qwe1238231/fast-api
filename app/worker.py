@@ -32,7 +32,7 @@ from app.crud.order import create_order, get_order_by_idempotency_key
 from app.crud.refresh_token import purge_expired
 from app.crud.stripe_event import cutoff_for, purge_events_older_than
 from app.models.audit_log import DEFAULT_PARTITION, AuditLog, partition_name
-from app.services.audit import AUDIT_STREAM_KEY
+from app.services.audit import AUDIT_STREAM_KEY, AUDIT_STREAM_MAX_LEN
 from app.models.event import Event, EventStatus
 from app.services.inventory import (
     compute_expected_available, compute_expected_quotas,
@@ -92,6 +92,14 @@ def cron_job(
 PENDING_TIMEOUT_MINUTES = 10
 AUDIT_CONSUMER_GROUP = "audit-writer"
 AUDIT_CONSUMER_NAME = "worker"
+AUDIT_BATCH = 1000
+"""一次 XREADGROUP 讀幾筆。小批次是為了讓「整批失敗退回逐筆」的代價可控 ——
+一萬筆一批的話,一顆毒藥會讓九千九百多筆走慢路。"""
+AUDIT_MAX_BATCHES = 50
+"""單次 cron 最多讀幾批(= 5 萬筆)。上限存在是為了不讓一輪佔住 worker
+(max_jobs=4),撞到上限會 alert 而不是靜靜收工。"""
+AUDIT_DEAD_LETTER_KEY = "audit:events:dead"
+AUDIT_DEAD_LETTER_MAX_LEN = 10_000
 ORDER_CONSUMER_GROUP = "order-writer"
 ORDER_CONSUMER_NAME = "worker"
 ORDER_LOOP_CONSUMER_NAME = "stream-consumer"   # the dedicated long-lived consumer process
@@ -408,48 +416,252 @@ async def shutdown(ctx: dict) -> None:
     """Close Redis client."""
     await ctx["redis_client"].aclose()
 
-@cron_job
-async def consume_audit_events(ctx: dict) -> None:
-    """Read pending audit events from stream, batch insert to Postgres."""
-    redis = ctx["redis_client"]
+def _audit_row(fields: dict) -> AuditLog:
+    """把一筆 stream entry 轉成 AuditLog。格式不對就丟例外,由呼叫端隔離。
 
+    刻意讓它會丟:靜默吞掉壞欄位(例如把爛掉的 payload 當成 {})會產生一列
+    「看起來正常但內容是編的」稽核紀錄,而那比少一列更糟 —— 少一列查得出來,
+    編出來的查不出來。
+    """
+    return AuditLog(
+        event_type=fields["event_type"],
+        actor_user_id=(
+            int(fields["actor_user_id"]) if fields.get("actor_user_id") else None
+        ),
+        actor_ip=fields.get("actor_ip") or None,
+        target_type=fields.get("target_type") or None,
+        target_id=fields.get("target_id") or None,
+        payload=json.loads(fields["payload"]) if fields.get("payload") else {},
+        success=fields.get("success") == "1",
+        error_code=fields.get("error_code") or None,
+        created_at=(
+            datetime.fromisoformat(fields["created_at"])
+            if fields.get("created_at") else None
+        ),
+    )
+
+
+async def _write_audit_rows(
+        entries: list[tuple[str, dict]],
+) -> tuple[list[str], list[tuple[str, dict]]]:
+    """寫入一批稽核事件。回傳 (可以 ack 的 entry_id, 寫不進去的 entry)。
+
+    **先整批、失敗才逐筆。** 整批一個交易是為了吞吐(尖峰時一分鐘幾萬筆),但一批
+    裡只要有一顆毒藥(欄位超長、payload 不是 JSON),整個交易就會回滾 —— 舊寫法在
+    這裡會把幾千筆好資料一起賠掉,而且下一輪重讀同一批、再賠一次。
+
+    退回逐筆之後,毒藥只毒到自己:好的落帳並 ack,壞的留在 PEL 由 reclaim 接手,
+    投遞次數用完就送死信。
+    """
+    prepared: list[tuple[str, dict]] = []
+    unwritable: list[tuple[str, dict]] = []
+    for entry_id, fields in entries:
+        try:
+            _audit_row(fields)
+        except Exception:
+            # 連物件都組不出來 —— 這種絕對不會因為重試而變好。
+            logger.warning(
+                "malformed audit entry",
+                extra={"event": "audit_entry_malformed", "stream_id": entry_id},
+            )
+            unwritable.append((entry_id, fields))
+        else:
+            prepared.append((entry_id, fields))
+
+    if not prepared:
+        return [], unwritable
+
+    async with AsyncSessionLocal() as db:
+        try:
+            db.add_all([_audit_row(fields) for _, fields in prepared])
+            await db.commit()
+            return [entry_id for entry_id, _ in prepared], unwritable
+        except Exception:
+            await db.rollback()
+            logger.warning(
+                "audit batch insert failed; falling back to one-by-one",
+                extra={"event": "audit_batch_fallback", "batch": len(prepared)},
+            )
+
+    acked: list[str] = []
+    for entry_id, fields in prepared:
+        async with AsyncSessionLocal() as db:
+            try:
+                # 從 fields 重新組一個 —— 上一批的 ORM 實例已經跟著被 rollback 的
+                # session 走了,不能再 add 進新的 session。
+                db.add(_audit_row(fields))
+                await db.commit()
+                acked.append(entry_id)
+            except Exception:
+                await db.rollback()
+                logger.exception(
+                    "failed to persist audit entry",
+                    extra={"event": "audit_entry_failed", "stream_id": entry_id},
+                )
+    return acked, unwritable
+
+
+async def _dead_letter_audit(redis, entry_id: str, fields: dict, *, reason: str) -> None:
+    """放棄一筆稽核事件,但**不要讓它消失** —— 搬到死信串流留給人看。
+
+    稽核跟訂單不一樣:訂單死信要退座位、標記 claim 失敗,有補償動作。稽核沒有東西
+    可以補償,唯一該做的就是「別靜靜丟掉」。丟掉的話,事後查帳看到的是一段沒有
+    任何異常訊號的空白。
+    """
+    await redis.xadd(
+        AUDIT_DEAD_LETTER_KEY,
+        {**fields, "_dead_reason": reason, "_original_id": entry_id},
+        maxlen=AUDIT_DEAD_LETTER_MAX_LEN,
+        approximate=True,
+    )
+    await redis.xack(AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP, entry_id)
+    alert(
+        logger,
+        "audit event dead-lettered — it will never reach Postgres; inspect "
+        f"`XRANGE {AUDIT_DEAD_LETTER_KEY} - +`",
+        event="audit_dead_lettered",
+        stream_id=entry_id,
+        reason=reason,
+    )
+
+
+async def _reclaim_audit_entries(redis, *, min_idle_ms: int, max_deliveries: int) -> int:
+    """回收卡在 PEL 裡的稽核事件。回傳重新處理的筆數。
+
+    **這支存在的理由**:消費者在 `db.commit()` 之後、`xack` 之前掛掉,那一批就留在
+    pending list 裡 —— 而下一輪用 `>` 讀只會拿到**新**訊息,永遠不會回頭。舊版沒有
+    這條路徑,所以那些事件就是靜默消失。訂單流一直都有 reclaim,稽核流沒有。
+
+    代價講清楚:commit 成功但 ack 失敗的那批會被重放,於是 Postgres 裡會出現重複的
+    稽核列。這是刻意的取捨 —— 稽核紀錄重複是雜訊,消失是失去證據,而且沒有任何
+    訊號。要根除重複得為每一列加上 stream_id 的唯一索引,那在這張寫入密集又已經
+    分區的表上不划算(唯一索引還必須包含分區鍵)。
+    """
+    pending = await redis.xpending_range(
+        AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP,
+        min="-", max="+", count=500, idle=min_idle_ms,
+    )
+    if not pending:
+        return 0
+
+    claimable: list[tuple[str, dict]] = []
+    for p in pending:
+        entry_id = p["message_id"]
+        claimed = await redis.xclaim(
+            AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP, AUDIT_CONSUMER_NAME,
+            min_idle_time=min_idle_ms, message_ids=[entry_id],
+        )
+        if not claimed:
+            continue                      # 別人先搶到了
+        _, fields = claimed[0]
+        if p["times_delivered"] >= max_deliveries:
+            await _dead_letter_audit(
+                redis, entry_id, fields,
+                reason=f"{p['times_delivered']} deliveries exhausted",
+            )
+            continue
+        claimable.append((entry_id, fields))
+
+    if not claimable:
+        return 0
+
+    acked, unwritable = await _write_audit_rows(claimable)
+    for entry_id, fields in unwritable:
+        await _dead_letter_audit(redis, entry_id, fields, reason="malformed")
+    if acked:
+        await redis.xack(AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP, *acked)
+    logger.info(
+        "reclaimed audit entries",
+        extra={"event": "audit_reclaimed", "reclaimed": len(acked)},
+    )
+    return len(acked)
+
+
+async def _consume_audit_batch(redis) -> int:
+    """讀一批新的稽核事件並落帳。回傳讀到幾筆。"""
     result = await redis.xreadgroup(
         groupname=AUDIT_CONSUMER_GROUP,
         consumername=AUDIT_CONSUMER_NAME,
         streams={AUDIT_STREAM_KEY: ">"},
-        count=10000,
+        count=AUDIT_BATCH,
         block=None,
     )
     if not result:
-        return
-    stream_data = result[0][1]
+        return 0
+    entries = result[0][1]
+    if not entries:
+        return 0
 
-    async with AsyncSessionLocal() as db:
-        entry_ids: list[str] = []
-        for entry_id, fields in stream_data:
-            audit_log = AuditLog(
-                event_type=fields.get("event_type"),
-                actor_user_id=(
-                    int(fields["actor_user_id"]) if fields.get("actor_user_id")
-                    else None
-                ),
-                actor_ip=fields.get("actor_ip") or None,
-                target_type=fields.get("target_type") or None,
-                target_id=fields.get("target_id") or None,
-                payload=json.loads(fields["payload"]) if fields.get("payload") else {},
-                success=fields.get("success") == "1",
-                error_code=fields.get("error_code") or None,
-                created_at=(
-                    datetime.fromisoformat(fields["created_at"]) if fields.get("created_at")
-                    else None
-                ),
-            )
-            db.add(audit_log)
-            entry_ids.append(entry_id)
-        await db.commit()
+    acked, unwritable = await _write_audit_rows(entries)
+    for entry_id, fields in unwritable:
+        await _dead_letter_audit(redis, entry_id, fields, reason="malformed")
+    if acked:
+        await redis.xack(AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP, *acked)
+    # 寫不進去的那些**不 ack** —— 留在 PEL 給 reclaim 重試,而不是當場丟掉。
+    return len(entries)
 
-    if entry_ids:
-        await redis.xack(AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP, *entry_ids)
+
+async def _audit_lag(redis) -> int | None:
+    """這個消費者群組還有多少筆沒讀到。看不出來就回 None。
+
+    不能用 XLEN 判斷積壓:稽核事件 ack 之後**不會 XDEL**(留在串流裡靠 maxlen 汰換),
+    所以 XLEN 穩定之後永遠是接近上限的那個數字,跟消費進度無關。
+    """
+    for group in await redis.xinfo_groups(AUDIT_STREAM_KEY):
+        if group.get("name") == AUDIT_CONSUMER_GROUP:
+            return group.get("lag")
+    return None
+
+
+@cron_job
+async def consume_audit_events(ctx: dict) -> None:
+    """把稽核事件從 Redis Stream 搬進 Postgres。
+
+    三件舊版沒做的事:
+      1. 先回收 PEL(舊版完全沒有,卡住的事件永遠消失)
+      2. 一輪之內讀到抽乾為止,而不是只讀一批就收工 —— 舊版一分鐘上限 1 萬筆,
+         而 XADD 的 maxlen=100k 是 approximate trim,追不上就是**最舊的事件被
+         Redis 直接丟掉**,沒有任何錯誤
+      3. 抽不乾時把 lag 叫出來。這條路徑上沒有別的偵測手段:資料是被 Redis 靜靜
+         修掉的,Postgres 端看不出少了什麼
+    """
+    redis = ctx["redis_client"]
+    settings = get_settings()
+
+    await _reclaim_audit_entries(
+        redis,
+        min_idle_ms=settings.AUDIT_RECLAIM_IDLE_MS,
+        max_deliveries=settings.AUDIT_MAX_DELIVERIES,
+    )
+
+    drained = 0
+    for _ in range(AUDIT_MAX_BATCHES):
+        read = await _consume_audit_batch(redis)
+        drained += read
+        if read < AUDIT_BATCH:
+            break                          # 這一輪已經抽乾
+    else:
+        # 撞到上限才會走到這裡。**一定要說出來** —— 一個安靜的上限讀起來就像
+        # 「全部處理完了」,而實際上積壓正在長大,而且上游會被 maxlen 修掉。
+        alert(
+            logger,
+            f"audit consumer hit its per-run cap ({AUDIT_MAX_BATCHES * AUDIT_BATCH} "
+            "entries); the backlog is growing and XADD's approximate trim will "
+            "start dropping the oldest events",
+            event="audit_consumer_capped",
+            drained=drained,
+        )
+
+    lag = await _audit_lag(redis)
+    if lag is not None and lag > settings.AUDIT_LAG_WARN:
+        alert(
+            logger,
+            f"audit stream lag is {lag} (warn above {settings.AUDIT_LAG_WARN}); "
+            f"events are trimmed at {AUDIT_STREAM_MAX_LEN} — anything beyond that "
+            "is lost with no error",
+            event="audit_lag_high",
+            lag=lag,
+        )
 
 async def _persist_intent(fields: dict) -> str:
     """Insert one order intent. Returns 'ok' | 'duplicate' | 'failed'.

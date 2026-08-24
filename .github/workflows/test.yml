@@ -112,6 +112,26 @@ jobs:
             exit 1
           fi
 
+      # `alembic check` 的第二個盲點:它比對欄位、約束、外鍵的 ON DELETE,但**不比對
+      # 索引定義的細節**。實測確認至少漏掉 postgresql_include —— 把 model 的 INCLUDE
+      # 拿掉,alembic check 照樣說乾淨。同一類還有 opclass、排序方向、表達式索引的內容。
+      #
+      # 這種漂移最陰險的地方是它不會讓任何測試變紅:pytest 走 metadata.create_all,
+      # 看到的永遠是 model 那一份,而正式環境跑的是 migration 那一份 —— 於是本機量到
+      # 的查詢計畫跟線上跑的不是同一個東西。
+      #
+      # 做法是拿 Postgres 自己的 pg_get_indexdef 當共同語言,兩份 schema 各問一次逐字
+      # 比對(細節見 app/scripts/check_index_drift.py)。必須在 pytest **之前** ——
+      # 理由跟 alembic check 同一條:create_all 會把缺的東西補進同一個資料庫。
+      - name: Check index definitions match the models
+        env:
+          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
+          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
+          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
+          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
+          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
+        run: python -m app.scripts.check_index_drift
+
       - name: Run pytest
         env:
           DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb

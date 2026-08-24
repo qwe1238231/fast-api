@@ -167,6 +167,16 @@ class Settings(BaseSettings):
     ORDER_MAX_DELIVERIES: int = 5              # dead-letter after this many delivery attempts
     ORDER_BACKLOG_WARN: int = 1000             # log a warning when backlog exceeds this
 
+    # 稽核串流的耐久性。訂單流有 reclaim 守著,稽核流以前完全沒有 —— 消費者在
+    # commit 之後、xack 之前掛掉,那一批就永遠留在 PEL 裡不再被讀(`>` 只給新訊息),
+    # 也就是**靜默消失**。而稽核的全部價值就在於它可信。
+    AUDIT_RECLAIM_IDLE_MS: int = 60_000        # 閒置這麼久才回收(還在處理中的不要搶)
+    AUDIT_MAX_DELIVERIES: int = 5              # 投遞這麼多次仍失敗就送死信
+    AUDIT_LAG_WARN: int = 10_000               # 未消費筆數超過這個就告警
+    """XADD 帶 maxlen=100_000 的 approximate trim —— 消費者落後太多時,**最舊的
+    事件會被 Redis 直接丟掉**,不會有任何錯誤。所以 lag 必須在遠低於那個上限的
+    地方就叫出來:告警是這條路徑上唯一的偵測手段。"""
+
     # DB connection pool (per-process). The total across ALL processes
     # (API workers + ARQ worker + order consumer) must fit Postgres max_connections:
     #   total ≈ num_processes * (DB_POOL_SIZE + DB_MAX_OVERFLOW)

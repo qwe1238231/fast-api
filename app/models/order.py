@@ -23,8 +23,25 @@ class OrderStatus(str, Enum):
 class Order(Base):
     __tablename__ = "orders"
     __table_args__ = (
+        # INCLUDE 把對帳查詢變成 Index Only Scan。不是為了單次查詢快 20ms ——
+        # 是因為 detect_inventory_drift **每 5 分鐘對每一個 published 場次各跑一次**
+        # compute_expected_available,所以成本是「場次數 × 每場 heap block」。
+        #
+        # 實測(每場約 4000 筆持有中的訂單):
+        #   訂單實體打散(普通場次、長售期)  4000 blocks/場 → 300 場一輪 ≈ 9.4 GB
+        #   訂單實體集中(熱門場次爆量)        58 blocks/場 → 一輪 ≈ 136 MB
+        #   打散 + INCLUDE                     23 blocks/場 → 一輪 ≈ 54 MB
+        #
+        # 打散那一列的問題不是慢,是每 5 分鐘把 shared_buffers 沖一遍 —— 而被排擠掉的
+        # 正是下單路徑需要的頁面。熱門場次自己用不到這個索引,但普通場次會一直在
+        # 背景製造那個負載,而長售期讓它們待在保留窗裡更久、被掃更多輪。
+        #
+        # 寫入代價幾乎是零:user_id 與 quantity 建立後不再改(CAS 只動 status 與
+        # 時間戳),所以不會製造額外的索引更新;HOT 也沒有損失,因為 status 本來就
+        # 在索引裡,狀態轉換早就打斷 HOT 了。每個 tuple 只是大 8 bytes。
         Index(
             "ix_orders_active", "event_id", "status",
+            postgresql_include=["user_id", "quantity"],
             postgresql_where=text("status IN ('pending', 'paid', 'confirmed')"),
         ),
         # Keyset pagination for list_orders_for_user: equality on user_id, then

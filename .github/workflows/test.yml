@@ -13,6 +13,24 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # env 放在 **job 層級**,不是每個步驟各自複製一份。這正是這次 CI 壞掉的根因:
+    # 71bdd9b 加了 STRIPE_WEBHOOK_SECRET 的 fail-closed 驗證(空密鑰是「已知密鑰」,
+    # 任何人都能偽造 Stripe webhook),也同步改了 infra 注入它 —— 但這裡四個步驟各帶
+    # 一份 env,漏掉就是漏掉。結果 alembic 那幾步從 08-06 起每次都在 Settings() 驗證
+    # 失敗,而 pytest 照常綠(conftest 自己 setdefault DEBUG=True),把故障蓋掉了。
+    #
+    # DEBUG **刻意不設**:conftest 用 setdefault 把它設成 True 給測試(模擬付款需要),
+    # 在這裡設死會讓那個 setdefault 失效。alembic 那幾步沒有 DEBUG 就是 False ——
+    # 而那正是要驗的 production 形狀,所以密鑰給一個真的假值,不是靠 DEBUG 繞過守衛。
+    env:
+      DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
+      SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
+      STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
+      STRIPE_WEBHOOK_SECRET: whsec_dummy_value_for_ci
+      PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
+      PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
+      REDIS_URL: redis://localhost:6379/0
+
     services:
       postgres:
         image: postgres:16
@@ -63,12 +81,6 @@ jobs:
         run: pip install ticket_secrets/target/wheels/*.whl
       
       - name: Run alembic migrations
-        env:
-          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
-          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
-          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
-          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
-          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
         run: alembic upgrade head
 
       # 測試是走 metadata.create_all 建表的,完全不經過 migration —— 所以「model 改了
@@ -78,12 +90,6 @@ jobs:
       # 一定要在 pytest **之前**:pytest 的 create_all 會把缺的表直接補進同一個資料庫,
       # 補完之後再檢查就永遠是乾淨的 —— 那正是這一步要抓的東西被蓋掉。
       - name: Check migrations match the models
-        env:
-          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
-          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
-          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
-          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
-          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
         run: alembic check
 
       # `alembic check` 比對欄位、索引、約束,但**看不到 sequence 的型別**。
@@ -125,20 +131,7 @@ jobs:
       # 比對(細節見 app/scripts/check_schema_drift.py)。必須在 pytest **之前** ——
       # 理由跟 alembic check 同一條:create_all 會把缺的東西補進同一個資料庫。
       - name: Check index definitions and storage params match the models
-        env:
-          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
-          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
-          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
-          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
-          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
         run: python -m app.scripts.check_schema_drift
 
       - name: Run pytest
-        env:
-          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
-          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
-          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
-          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
-          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
-          REDIS_URL: redis://localhost:6379/0
         run: pytest test/ -v --cov-fail-under=76

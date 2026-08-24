@@ -139,3 +139,46 @@ jobs:
 
       - name: Run pytest
         run: pytest test/ -v --cov-fail-under=76
+
+  # 基礎設施的合法性。**獨立成一個 job,跟上面那個平行跑** —— 它不需要 postgres、
+  # redis、也不需要 Rust toolchain,而那三樣正好是上面最慢的部分。平行跑等於這一關
+  # 幾乎不佔任何額外時間,所以不必為了省時間而犧牲它。
+  #
+  # 在這之前,`.tf` 的語法錯誤、型別錯誤、引用一個不存在的資源,回饋點都是
+  # `terraform apply` —— 而 apply 只發生在部署當下、對著真的 AWS。
+  # test/test_deploy_pipeline.py 那些結構斷言掃的是**文字**(「這個屬性有沒有被設」),
+  # 掃不出 HCL 本身合不合法,兩者互補而不重疊。
+  #
+  # deploy.yml 用 `uses:` 呼叫這整支工作流,而呼叫端要等**所有** job 都綠才算過,
+  # 所以多這一個 job 不會讓部署的閘門變鬆。
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 釘死版本,理由跟 task def 釘 SHA 一樣:CI 跟本機跑的必須是同一個東西。
+      # versions.tf 只寫 >= 1.6,那是「這份設定能在哪些版本上跑」,不是「CI 該用哪個」。
+      # terraform_wrapper: false —— 預設的包裝會改寫 stdout,讓輸出難讀。
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.7"
+          terraform_wrapper: false
+
+      # 排版差異會在 review 裡把真正的改動淹掉。-recursive 一併涵蓋 bootstrap/。
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      # validate 要有 provider schema 才能檢查屬性名與型別,所以得先 init。
+      # -backend=false:這一關**不需要任何 AWS 憑證**,也不該碰 state —— 而那正是它
+      # 能安全地跑在 pull_request 上的原因。init 會照 .terraform.lock.hcl 取 provider,
+      # 所以順帶也驗證了那個 lock 檔還是可用的。
+      #
+      # bootstrap/ 是**另一個 root module**(自己的 state、自己的 lock),在 infra/
+      # 底下跑的 validate 完全看不到它 —— 所以要分開跑一次。
+      - name: terraform validate
+        run: |
+          for dir in infra infra/bootstrap; do
+            echo "── $dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done

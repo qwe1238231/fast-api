@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.core.security import create_access_token, get_password_hash
@@ -48,8 +49,16 @@ async def main() -> None:
             await db.execute(stmt)
         await db.commit()
 
-    # sub = username, matching create_access_token's contract with get_current_user.
-    tokens = [create_access_token(subject=u) for u in usernames]
+        # `sub` 必須是 user.id 的字串:get_current_user 只接受數字 sub(2026-08 把 /token
+        # 與 /refresh 統一之後),舊的 sub=username token 一律 401。所以先把 id 查回來 ——
+        # ON CONFLICT DO NOTHING 之後 RETURNING 只會給新插入的那些,要另外查。
+        rows = await db.execute(
+            select(User.username, User.id).where(User.username.in_(usernames))
+        )
+        id_by_username: dict[str, int] = dict(rows.all())
+
+    # tokens[i] 對應 usernames[i](= lt_{i});admission.json 靠這個順序配對,不能亂。
+    tokens = [create_access_token(subject=str(id_by_username[u])) for u in usernames]
     OUT_PATH.write_text(json.dumps(tokens))
     print(f"seeded {N_USERS} users; wrote {len(tokens)} tokens -> {OUT_PATH}")
 

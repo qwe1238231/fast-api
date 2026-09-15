@@ -145,7 +145,6 @@ async def release_order_seat(
 
 
 async def submit_order(
-        db: AsyncSession,
         redis: RedisClient,
         *,
         user_id: int,
@@ -160,8 +159,11 @@ async def submit_order(
     path only validates (cheap, cached reads) and runs the atomic Redis script.
     Raises InsufficientInventory (-> 409) when sold out; returns OK or DUP
     (both mean "accepted, processing") otherwise.
+
+    不收 `db`:這條路徑不碰 DB session。event meta 的快取 miss 由 event_cache 自己
+    開 session 重算(在獨立 task 上,見那邊的說明),請求路徑因此只依賴 Redis。
     """
-    event = await get_event_meta(redis, db, event_id=event_id)
+    event = await get_event_meta(redis, event_id=event_id)
     if event is None:
         raise EventNotFound(event_id=event_id)
     if event.status == EventStatus.CANCELLED:

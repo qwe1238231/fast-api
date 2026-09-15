@@ -166,12 +166,12 @@ async def test_a_zone_from_another_venue_is_rejected(client, admin, seated, db):
     assert resp.status_code == 422
 
 
-async def test_price_change_invalidates_the_meta_cache(client, admin, seated, db, redis):
+async def test_price_change_invalidates_the_meta_cache(client, admin, seated, redis):
     """下單算錢讀的是 EventMeta 的 zone_prices,不是 event_zone_prices 表。"""
     event, front, _ = seated
     event_id, front_id = event.id, front.id
 
-    before = await get_event_meta(redis, db, event_id=event_id)
+    before = await get_event_meta(redis, event_id=event_id)
     assert before.zone_prices[front_id] == 2000        # 灌熱
 
     resp = await client.patch(
@@ -181,8 +181,8 @@ async def test_price_change_invalidates_the_meta_cache(client, admin, seated, db
     )
     assert resp.status_code == 200
 
-    db.expire_all()      # 否則 cache miss 後的 DB 回讀會命中這個 session 的舊物件
-    after = await get_event_meta(redis, db, event_id=event_id)
+    # 重算開自己的 session,不會命中測試 session 的舊物件,不需要 expire_all
+    after = await get_event_meta(redis, event_id=event_id)
     assert after.zone_prices[front_id] == 2500
 
 

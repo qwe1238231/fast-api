@@ -205,12 +205,12 @@ async def test_drift_check_skipped_when_queue_not_drained(client, db, redis):
 
 
 @pytest.mark.asyncio
-async def test_get_event_meta_caches(db, redis, published_event):
+async def test_get_event_meta_caches(redis, published_event):
     from app.services.event_cache import get_event_meta
 
     key = f"event:{published_event.id}:meta"
     assert await redis.get(key) is None                       # 一開始沒快取
-    meta = await get_event_meta(redis, db, event_id=published_event.id)
+    meta = await get_event_meta(redis, event_id=published_event.id)
     assert meta.status.value == "published"
     assert await redis.get(key) is not None                   # 讀過 → 快取了(下次不打 DB)
 
@@ -222,7 +222,7 @@ async def test_publish_invalidates_event_cache(client, db, redis):
     headers = await _make_admin_and_login(client, db)
     event_id = (await client.post("/v1/events/", json=_event_payload(), headers=headers)).json()["id"]
 
-    await get_event_meta(redis, db, event_id=event_id)        # 草稿狀態被快取
+    await get_event_meta(redis, event_id=event_id)            # 草稿狀態被快取
     assert await redis.get(f"event:{event_id}:meta") is not None
 
     await client.post(f"/v1/events/{event_id}/publish", headers=headers)

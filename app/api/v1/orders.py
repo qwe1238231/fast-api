@@ -36,7 +36,6 @@ async def create_endpoint(
     idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
     admission_token: Annotated[str, Header(alias="Admission-Token")],
     current_user: CurrentUser,
-    db: DbSession,
     redis: Redis,
 ) -> OrderAcceptedResponse:
     """Accept an order intent: validate, reserve a seat, enqueue for the worker.
@@ -54,7 +53,6 @@ async def create_endpoint(
         )
     try:
         await submit_order(
-            db,
             redis,
             user_id=current_user.id,
             event_id=order_in.event_id,

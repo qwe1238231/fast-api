@@ -17,7 +17,8 @@ from uuid import UUID
 
 from arq import cron
 from arq.connections import RedisSettings
-from sqlalchemy import select, text
+from redis.asyncio import Redis as RedisClient
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -32,6 +33,7 @@ from app.crud.order import create_order, get_order_by_idempotency_key
 from app.crud.refresh_token import purge_expired
 from app.crud.stripe_event import cutoff_for, purge_events_older_than
 from app.models.audit_log import DEFAULT_PARTITION, AuditLog, partition_name
+from app.models.outbox import SEAT_RELEASE, OutboxEntry
 from app.services.audit import AUDIT_STREAM_KEY, AUDIT_STREAM_MAX_LEN
 from app.models.event import Event, EventStatus
 from app.services.inventory import (
@@ -161,17 +163,176 @@ async def expire_pending_orders(ctx: dict) -> None:
                 try:
                     await release_order_seat(db, redis, order)
                 except Exception:
-                    alert(
-                        logger,
-                        "order expired but seat release failed — for a SEATED order "
-                        "nothing repairs this automatically (reconcile_inventory only "
-                        "fixes the event counter); run "
-                        "`python -m app.scripts.rebuild_seat_runs <event_id>` once the "
-                        "stream drains",
-                        event="seat_release_failed",
+                    # 不再 needs_human:EXPIRED 的 CAS 同交易掛了 outbox 列,relay
+                    # 會重試到還掉為止;真的救不回來才由 outbox_dead_letter 收口。
+                    logger.warning(
+                        "order expired but the fast-path seat release failed — "
+                        "the outbox relay will retry it",
+                        extra={"event": "seat_release_fast_path_failed"},
                         exc_info=True,
-                        event_id=order.event_id,
                     )
+
+# --- Transactional outbox relay ---------------------------------------------
+#
+# 寫入端(services/orders 的 _transition_owing_release)保證:每個欠座位釋放的狀態
+# 轉移都跟一筆 outbox 列同交易 commit。這裡是消費端 —— fast path(caller 的
+# post-commit release)成功時 relay 只是把列標記掉;fast path 死在半路時,relay
+# 是那個「遲早會還座位」的保證。語意是 at-least-once:handler 成功後、標記
+# processed 前崩掉會重放,冪等由 hold 列(DB 側)+ released marker 的 SETNX
+# (Redis 側)擋住。
+
+OUTBOX_BATCH = 100
+OUTBOX_MAX_ATTEMPTS = 8            # 超過即毒丸:不再 claim,進 dead pile 等人看
+OUTBOX_BACKOFF_BASE_S = 60         # 第 n 次失敗退避 base * 2^n 秒,封頂 CAP
+OUTBOX_BACKOFF_CAP_S = 3600
+OUTBOX_RETENTION_DAYS = 7          # processed 列的保留期(修 alert 的第一現場)
+
+#: claim = UPDATE 租約,不是 SELECT:把 next_attempt_at 推到未來 + attempts 加一,
+#: **先 commit 再處理**。於是不存在「處理中」狀態需要表示 —— 崩掉的 claim 等租約
+#: 到期自然被重新 claim,跟 Redis Stream 的 XAUTOCLAIM 是同一個思路,只是用 SQL 寫。
+#: FOR UPDATE SKIP LOCKED 讓多個 relay 互不阻塞:鎖住的列直接跳過,不排隊。
+#: ORDER BY id 只是「大致照插入序」—— sequence 不保證 commit 順序,晚 commit 的
+#: 小 id 這一輪看不見、下一輪撿到。這裡每列各自獨立(一列 = 一筆訂單的釋放),
+#: 順序本來就無所謂;需要嚴格序的事件到那天再說。
+_OUTBOX_CLAIM_SQL = text(
+    """
+    UPDATE outbox
+       SET attempts = attempts + 1,
+           next_attempt_at = now()
+               + LEAST(:base * power(2, attempts), :cap) * interval '1 second'
+     WHERE id IN (
+           SELECT id FROM outbox
+            WHERE processed_at IS NULL
+              AND next_attempt_at <= now()
+              AND attempts < :max_attempts
+            ORDER BY id
+            LIMIT :batch
+              FOR UPDATE SKIP LOCKED
+     )
+    RETURNING id, event_type, aggregate_id
+    """
+)
+
+
+async def _handle_seat_release(
+    db: AsyncSession, redis: RedisClient, *, aggregate_id: int
+) -> None:
+    order = await db.get(Order, aggregate_id)
+    if order is None:
+        # 同交易寫入保證訂單存在,而訂單從不刪除 —— 走到這裡是異常本身,
+        # 但重試也變不出那列,所以照常返回讓列被標記,異常用 alert 留痕。
+        alert(
+            logger,
+            "outbox seat.release points at a missing order",
+            event="outbox_missing_aggregate",
+            aggregate_id=aggregate_id,
+        )
+        return
+    # False = fast path 已經還過(hold 沒了 / marker 已設)—— 對 relay 一樣是成功。
+    await release_order_seat(db, redis, order)
+
+
+_OUTBOX_HANDLERS: dict[
+    str, Callable[..., Awaitable[None]]
+] = {
+    SEAT_RELEASE: _handle_seat_release,
+}
+
+
+@cron_job
+async def process_outbox(ctx: dict) -> None:
+    """Cron job: claim 一批到期的 outbox 列,逐列執行 handler、標記 processed。
+
+    逐列 commit 而不是整批:一列失敗不拖累同批已成功的標記。失敗的列**不做任何
+    補救動作** —— claim 時已經把租約(next_attempt_at)推到未來,躺著等就是重試。
+    """
+    redis = ctx["redis_client"]
+    async with AsyncSessionLocal() as db:
+        rows = (
+            await db.execute(
+                _OUTBOX_CLAIM_SQL,
+                {
+                    "base": OUTBOX_BACKOFF_BASE_S,
+                    "cap": OUTBOX_BACKOFF_CAP_S,
+                    "max_attempts": OUTBOX_MAX_ATTEMPTS,
+                    "batch": OUTBOX_BATCH,
+                },
+            )
+        ).all()
+        await db.commit()  # 租約先落地:此後崩掉,列會在租約到期後被重新 claim
+
+        for row in rows:
+            with log_context(outbox_id=row.id, aggregate_id=row.aggregate_id):
+                handler = _OUTBOX_HANDLERS.get(row.event_type)
+                if handler is None:
+                    # 寫入端和這張表吃同一個常數,對不上是程式錯誤。不標記 ——
+                    # 讓它耗盡 attempts 進 dead pile,由下面的 needs_human 收口。
+                    logger.warning(
+                        "no handler for outbox event type",
+                        extra={
+                            "event": "outbox_unknown_type",
+                            "event_type": row.event_type,
+                        },
+                    )
+                    continue
+                try:
+                    await handler(db, redis, aggregate_id=row.aggregate_id)
+                except Exception:
+                    await db.rollback()  # handler 可能留下半途的 session 狀態
+                    logger.warning(
+                        "outbox handler failed; the lease will retry it",
+                        extra={"event": "outbox_retry"},
+                        exc_info=True,
+                    )
+                    continue
+                await db.execute(
+                    update(OutboxEntry)
+                    .where(OutboxEntry.id == row.id)
+                    .values(processed_at=func.now())
+                )
+                await db.commit()
+
+        # dead pile:耗盡重試的列。這是 needs_human 唯一該在的位置 —— fast path
+        # 失敗有 relay 兜底、relay 失敗有租約重試,只有這裡真的沒有下一層了。
+        dead = await db.scalar(
+            select(func.count())
+            .select_from(OutboxEntry)
+            .where(
+                OutboxEntry.processed_at.is_(None),
+                OutboxEntry.attempts >= OUTBOX_MAX_ATTEMPTS,
+            )
+        )
+        if dead:
+            alert(
+                logger,
+                "outbox rows exhausted their retries — inspect them, fix the cause, "
+                "then reset attempts/next_attempt_at to re-drive",
+                event="outbox_dead_letter",
+                count=dead,
+            )
+
+
+@cron_job
+async def purge_processed_outbox(ctx: dict) -> None:
+    """Cron job: 清掉過了保留期的已處理列。未處理的列永不清 —— 它們是債,不是垃圾。"""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=OUTBOX_RETENTION_DAYS)
+    async with AsyncSessionLocal() as db:
+        try:
+            result = await db.execute(
+                delete(OutboxEntry).where(OutboxEntry.processed_at < cutoff)
+            )
+            await db.commit()
+            if result.rowcount:
+                logger.info(
+                    "purged processed outbox rows",
+                    extra={"event": "outbox_purged", "purged": result.rowcount},
+                )
+        except Exception:
+            await db.rollback()
+            logger.exception(
+                "failed to purge outbox", extra={"event": "outbox_purge_failed"}
+            )
+
 
 @cron_job
 async def purge_expired_refresh_tokens(ctx: dict) -> None:
@@ -1202,6 +1363,23 @@ async def publish_prewarm_signal(ctx: dict) -> int:
     return imminent
 
 
+#: 限購 quota 審計的錯開槽數。庫存比對每輪全掃 —— 「鍵丟失 = 整場看起來完售」是
+#: 急症,而且每場只要一次 covering-index 掃(2026-08-25 基準:91k 活躍訂單 8ms)加
+#: 一個 GET;quota 比對則是 GROUP BY 加整份 HGETALL,熱門場是幾萬人的 hash,而它抓
+#: 的是「有人多買了幾張」的慢性症 —— 30 分鐘的偵測延遲換掉每輪的線性成本,划算。
+QUOTA_AUDIT_SLOTS = 6
+
+
+def _quota_audit_due(event_id: int, now: datetime) -> bool:
+    """quota 審計這一輪輪不輪到這一場。
+
+    cron 固定打在牆鐘 5 分邊界(minute // 5 每輪 +1),所以這是確定性的排班:
+    每一場在可預測的分鐘被審到,最長 QUOTA_AUDIT_SLOTS × 5 分鐘一輪,不需要
+    任何跨輪狀態,worker 重啟也不會亂。
+    """
+    return event_id % QUOTA_AUDIT_SLOTS == (now.minute // 5) % QUOTA_AUDIT_SLOTS
+
+
 @cron_job
 async def detect_inventory_drift(ctx: dict) -> list[dict]:
     """比對每個 published event 的 Redis 庫存 vs Postgres 應有值。
@@ -1229,7 +1407,8 @@ async def detect_inventory_drift(ctx: dict) -> list[dict]:
     # 少了這個過濾,早就被清掉的場次每五分鐘都會被報成一次庫存漂移(Redis 沒有鍵 → 0,
     # 而 Postgres 還算得出未售出的張數)—— 一個永遠在響、而且完全正確地響的假警報。
     # detect_seat_structure_drift 一直有這個過濾,這裡漏了。
-    horizon = datetime.now(timezone.utc) - timedelta(days=EVENT_KEY_RETENTION_DAYS)
+    now = datetime.now(timezone.utc)
+    horizon = now - timedelta(days=EVENT_KEY_RETENTION_DAYS)
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(Event.id).where(
@@ -1272,6 +1451,11 @@ async def detect_inventory_drift(ctx: dict) -> list[dict]:
             # 限購額度也要對帳。它的漂移**比庫存漂移更難發現**:超賣會撞到總量、
             # 等候室會叫;超買不會撞到任何東西 —— 那個人就是多買了幾張,而所有計數器
             # 都自洽。所以這裡是唯一會看到它的地方。
+            #
+            # 但它輪班做(理由見 QUOTA_AUDIT_SLOTS):沒輪到的場次**跳過的是計算本身**,
+            # 不是只跳過告警 —— 省的就是 GROUP BY + HGETALL 那筆錢。
+            if not _quota_audit_due(event_id, now):
+                continue
             #
             # 只記「誰對不上」而不是整份 hash:一個熱門場次有幾萬個買家,把整份倒進
             # log 只會讓真正的訊號被淹掉。
@@ -1562,8 +1746,8 @@ class WorkerSettings:
 
     #: 同時最多跑幾個 job。**這個數字是連線預算的一部分,不是隨手填的。**
     #:
-    #: 每分鐘那一刻有四個 cron 同時到期(expire / audit / reclaim / report),每 5 分鐘
-    #: 再多兩個漂移偵測,而每個 job 會開 1~2 條 DB 連線。ARQ 的預設是 10,也就是
+    #: 每分鐘那一刻有六個 cron 同時到期(expire / audit / reclaim / report / prewarm /
+    #: outbox),每 5 分鐘再多兩個漂移偵測,而每個 job 會開 1~2 條 DB 連線。ARQ 的預設是 10,也就是
     #: worker 的連線用量上界是「10 × 每個 job 的 session 數」—— 那是一個**沒有人宣告過
     #: 的**上界,而 autoscaling 的 max_capacity 是拿整體連線預算算出來的。把它明確定成
     #: 4,worker 那一格才是一個真的數字而不是猜的。
@@ -1579,6 +1763,8 @@ class WorkerSettings:
         # order intents are drained by the dedicated app.order_consumer process
         # (near-real-time); the ARQ worker only runs the reclaim safety net.
         cron(reclaim_stale_order_intents, minute={i for i in range(60)}),
+        # outbox 是 fast-path release 的兜底,每分鐘一輪 = 安全網的最大延遲 ~1 分鐘。
+        cron(process_outbox, minute={i for i in range(60)}),
         cron(report_queue_depth, minute={i for i in range(60)}),
         # 每分鐘都要發(包含 0),否則預熱的告警會停在 INSUFFICIENT_DATA 而不是 OK。
         cron(publish_prewarm_signal, minute={i for i in range(60)}),
@@ -1587,6 +1773,7 @@ class WorkerSettings:
         cron(ensure_audit_log_partitions, hour={2}, minute={15}),
         cron(purge_old_audit_logs, hour={2}, minute={30}),
         cron(purge_old_stripe_events, hour={2}, minute={45}),
+        cron(purge_processed_outbox, hour={3}, minute={15}),
         cron(detect_inventory_drift, minute=set(range(0, 60, 5))),
         cron(detect_seat_structure_drift, minute=set(range(0, 60, 5))),
         cron(purge_finished_event_keys, hour={3}, minute={30}),

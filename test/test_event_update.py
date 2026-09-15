@@ -244,10 +244,10 @@ async def test_a_normal_user_cannot_edit(client, event):
 
 # ---- 快取 ----
 
-async def test_a_price_change_invalidates_the_cached_meta(client, admin, event, db, redis):
+async def test_a_price_change_invalidates_the_cached_meta(client, admin, event, redis):
     """下單讀的是 EventMeta 快取,不是 events 表。不清的話最多 60 秒內還按舊價賣。"""
-    event_id = event.id                          # expire_all 之後再讀屬性會是一次 lazy load
-    before = await get_event_meta(redis, db, event_id=event_id)
+    event_id = event.id
+    before = await get_event_meta(redis, event_id=event_id)
     assert before.price_cents == 1500            # 先把快取灌熱
 
     resp = await client.patch(
@@ -255,12 +255,9 @@ async def test_a_price_change_invalidates_the_cached_meta(client, admin, event, 
     )
     assert resp.status_code == 200
 
-    # 快取 miss 之後 get_event_meta 會回頭讀 DB,而這個 session 的 identity map 裡
-    # 還躺著改動前的 Event(expire_on_commit=False,且改動是端點那個 session 做的)。
-    # 不 expire 的話這裡讀到的是記憶體裡的舊物件,測到的就不是 Redis 有沒有被清。
-    db.expire_all()
-
-    after = await get_event_meta(redis, db, event_id=event_id)
+    # 重算開自己的 session,不會命中任何測試 session 的 identity map —— 所以這裡
+    # 讀到 2000 就真的證明了「Redis 被清掉、DB 被回讀」,不需要 expire_all。
+    after = await get_event_meta(redis, event_id=event_id)
     assert after.price_cents == 2000
 
 

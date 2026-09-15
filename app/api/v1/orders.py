@@ -12,7 +12,6 @@ from app.schemas.order import OrderCreate, OrderResponse, OrderAcceptedResponse,
 from app.services.orders import submit_order, cancel_order as cancel_order_service, mark_confirmed, mark_paid, release_order_seat
 from app.services.idempotency import get_claim_state, CLAIM_PENDING, CLAIM_FAILED
 from app.core.config import get_settings
-from app.core.logging import alert
 from app.core.exceptions import DomainError, OrderNotFound, InvalidOrderTransition, SeatsNotAssigned
 from app.crud.order import get_order_by_id, get_order_by_idempotency_key, list_orders_for_user
 from app.schemas.payment import PaymentIntentResponse
@@ -37,7 +36,6 @@ async def create_endpoint(
     idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
     admission_token: Annotated[str, Header(alias="Admission-Token")],
     current_user: CurrentUser,
-    db: DbSession,
     redis: Redis,
 ) -> OrderAcceptedResponse:
     """Accept an order intent: validate, reserve a seat, enqueue for the worker.
@@ -55,7 +53,6 @@ async def create_endpoint(
         )
     try:
         await submit_order(
-            db,
             redis,
             user_id=current_user.id,
             event_id=order_in.event_id,
@@ -230,20 +227,20 @@ async def cancel_order(
         )
     await db.commit()
     # post-commit, idempotent seat return; a failure here is a recoverable lost
-    # seat (reconcile), NOT a failed cancel -> log, don't 500 the client.
+    # seat (the outbox relay retries it), NOT a failed cancel -> log, don't 500
+    # the client.
     try:
         await release_order_seat(db, redis, order)
     except Exception:
-        alert(
-            logger,
-            "order cancelled but seat release failed — for a SEATED order nothing "
-            "repairs this automatically (reconcile_inventory only fixes the event "
-            "counter); run `python -m app.scripts.rebuild_seat_runs <event_id>` once "
-            "the stream drains",
-            event="seat_release_failed",
+        logger.warning(
+            "order cancelled but the fast-path seat release failed — "
+            "the outbox relay will retry it",
+            extra={
+                "event": "seat_release_fast_path_failed",
+                "order_id": order_id,
+                "event_id": order.event_id,
+            },
             exc_info=True,
-            order_id=order_id,
-            event_id=order.event_id,
         )
 
 @router.post("/{order_id}/payment-intent", response_model=PaymentIntentResponse)

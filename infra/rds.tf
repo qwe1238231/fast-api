@@ -35,6 +35,31 @@ resource "aws_db_subnet_group" "main" {
   tags       = { Name = "${var.project}-db" }
 }
 
+# Planner 成本參數要跟儲存硬體一致。PG 預設 random_page_cost=4 是轉盤硬碟時代的值
+# (隨機讀 = 4 倍循序讀);gp3 是 SSD,隨機讀跟循序讀幾乎同價,繼續用 4 會讓 planner
+# 系統性高估 index scan 的成本 —— 表一大就傾向 Seq Scan / Bitmap,而這個系統的熱路徑
+# 全是靠 partial / covering index 撐的(2026-08-25 的 EXPLAIN 基準報告)。1.1 是 SSD
+# 的常用值:仍略高於 seq(1.0),保留「循序還是比較便宜」的事實。
+#
+# shared_buffers / effective_cache_size **不設**:RDS 依 instance class 自動給
+# (25% / 50% RAM),手寫死反而在換 instance class 時變成暗雷。
+#
+# 注意:parameter group 的「掛上去」和「生效」是兩件事 —— 換 association 之後參數要
+# reboot 才吃到(即使是 dynamic 參數)。這個專案每次 session 都是 destroy → 全新
+# apply,新實例建立時就帶著這組參數,所以感受不到;但如果哪天在**活著的**實例上改
+# 這裡,記得看 pending-reboot 狀態。
+resource "aws_db_parameter_group" "main" {
+  name   = "${var.project}-pg16"
+  family = "postgres16"
+
+  parameter {
+    name  = "random_page_cost"
+    value = "1.1"
+  }
+
+  tags = { Name = "${var.project}-pg16" }
+}
+
 resource "aws_db_instance" "main" {
   identifier     = "${var.project}-db"
   engine         = "postgres"
@@ -57,6 +82,7 @@ resource "aws_db_instance" "main" {
   password = random_password.db.result
 
   db_subnet_group_name   = aws_db_subnet_group.main.name
+  parameter_group_name   = aws_db_parameter_group.main.name
   vpc_security_group_ids = [aws_security_group.db.id]
   publicly_accessible    = true # dev only — see header
 

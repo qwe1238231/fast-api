@@ -17,6 +17,7 @@ from app.core.exceptions import (
 )
 from app.crud.order import transition_order_status
 from app.models.order import Order, OrderStatus
+from app.models.outbox import SEAT_RELEASE, OutboxEntry
 from app.models.seating import SeatHold
 from app.services.inventory import release, reserve_and_enqueue, ReserveOutcome, ReserveResult
 from app.models.event import EventStatus
@@ -47,13 +48,43 @@ async def mark_confirmed(db: AsyncSession, order: Order) -> bool:
     return True
 
 
+async def _transition_owing_release(
+    db: AsyncSession, order: Order, new_status: OrderStatus
+) -> bool:
+    """CAS 到一個「欠一次座位釋放」的終態,並在同一個交易掛上還座位的 outbox 列。
+
+    欠釋放這件事跟著狀態轉移走,不跟著 caller 走 —— 所以 outbox 列在這裡寫,
+    而不是在 worker 迴圈 / webhook / endpoint 各自記得。CAS 輸掉(False)就
+    **不能**寫:座位已經是別的轉移的責任,多掛一筆是替別人還第二次。
+
+    實際的 release 仍是 caller 的 POST-COMMIT fast path(見 release_order_seat:
+    commit 前絕不能放座位,否則 rollback 會留下已釋放的座位)。outbox 是 safety
+    net:fast path 崩掉的話,relay 遲早重放,冪等由 hold 列 + SETNX marker 擋。
+    """
+    if not await transition_order_status(db, order, new_status):
+        return False
+    db.add(
+        OutboxEntry(
+            event_type=SEAT_RELEASE,
+            aggregate_type="order",
+            aggregate_id=order.id,
+            # 空 payload 是刻意的:release 需要的欄位(event_id/zone_id/...)在
+            # INSERT 後不可變、而且此刻訂單已是終態 —— relay 回查 DB 讀到的就是
+            # 快照。塞進 payload 只是多一份會漂移的複本。
+            payload={},
+        )
+    )
+    return True
+
+
 async def cancel_order(db: AsyncSession, order: Order) -> bool:
     """CAS PENDING -> CANCELLED. Returns True iff applied.
 
-    Like expire_order, the seat release is a POST-COMMIT step owned by the caller
-    (the endpoint): pair a True return with `db.commit()` then release_order_seat().
+    Pair a True return with `db.commit()` then `release_order_seat()` (the
+    post-commit fast path); the outbox row enqueued alongside the CAS is the
+    safety net when that fast path dies.
     """
-    return await transition_order_status(db, order, OrderStatus.CANCELLED)
+    return await _transition_owing_release(db, order, OrderStatus.CANCELLED)
 
 
 async def expire_order(db: AsyncSession, order: Order) -> bool:
@@ -61,10 +92,11 @@ async def expire_order(db: AsyncSession, order: Order) -> bool:
 
     The seat release is deliberately NOT done here: it must happen AFTER the
     caller commits (a rolled-back transition must never leave a released seat),
-    and the commit is owned by the caller (the expire cron). The caller pairs a
-    True return with `db.commit()` then `release_order_seat()`.
+    and the commit is owned by the caller. Pair a True return with `db.commit()`
+    then `release_order_seat()` — and if that fast path dies, the outbox row
+    committed with the CAS guarantees the relay eventually releases the seat.
     """
-    return await transition_order_status(db, order, OrderStatus.EXPIRED)
+    return await _transition_owing_release(db, order, OrderStatus.EXPIRED)
 
 
 async def release_order_seat(
@@ -113,7 +145,6 @@ async def release_order_seat(
 
 
 async def submit_order(
-        db: AsyncSession,
         redis: RedisClient,
         *,
         user_id: int,
@@ -128,8 +159,11 @@ async def submit_order(
     path only validates (cheap, cached reads) and runs the atomic Redis script.
     Raises InsufficientInventory (-> 409) when sold out; returns OK or DUP
     (both mean "accepted, processing") otherwise.
+
+    不收 `db`:這條路徑不碰 DB session。event meta 的快取 miss 由 event_cache 自己
+    開 session 重算(在獨立 task 上,見那邊的說明),請求路徑因此只依賴 Redis。
     """
-    event = await get_event_meta(redis, db, event_id=event_id)
+    event = await get_event_meta(redis, event_id=event_id)
     if event is None:
         raise EventNotFound(event_id=event_id)
     if event.status == EventStatus.CANCELLED:

@@ -4,6 +4,7 @@ from app.models.event import Event
 from app.models.order import Order
 from app.models.buyer_info import BuyerInfo
 from app.models.audit_log import AuditLog
+from app.models.outbox import OutboxEntry
 from app.models.stripe_event import StripeEvent
 from app.models.seating import (
     EventZonePrice,
@@ -21,6 +22,7 @@ __all__ = [
     "Order",
     "BuyerInfo",
     "AuditLog",
+    "OutboxEntry",
     "StripeEvent",
     "Venue",
     "Zone",

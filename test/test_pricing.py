@@ -172,8 +172,8 @@ async def test_cached_zone_prices_keep_integer_keys(db, redis) -> None:
     db.add(EventZonePrice(event_id=event.id, zone_id=zone.id, price_cents=7777))
     await db.commit()
 
-    fresh = await get_event_meta(redis, db, event_id=event.id)      # miss → 回填
-    cached = await get_event_meta(redis, db, event_id=event.id)     # hit
+    fresh = await get_event_meta(redis, event_id=event.id)      # miss → 回填
+    cached = await get_event_meta(redis, event_id=event.id)     # hit
     assert fresh is not None and cached is not None
     assert fresh.zone_prices == cached.zone_prices == {zone.id: 7777}
     assert all(isinstance(key, int) for key in cached.zone_prices)

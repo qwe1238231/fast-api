@@ -103,14 +103,16 @@ async def stripe_webhook(
     if release is not None:
         try:
             await release_order_seat(db, redis, release)
-        except Exception:  # release 是冪等的;失敗只是暫時弄丟一個座位
-            alert(
-                logger,
-                "payment aborted: order expired but seat release failed",
-                event="seat_release_failed",
+        except Exception:  # release 是冪等的;outbox relay 會重試,真的只是暫時
+            logger.warning(
+                "payment aborted: fast-path seat release failed — "
+                "the outbox relay will retry it",
+                extra={
+                    "event": "seat_release_fast_path_failed",
+                    "order_id": release.id,
+                    "event_id": release.event_id,
+                },
                 exc_info=True,
-                order_id=release.id,
-                event_id=release.event_id,
             )
 
     if refund is not None:

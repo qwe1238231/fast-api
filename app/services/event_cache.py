@@ -27,6 +27,7 @@ dict 查找 —— 見 pricing.load_zone_prices 的白名單語意。
 """
 import asyncio
 import json
+import logging
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -35,8 +36,9 @@ from datetime import datetime
 from redis.asyncio import Redis
 from redis.commands.core import AsyncScript
 
+from app.core.cache_metrics import EVENT_META_CACHE_FLIGHTS, EVENT_META_CACHE_REQUESTS
 from app.core.singleflight import SingleFlight
-from app.db.session import AsyncSessionLocal
+from app.db.session import CacheSessionLocal
 from app.models.event import Event, EventStatus
 from app.services.pricing import load_zone_prices
 
@@ -63,6 +65,8 @@ end
 return 0
 """
 _release_script: AsyncScript | None = None
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -122,8 +126,24 @@ async def get_event_meta(redis: Redis, *, event_id: int) -> EventMeta | None:
     """Cache-aside:先讀 Redis,miss 才(合併後)回 Postgres 並回填。"""
     cached = await redis.get(_key(event_id))
     if cached is not None:
+        EVENT_META_CACHE_REQUESTS.labels(outcome="hit").inc()
         return _decode(event_id, cached)
-    return await _flight.run(event_id, lambda: _load_coordinated(redis, event_id))
+    EVENT_META_CACHE_REQUESTS.labels(outcome="miss").inc()
+    return await _flight.run(event_id, lambda: _load_logged(redis, event_id))
+
+
+async def _load_logged(redis: Redis, event_id: int) -> EventMeta | None:
+    """flight 的失敗要留痕。等它的請求可能早已超時離場,而 shield 會把沒人取回的例外
+    標成「已取回」—— 不在這裡記一筆,重算掛掉就是完全無聲的(2026-09-15 的 pool 死鎖
+    就是這樣:149 個 504,log 裡零例外)。"""
+    try:
+        return await _load_coordinated(redis, event_id)
+    except Exception:
+        logger.exception(
+            "event meta recompute failed; waiters (if any) get this exception",
+            extra={"event": "event_meta_cache_load_failed", "event_id": event_id},
+        )
+        raise
 
 
 async def _load_coordinated(redis: Redis, event_id: int) -> EventMeta | None:
@@ -143,7 +163,10 @@ async def _load_coordinated(redis: Redis, event_id: int) -> EventMeta | None:
                 # 回填並釋放了。少了這一步,「前一個 leader 剛做完」會變成多讀一次。
                 cached = await redis.get(key)
                 if cached is not None:
+                    EVENT_META_CACHE_FLIGHTS.labels(resolution="already_filled").inc()
                     return _decode(event_id, cached)
+                # 記在讀之前:失敗的讀也花了 round-trip,「DB 被打了幾次」要算它。
+                EVENT_META_CACHE_FLIGHTS.labels(resolution="loaded").inc()
                 return await _load_and_fill(redis, event_id)
             finally:
                 await _release_lock(redis, lock_key, token)
@@ -152,9 +175,21 @@ async def _load_coordinated(redis: Redis, event_id: int) -> EventMeta | None:
         # 它釋放 lock。先看再睡 —— 它很可能剛好做完了。
         cached = await redis.get(key)
         if cached is not None:
+            EVENT_META_CACHE_FLIGHTS.labels(resolution="waited").inc()
             return _decode(event_id, cached)
         if time.monotonic() >= deadline:
             # holder 死了,或慢到超過 TTL。降級成自己讀:多一次 DB 讀,絕不讓請求失敗。
+            # 但要留下痕跡:一次是雜訊,持續出現就是有 process 死在重算裡、或 DB 慢到
+            # 一次點查超過 lock TTL —— 兩者都不是快取層能修的,要有人看。
+            EVENT_META_CACHE_FLIGHTS.labels(resolution="fallback").inc()
+            logger.warning(
+                "event meta lock holder never filled the cache; loading without the lock",
+                extra={
+                    "event": "event_meta_cache_wait_exhausted",
+                    "event_id": event_id,
+                    "waited_seconds": _LOCK_WAIT_SECONDS,
+                },
+            )
             return await _load_and_fill(redis, event_id)
         await asyncio.sleep(_LOCK_POLL_SECONDS)
 
@@ -162,9 +197,13 @@ async def _load_coordinated(redis: Redis, event_id: int) -> EventMeta | None:
 async def _load_and_fill(redis: Redis, event_id: int) -> EventMeta | None:
     """真的讀 DB 並回填。
 
+    走 **CacheSessionLocal(獨立的小 pool)**,不走請求用的主 pool:等這個 flight 的每個
+    請求都握著一條主 pool 連線(auth 讀過 user 之後就一直握到 request 結束),loader 若
+    也向主 pool 要,pool 一滿就是互等 —— 見 db/session.py 的 bulkhead 說明。
+
     session 在 Redis round-trip 之前就關掉:不要抱著一條 pool 連線等網路。
     """
-    async with AsyncSessionLocal() as db:
+    async with CacheSessionLocal() as db:
         event = await db.get(Event, event_id)
         if event is None:
             return None

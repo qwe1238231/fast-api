@@ -179,7 +179,10 @@ class Settings(BaseSettings):
 
     # DB connection pool (per-process). The total across ALL processes
     # (API workers + ARQ worker + order consumer) must fit Postgres max_connections:
-    #   total ≈ num_processes * (DB_POOL_SIZE + DB_MAX_OVERFLOW)
+    #   total ≈ num_processes * (DB_POOL_SIZE + DB_MAX_OVERFLOW) + api_tasks * cache_pool
+    # cache_pool 是 db/session.py 的 cache_engine(快取重算專用的 bulkhead,目前 1 條、
+    # 不溢位;CACHE_POOL_SIZE + CACHE_POOL_MAX_OVERFLOW),只有 api 會開它。尺寸由「同時
+    # 在重算的 key 數」決定而不是流量,所以不受這兩個設定控制,也被預算測試獨立算進去。
     DB_POOL_SIZE: int = 5                       # persistent connections held open
     DB_MAX_OVERFLOW: int = 10                   # extra temporary connections at peak
     DB_POOL_PRE_PING: bool = True               # validate a connection before use (dead-conn defense)

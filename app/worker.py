@@ -1363,6 +1363,23 @@ async def publish_prewarm_signal(ctx: dict) -> int:
     return imminent
 
 
+#: 限購 quota 審計的錯開槽數。庫存比對每輪全掃 —— 「鍵丟失 = 整場看起來完售」是
+#: 急症,而且每場只要一次 covering-index 掃(2026-08-25 基準:91k 活躍訂單 8ms)加
+#: 一個 GET;quota 比對則是 GROUP BY 加整份 HGETALL,熱門場是幾萬人的 hash,而它抓
+#: 的是「有人多買了幾張」的慢性症 —— 30 分鐘的偵測延遲換掉每輪的線性成本,划算。
+QUOTA_AUDIT_SLOTS = 6
+
+
+def _quota_audit_due(event_id: int, now: datetime) -> bool:
+    """quota 審計這一輪輪不輪到這一場。
+
+    cron 固定打在牆鐘 5 分邊界(minute // 5 每輪 +1),所以這是確定性的排班:
+    每一場在可預測的分鐘被審到,最長 QUOTA_AUDIT_SLOTS × 5 分鐘一輪,不需要
+    任何跨輪狀態,worker 重啟也不會亂。
+    """
+    return event_id % QUOTA_AUDIT_SLOTS == (now.minute // 5) % QUOTA_AUDIT_SLOTS
+
+
 @cron_job
 async def detect_inventory_drift(ctx: dict) -> list[dict]:
     """比對每個 published event 的 Redis 庫存 vs Postgres 應有值。
@@ -1390,7 +1407,8 @@ async def detect_inventory_drift(ctx: dict) -> list[dict]:
     # 少了這個過濾,早就被清掉的場次每五分鐘都會被報成一次庫存漂移(Redis 沒有鍵 → 0,
     # 而 Postgres 還算得出未售出的張數)—— 一個永遠在響、而且完全正確地響的假警報。
     # detect_seat_structure_drift 一直有這個過濾,這裡漏了。
-    horizon = datetime.now(timezone.utc) - timedelta(days=EVENT_KEY_RETENTION_DAYS)
+    now = datetime.now(timezone.utc)
+    horizon = now - timedelta(days=EVENT_KEY_RETENTION_DAYS)
     async with AsyncSessionLocal() as db:
         result = await db.execute(
             select(Event.id).where(
@@ -1433,6 +1451,11 @@ async def detect_inventory_drift(ctx: dict) -> list[dict]:
             # 限購額度也要對帳。它的漂移**比庫存漂移更難發現**:超賣會撞到總量、
             # 等候室會叫;超買不會撞到任何東西 —— 那個人就是多買了幾張,而所有計數器
             # 都自洽。所以這裡是唯一會看到它的地方。
+            #
+            # 但它輪班做(理由見 QUOTA_AUDIT_SLOTS):沒輪到的場次**跳過的是計算本身**,
+            # 不是只跳過告警 —— 省的就是 GROUP BY + HGETALL 那筆錢。
+            if not _quota_audit_due(event_id, now):
+                continue
             #
             # 只記「誰對不上」而不是整份 hash:一個熱門場次有幾萬個買家,把整份倒進
             # log 只會讓真正的訊號被淹掉。

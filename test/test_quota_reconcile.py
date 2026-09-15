@@ -169,8 +169,11 @@ async def test_reconcile_refuses_while_intents_are_in_flight(db, redis) -> None:
 # ─ 漂移偵測
 
 @pytest.mark.asyncio
-async def test_drift_detection_notices_a_quota_mismatch(db, redis) -> None:
+async def test_drift_detection_notices_a_quota_mismatch(db, redis, monkeypatch) -> None:
     """額度對不上要被記錄。這是唯一會看到超買的地方。"""
+    # quota 審計按牆鐘輪班(QUOTA_AUDIT_SLOTS);這裡釘在「輪到了」的世界,
+    # 排班本身由 test_quota_audit_staggering_never_delays_inventory_checks 顧。
+    monkeypatch.setattr("app.worker._quota_audit_due", lambda *_: True)
     event = await _event(db, redis)
     user = await _buyer(db, "drifter-q")
     await _persisted_order(db, event_id=event.id, user_id=user, qty=2)
@@ -186,8 +189,10 @@ async def test_drift_detection_notices_a_quota_mismatch(db, redis) -> None:
 
 
 @pytest.mark.asyncio
-async def test_drift_detection_is_quiet_when_quotas_agree(db, redis) -> None:
+async def test_drift_detection_is_quiet_when_quotas_agree(db, redis, monkeypatch) -> None:
     """一致的時候不能叫 —— 一個會誤報的漂移偵測最後會被關掉。"""
+    # 釘在「輪到了」:沒輪到的沉默是空話,輪到了還沉默才是這個測試要的。
+    monkeypatch.setattr("app.worker._quota_audit_due", lambda *_: True)
     event = await _event(db, redis)
     user = await _buyer(db, "clean-q")
     await _persisted_order(db, event_id=event.id, user_id=user, qty=2)
@@ -196,3 +201,26 @@ async def test_drift_detection_is_quiet_when_quotas_agree(db, redis) -> None:
 
     drifts = await detect_inventory_drift({"redis_client": redis})
     assert [d for d in drifts if d.get("kind") == "quota"] == []
+
+
+@pytest.mark.asyncio
+async def test_quota_audit_staggering_never_delays_inventory_checks(
+    db, redis, monkeypatch
+) -> None:
+    """quota 審計輪班做,庫存比對每輪都做。
+
+    quota 比對是 GROUP BY + 整份 HGETALL(熱門場是幾萬人),錯開攤掉線性成本;
+    但「Redis 值錯了 / 鍵不見了」是急症,不能等排班。固定在「這輪沒輪到」的
+    世界:庫存漂移照樣要報,quota 漂移這輪沉默(下一班會抓到)。
+    """
+    monkeypatch.setattr("app.worker._quota_audit_due", lambda *_: False)
+    event = await _event(db, redis)
+    user = await _buyer(db, "stagger-q")
+    await _persisted_order(db, event_id=event.id, user_id=user, qty=2)
+    await redis.set(f"event:{event.id}:available", 42)           # 庫存錯(應為 98)
+    await redis.hset(_purchased_key(event.id), str(user), 99)    # 額度也錯
+
+    drifts = await detect_inventory_drift({"redis_client": redis})
+
+    assert [d for d in drifts if d.get("kind") == "quota"] == [], "沒輪到就不該花這筆錢"
+    assert any(d.get("actual") == 42 for d in drifts), "庫存比對不能被排班拖住"

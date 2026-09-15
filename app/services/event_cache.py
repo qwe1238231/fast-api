@@ -38,7 +38,7 @@ from redis.commands.core import AsyncScript
 
 from app.core.cache_metrics import EVENT_META_CACHE_FLIGHTS, EVENT_META_CACHE_REQUESTS
 from app.core.singleflight import SingleFlight
-from app.db.session import AsyncSessionLocal
+from app.db.session import CacheSessionLocal
 from app.models.event import Event, EventStatus
 from app.services.pricing import load_zone_prices
 
@@ -129,7 +129,21 @@ async def get_event_meta(redis: Redis, *, event_id: int) -> EventMeta | None:
         EVENT_META_CACHE_REQUESTS.labels(outcome="hit").inc()
         return _decode(event_id, cached)
     EVENT_META_CACHE_REQUESTS.labels(outcome="miss").inc()
-    return await _flight.run(event_id, lambda: _load_coordinated(redis, event_id))
+    return await _flight.run(event_id, lambda: _load_logged(redis, event_id))
+
+
+async def _load_logged(redis: Redis, event_id: int) -> EventMeta | None:
+    """flight 的失敗要留痕。等它的請求可能早已超時離場,而 shield 會把沒人取回的例外
+    標成「已取回」—— 不在這裡記一筆,重算掛掉就是完全無聲的(2026-09-15 的 pool 死鎖
+    就是這樣:149 個 504,log 裡零例外)。"""
+    try:
+        return await _load_coordinated(redis, event_id)
+    except Exception:
+        logger.exception(
+            "event meta recompute failed; waiters (if any) get this exception",
+            extra={"event": "event_meta_cache_load_failed", "event_id": event_id},
+        )
+        raise
 
 
 async def _load_coordinated(redis: Redis, event_id: int) -> EventMeta | None:
@@ -183,9 +197,13 @@ async def _load_coordinated(redis: Redis, event_id: int) -> EventMeta | None:
 async def _load_and_fill(redis: Redis, event_id: int) -> EventMeta | None:
     """真的讀 DB 並回填。
 
+    走 **CacheSessionLocal(獨立的小 pool)**,不走請求用的主 pool:等這個 flight 的每個
+    請求都握著一條主 pool 連線(auth 讀過 user 之後就一直握到 request 結束),loader 若
+    也向主 pool 要,pool 一滿就是互等 —— 見 db/session.py 的 bulkhead 說明。
+
     session 在 Redis round-trip 之前就關掉:不要抱著一條 pool 連線等網路。
     """
-    async with AsyncSessionLocal() as db:
+    async with CacheSessionLocal() as db:
         event = await db.get(Event, event_id)
         if event is None:
             return None

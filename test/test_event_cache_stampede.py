@@ -23,7 +23,8 @@ from redis.asyncio import Redis
 from sqlalchemy import event
 from sqlalchemy.engine import Connection
 
-from app.db.session import engine
+from app.core.config import get_settings
+from app.db.session import cache_engine, engine
 from app.services import event_cache
 from app.services.event_cache import EventMeta, get_event_meta
 
@@ -74,11 +75,16 @@ def count_statements(needle: str) -> Iterator[list[str]]:
         if needle in statement:
             seen.append(statement)
 
-    event.listen(engine.sync_engine, "before_cursor_execute", _on_execute)
+    # 兩個 engine 都掛:重算走 cache_engine(bulkhead pool),請求走主 engine。只掛一邊
+    # 會把另一邊的 DB 讀漏數成 0 —— 那正是「量出零次讀、其實是量錯」的形狀。
+    engines = (engine.sync_engine, cache_engine.sync_engine)
+    for e in engines:
+        event.listen(e, "before_cursor_execute", _on_execute)
     try:
         yield seen
     finally:
-        event.remove(engine.sync_engine, "before_cursor_execute", _on_execute)
+        for e in engines:
+            event.remove(e, "before_cursor_execute", _on_execute)
 
 
 async def _burst(redis: Redis, event_id: int) -> list[EventMeta | None]:
@@ -223,6 +229,26 @@ async def test_lock_is_released_only_by_its_owner(redis):
 
     assert await event_cache._release_lock(redis, lock, "theirs") is True
     assert await redis.get(lock) is None
+
+
+@pytest.mark.asyncio
+async def test_recompute_survives_an_exhausted_request_pool(redis, published_event):
+    """死鎖回歸。主 pool 被握滿 —— 每個請求 auth 之後都握著一條連線等 flight —— loader 若
+    也向主 pool 要連線就是互等:2026-09-15 對 4 workers 打 300 併發冷 key,149 個 504、
+    DB 讀 0 次、log 零例外。重算走獨立的 cache pool,所以主 pool 滿了也照樣完成。
+
+    修掉之前這條會等到 asyncio.wait_for 的 5 秒(主 pool 的 pool_timeout 是 30 秒)。"""
+    settings = get_settings()
+    capacity = settings.DB_POOL_SIZE + settings.DB_MAX_OVERFLOW
+    held = [await engine.connect() for _ in range(capacity)]      # 把主 pool 握滿
+    try:
+        meta = await asyncio.wait_for(
+            get_event_meta(redis, event_id=published_event.id), timeout=5
+        )
+    finally:
+        for conn in held:
+            await conn.close()
+    assert meta is not None and meta.event_id == published_event.id
 
 
 # ── 邊界 ──────────────────────────────────────────────────────────────────────

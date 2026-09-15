@@ -567,8 +567,15 @@ def test_the_scaling_ceiling_respects_the_connection_budget() -> None:
     **每個數字都從 .tf 讀出來**,一個都不寫死。舊版把 api/worker/migration 那三格寫成
     常數(`2 * 15`、`15`、`15`),於是「改了 task def 的池子」跟「這條測試算的東西」
     可以無聲地分家 —— 而這條測試的全部價值就在於它們不會分家。
+
+    唯一不在 .tf 裡的是 api 的 cache pool(db/session.py 的 bulkhead,快取重算專用):
+    它的尺寸是程式常數而不是部署設定,所以從程式 import —— 同樣的理由,改了那邊這裡
+    要跟著動。只加在 api 上:worker / consumer 從不呼叫 get_event_meta,lazy pool 不會開。
     """
-    api_peak = _max_capacity("api") * 2 * _pool_per_task("api")  # 部署期間 max 200%
+    from app.db.session import CACHE_POOL_MAX_OVERFLOW, CACHE_POOL_SIZE
+
+    cache_pool = CACHE_POOL_SIZE + CACHE_POOL_MAX_OVERFLOW
+    api_peak = _max_capacity("api") * 2 * (_pool_per_task("api") + cache_pool)  # 部署期間 max 200%
     worker_peak = _pool_per_task("worker")                       # 單例
     consumer_peak = _max_capacity("consumer") * _pool_per_task("consumer")
     # 部署時的 migration 是 one-off task,用的是 **worker 的** task def(deploy.yml)。
@@ -577,9 +584,10 @@ def test_the_scaling_ceiling_respects_the_connection_budget() -> None:
 
     total = api_peak + worker_peak + consumer_peak + migration_peak
     assert total <= budget - 10, (
-        f"最壞情況要 {total} 條連線(api {api_peak} / worker {worker_peak} / "
-        f"consumer {consumer_peak} / migration {migration_peak}),而 db.t4g.micro 只有 "
-        f"~{budget} —— 調高 max_capacity 之前要先縮某個 pool、加 RDS Proxy,或換大一號"
+        f"最壞情況要 {total} 條連線(api {api_peak} 含每任務 {cache_pool} 條 cache pool / "
+        f"worker {worker_peak} / consumer {consumer_peak} / migration {migration_peak}),"
+        f"而 db.t4g.micro 只有 ~{budget} —— 調高 max_capacity 之前要先縮某個 pool、"
+        f"加 RDS Proxy,或換大一號"
     )
 
 

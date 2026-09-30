@@ -161,6 +161,26 @@ class Settings(BaseSettings):
     """單筆訂單的張數上限。純粹是請求大小的護欄(擋掉 quantity=99999 這種),跟
     「這個人能買幾張」無關。"""
 
+    PENDING_TIMEOUT_MINUTES: int = Field(default=10, ge=1)
+    """還沒開始付款的 PENDING 訂單保留幾分鐘,錨在 created_at。到期由
+    worker.expire_pending_orders 收走。已建 PaymentIntent 的訂單**不在**這道超時裡,
+    見下一個欄位。"""
+
+    PAYMENT_ABANDON_TIMEOUT_MINUTES: int = Field(default=15, ge=1)
+    """已建 PaymentIntent 的 PENDING 訂單最多保留幾分鐘,**同樣錨在 created_at**。
+
+    為什麼需要第二道:API 直接建的 PaymentIntent 被放棄(使用者關掉分頁)時 Stripe
+    **不會自動取消、也不發任何 webhook**,而這種訂單又被 PENDING_TIMEOUT 刻意跳過 ——
+    沒有這道超時,它會 PENDING 到永遠,座位跟著鎖死。
+
+    錨在下單而不是「按付款的那一刻」:搶票場景裡「一張票總共可被佔多久」有明確上界,
+    對還在排隊的人才公平。代價是最晚在 T1 到期前一刻才按付款的人,只剩
+    T2 − T1 分鐘完成付款(預設 5 分鐘)。
+
+    到期**不是**直接 EXPIRED:先對 Stripe cancel intent,確知它是 canceled 才動本地
+    狀態,否則會開出「本地過期、Stripe 收款」的窗。
+    """
+
     # Async order-offload tuning
     ORDER_CONSUMER_BLOCK_MS: int = 2000        # how long the consumer loop blocks per read
     ORDER_RECLAIM_IDLE_MS: int = 60_000        # only reclaim entries idle at least this long
@@ -264,6 +284,18 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _guard_abandon_after_pending(self) -> "Settings":
+        # 開始付款的人不能比沒開始的人更早被踢:兩道超時同錨 created_at,T2 ≤ T1 會讓
+        # 「按下付款」反而縮短持有時間,而且 T2 − T1 就是付款者最少能有的填表時間。
+        if self.PAYMENT_ABANDON_TIMEOUT_MINUTES <= self.PENDING_TIMEOUT_MINUTES:
+            raise ValueError(
+                f"PAYMENT_ABANDON_TIMEOUT_MINUTES ({self.PAYMENT_ABANDON_TIMEOUT_MINUTES}m) "
+                f"must exceed PENDING_TIMEOUT_MINUTES ({self.PENDING_TIMEOUT_MINUTES}m) — "
+                "starting a payment must never shorten the hold"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _guard_cors_origins(self) -> "Settings":
         # `*` 配 allow_credentials 在規範上無效(瀏覽器拒絕),所以它給人的是
         # 「我已經開好 CORS 了」的錯覺,實際上前端仍然壞掉、而且順手把來源限制拆了。
@@ -306,7 +338,7 @@ class Settings(BaseSettings):
     def _guard_webhook_secret(self) -> "Settings":
         # 空字串是一個**已知的**密鑰,所以後果是完全顛倒的:真正的 Stripe webhook
         # 會驗簽失敗被拒,而任何人都能用空密鑰自算 HMAC 偽造 payment_intent.succeeded
-        # 把訂單推成 CONFIRMED,或用別人的 order_id 送 payment_failed 作廢他人訂單
+        # 把訂單推成 CONFIRMED,或用別人的 order_id 送 payment_intent.canceled 作廢他人訂單
         # 並把座位吐回市場(_handle_payment_aborted 沒有 ownership 檢查)。
         #
         # 驗簽本身是對的(webhook.py 用 construct_event),缺的只是密鑰 —— 所以這裡

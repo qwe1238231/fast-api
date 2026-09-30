@@ -83,6 +83,14 @@ class Order(Base):
             "ix_orders_pending_sweep", "created_at",
             postgresql_where=text("status = 'pending' AND payment_provider_id IS NULL"),
         ),
+        # 鏡像的另一半:worker.expire_abandoned_payments 每分鐘掃「PENDING 且**有**
+        # payment_provider_id 且超過 PAYMENT_ABANDON_TIMEOUT」。上面那條的 WHERE 是
+        # IS NULL,這個查詢用不到它,沒有這條就是每分鐘一次 orders 的 seq scan。
+        # 一樣小:只有在途付款住在這裡,付完或過期就離開。
+        Index(
+            "ix_orders_paying_sweep", "created_at",
+            postgresql_where=text("status = 'pending' AND payment_provider_id IS NOT NULL"),
+        ),
         CheckConstraint(
             "status IN ('pending', 'paid', 'confirmed', 'expired', 'cancelled')",
             name="ck_orders_status",

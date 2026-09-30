@@ -205,8 +205,8 @@ async def test_unhandled_event_types_are_still_recorded(client, db, monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_seat_is_released_when_payment_is_aborted(client, db, redis, published_event, monkeypatch, drain_orders):
-    """付款失敗 → 訂單過期 → **座位真的回到市場**。
+async def test_seat_is_released_when_intent_is_canceled(client, db, redis, published_event, monkeypatch, drain_orders):
+    """intent 被取消 → 訂單過期 → **座位真的回到市場**。
 
     釋放發生在提交之後(和取消/過期同一個模式),所以這條走完整條路由,不是只叫
     handler —— 那個 post-commit 步驟本身就是最容易在重構時掉的東西。
@@ -216,8 +216,8 @@ async def test_seat_is_released_when_payment_is_aborted(client, db, redis, publi
     monkeypatch.setattr(
         "stripe.Webhook.construct_event",
         lambda payload, sig_header, secret: {
-            "id": "evt_failed",
-            "type": "payment_intent.payment_failed",
+            "id": "evt_canceled",
+            "type": "payment_intent.canceled",
             "data": {"object": {"id": "pi_test", "metadata": {"order_id": str(order_id)}}},
         },
     )
@@ -226,6 +226,43 @@ async def test_seat_is_released_when_payment_is_aborted(client, db, redis, publi
 
     assert r.status_code == 204
     assert await get_available(redis, event_id=published_event.id) == before + 1
+
+
+@pytest.mark.asyncio
+async def test_payment_failed_keeps_order_pending(client, db, redis, published_event, monkeypatch, drain_orders):
+    """一次刷卡失敗 → **訂單不動、座位不還**,但事件仍進去重表。
+
+    `payment_failed` 只是「這一次嘗試失敗」,intent 還活著、可以換卡重試。以前它跟
+    `canceled` 同路,重試成功的人會撞上一筆已 EXPIRED 的訂單而被退款。這條測的就是
+    那個回歸:狀態機對這個事件必須是 no-op。
+    """
+    order_id, _ = await _create_pending_order(client, db, drain_orders, published_event.id)
+    before = await get_available(redis, event_id=published_event.id)
+    monkeypatch.setattr(
+        "stripe.Webhook.construct_event",
+        lambda payload, sig_header, secret: {
+            "id": "evt_attempt_failed",
+            "type": "payment_intent.payment_failed",
+            "data": {"object": {
+                "id": "pi_test",
+                "metadata": {"order_id": str(order_id)},
+                "last_payment_error": {"code": "card_declined", "decline_code": "insufficient_funds"},
+            }},
+        },
+    )
+
+    r = await client.post("/v1/webhooks/stripe", content=b"{}", headers={"Stripe-Signature": "x"})
+
+    assert r.status_code == 204
+    # 欄位查詢而不是載入 ORM 實例:繞過 identity map,讀到的是 route 提交後的真值。
+    status_now = await db.scalar(select(Order.status).where(Order.id == order_id))
+    assert status_now == OrderStatus.PENDING
+    assert await get_available(redis, event_id=published_event.id) == before
+    # 不處理不等於不記錄:去重表要有它,重送才會被擋、對帳才看得到。
+    recorded = await db.scalar(
+        select(StripeEvent.event_type).where(StripeEvent.event_id == "evt_attempt_failed")
+    )
+    assert recorded == "payment_intent.payment_failed"
 
 
 # ---------- handler-level:斷言「決定」,不斷言網路 ----------

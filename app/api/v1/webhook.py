@@ -93,7 +93,9 @@ async def stripe_webhook(
     release: Order | None = None
     if etype == "payment_intent.succeeded":
         refund = await _handle_payment_succeeded(db, intent)
-    elif etype in ("payment_intent.payment_failed", "payment_intent.canceled"):
+    elif etype == "payment_intent.payment_failed":
+        _log_payment_attempt_failed(intent)
+    elif etype == "payment_intent.canceled":
         release = await _handle_payment_aborted(db, intent)
 
     # claim 與狀態變更一起提交。這裡拋例外的話兩者一起回滾,而 Stripe 的重送會被當成
@@ -186,9 +188,42 @@ async def _handle_payment_succeeded(db, intent: dict) -> _RefundNeeded | None:
     return None
 
 
+def _log_payment_attempt_failed(intent: dict) -> None:
+    """一次刷卡失敗。**只記 log,不動狀態。**
+
+    Stripe 的 `payment_failed` 是「這一次嘗試失敗」,不是「這筆付款結束了」:
+    PaymentIntent 回到 `requires_payment_method`,同一個 `client_secret` 可以換卡
+    再試。以前這裡跟 `canceled` 走同一條路把訂單 EXPIRED、座位還回市場 —— 於是
+    使用者換卡重試成功時,`succeeded` 進來面對的是一筆終態訂單,結果是收款、退款、
+    票沒了。
+
+    訂單留在 PENDING 等重試;「等多久才放棄」是超時的工作,不在這裡數次數 ——
+    兩個機制各自決定放棄,就是 CAS 當初要解掉的那種「兩個寫入者」問題換個形狀。
+
+    INFO 而不是 WARNING:刷卡被拒是正常營業事件,量大時每分鐘幾十筆,掛在告警
+    通道上只會把它弄髒。記 `decline_code` 而不只 `code`:後者幾乎永遠是
+    `card_declined`,真正有資訊的是前者(`insufficient_funds`、`do_not_honor`……),
+    那是事後分析「這場轉換率為什麼低」唯一的材料。
+    """
+    error = intent.get("last_payment_error") or {}
+    logger.info(
+        "payment attempt failed; order stays PENDING for retry",
+        extra={
+            "event": "payment_attempt_failed",
+            "order_id": _order_id(intent),
+            "payment_intent_id": intent.get("id"),
+            "code": error.get("code"),
+            "decline_code": error.get("decline_code"),
+        },
+    )
+
+
 async def _handle_payment_aborted(db, intent: dict) -> Order | None:
-    """Payment failed or the intent was canceled/abandoned -> expire the order (it
-    was protected from the timeout cron while in flight).
+    """The intent was canceled -> expire the order (it was protected from the
+    timeout cron while in flight).
+
+    只有 `canceled` 走這裡。`payment_failed` 刻意不走:那只是一次嘗試失敗,intent
+    還活著、可以重試 —— 見 `_log_payment_attempt_failed`。
 
     回傳需要在提交後還座位的那筆訂單;沒有就 None。
     """

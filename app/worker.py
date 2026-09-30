@@ -28,7 +28,9 @@ from app.core.redis import create_redis_client
 from app.db.session import AsyncSessionLocal
 from app.models.order import Order, OrderStatus
 from app.models.seating import SeatBlock, SeatHold, Zone
+from app.services import abandoned_payments
 from app.services.orders import expire_order, release_order_seat
+from app.services.stripe_client import create_stripe_client
 from app.crud.order import create_order, get_order_by_idempotency_key
 from app.crud.refresh_token import purge_expired
 from app.crud.stripe_event import cutoff_for, purge_events_older_than
@@ -91,7 +93,10 @@ def cron_job(
     return wrapper
 
 
-PENDING_TIMEOUT_MINUTES = 10
+PENDING_TIMEOUT_MINUTES = _settings.PENDING_TIMEOUT_MINUTES
+"""T1:還沒開始付款的 PENDING 保留幾分鐘。搬進 Settings 是為了讓 T2
+(PAYMENT_ABANDON_TIMEOUT_MINUTES)能用 validator 釘住「必須大於 T1」——
+兩個數字的關係要有一個宣告點,而 config 不能反向 import 這裡。"""
 AUDIT_CONSUMER_GROUP = "audit-writer"
 AUDIT_CONSUMER_NAME = "worker"
 AUDIT_BATCH = 1000
@@ -130,7 +135,8 @@ async def expire_pending_orders(ctx: dict) -> None:
             .where(Order.status == OrderStatus.PENDING)
             .where(Order.created_at < cutoff)
             # Skip orders in the Stripe flow: their lifecycle is driven by the
-            # payment webhooks (succeeded -> paid; canceled/failed -> released),
+            # payment webhooks (succeeded -> paid; canceled -> released; a mere
+            # payment_failed is a retryable attempt and leaves the order PENDING),
             # not this timeout — so a buyer paying near the boundary keeps the
             # ticket instead of being expired out from under a successful charge.
             .where(Order.payment_provider_id.is_(None))
@@ -171,6 +177,51 @@ async def expire_pending_orders(ctx: dict) -> None:
                         extra={"event": "seat_release_fast_path_failed"},
                         exc_info=True,
                     )
+
+
+@cron_job
+async def expire_abandoned_payments(ctx: dict) -> abandoned_payments.AbandonedPaymentSweep:
+    """Cron: T2 超時 —— 收掉「建了 PaymentIntent 然後放棄」的訂單。
+
+    T1(上面那支)刻意跳過有 payment_provider_id 的訂單;這支只收那些。兩個集合靠
+    IS NULL / IS NOT NULL 互斥,各走各的 partial index。
+
+    邏輯全在 services/abandoned_payments(明確參數、可單獨測);這裡只做 job 該做的:
+    算 cutoff、餵 ctx 裡的 client、對**每輪層級**的結果做判斷。撞 cap 一定要叫出來 ——
+    一個安靜的上限讀起來就像「全部處理完了」,而實際上積壓在長大。
+    """
+    settings = get_settings()
+    cutoff = datetime.now(timezone.utc) - timedelta(
+        minutes=settings.PAYMENT_ABANDON_TIMEOUT_MINUTES
+    )
+    result = await abandoned_payments.expire_abandoned_payments(
+        session_factory=AsyncSessionLocal,
+        stripe_client=ctx["stripe_client"],
+        redis=ctx["redis_client"],
+        cutoff=cutoff,
+    )
+    summary = {
+        "expired": result.expired,
+        "awaiting_webhook": result.awaiting_webhook,
+        "in_flight": result.in_flight,
+        "missing": result.missing,
+        "errors": result.errors,
+    }
+    if result.capped:
+        alert(
+            logger,
+            f"abandoned-payment sweep hit its per-run cap ({abandoned_payments.ABANDON_BATCH}); "
+            "in-flight-but-abandoned orders are piling up faster than one run clears them",
+            event="abandoned_sweep_capped",
+            **summary,
+        )
+    elif any(summary.values()):
+        # 全零的分鐘不記:常態下這支每分鐘什麼都沒撿到,一行「0 0 0 0 0」只是噪音。
+        logger.info(
+            "abandoned-payment sweep",
+            extra={"event": "abandoned_sweep", **summary},
+        )
+    return result
 
 # --- Transactional outbox relay ---------------------------------------------
 #
@@ -570,12 +621,16 @@ async def startup(ctx: dict) -> None:
     configure_logging(component="ticket-worker")
     settings = get_settings()
     ctx["redis_client"] = create_redis_client(settings.REDIS_URL)
+    # 在途付款的超時 cron 要對 Stripe 主動 cancel intent。跟 api 的 lifespan 同一個
+    # 工廠、同一個逾時設定;http client 另外留著是因為 StripeClient 沒有 close。
+    ctx["stripe_client"], ctx["stripe_http"] = create_stripe_client(settings.STRIPE_SECRET_KEY)
     await ensure_consumer_group(ctx["redis_client"], AUDIT_STREAM_KEY, AUDIT_CONSUMER_GROUP)
     await ensure_consumer_group(ctx["redis_client"], ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP)
 
 async def shutdown(ctx: dict) -> None:
-    """Close Redis client."""
+    """Close Redis and Stripe clients."""
     await ctx["redis_client"].aclose()
+    await ctx["stripe_http"].close_async()
 
 def _audit_row(fields: dict) -> AuditLog:
     """把一筆 stream entry 轉成 AuditLog。格式不對就丟例外,由呼叫端隔離。
@@ -1746,18 +1801,22 @@ class WorkerSettings:
 
     #: 同時最多跑幾個 job。**這個數字是連線預算的一部分,不是隨手填的。**
     #:
-    #: 每分鐘那一刻有六個 cron 同時到期(expire / audit / reclaim / report / prewarm /
-    #: outbox),每 5 分鐘再多兩個漂移偵測,而每個 job 會開 1~2 條 DB 連線。ARQ 的預設是 10,也就是
+    #: 每分鐘那一刻有七個 cron 同時到期(expire / abandoned / audit / reclaim / report /
+    #: prewarm / outbox),每 5 分鐘再多兩個漂移偵測,而每個 job 會開 1~2 條 DB 連線。ARQ 的預設是 10,也就是
     #: worker 的連線用量上界是「10 × 每個 job 的 session 數」—— 那是一個**沒有人宣告過
     #: 的**上界,而 autoscaling 的 max_capacity 是拿整體連線預算算出來的。把它明確定成
     #: 4,worker 那一格才是一個真的數字而不是猜的。
     #:
-    #: 代價:同一刻到期的第五個 cron 要等前面的讓出位子。它們都是秒級的,而 cron 的
-    #: 語意本來就是「這一分鐘內跑」而不是「這一秒跑」。
+    #: 代價:同一刻到期的第五個 cron 要等前面的讓出位子。它們多半是秒級的,而 cron 的
+    #: 語意本來就是「這一分鐘內跑」而不是「這一秒跑」。例外是 abandoned:它對每筆候選
+    #: 打一次 Stripe,撞 cap 時最壞約 27 秒(200 筆 / 3 併發),仍在一分鐘內。它單獨一格
+    #: 的 session 數是 ABANDON_CONCURRENCY = 3,不是 1~2 —— 預算測試把它跟 max_jobs 一起算。
     max_jobs = 4
 
     cron_jobs =[
         cron(expire_pending_orders, minute={i for i in range(60)}),
+        # T2:有 PaymentIntent 的那一半。先 cancel Stripe 端、確知 canceled 才 EXPIRED。
+        cron(expire_abandoned_payments, minute={i for i in range(60)}),
         cron(purge_expired_refresh_tokens, hour={3}, minute={0}),
         cron(consume_audit_events, minute={i for i in range(60)}),
         # order intents are drained by the dedicated app.order_consumer process

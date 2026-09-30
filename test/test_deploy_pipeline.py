@@ -1112,10 +1112,18 @@ def test_the_worker_pool_covers_its_declared_job_concurrency() -> None:
     它。反過來也要成立:池子小於 max_jobs 的話,同一刻到期的 cron 會卡在連線池上等,
     而那個症狀是「排程任務偶爾沒跑」,查起來完全不會指向連線池。
     """
+    from app.services.abandoned_payments import ABANDON_CONCURRENCY
     from app.worker import WorkerSettings
 
     assert _pool_per_task("worker") >= WorkerSettings.max_jobs, (
         f"worker 池子 {_pool_per_task('worker')} < max_jobs {WorkerSettings.max_jobs}"
+    )
+    # 「每個 job 一條連線」對 abandoned-payment sweep 不成立:它用 semaphore 同時開到
+    # ABANDON_CONCURRENCY 條 session。最壞的一刻是它滿載 + 其他 (max_jobs − 1) 支各一條。
+    worst_case = (WorkerSettings.max_jobs - 1) + ABANDON_CONCURRENCY
+    assert _pool_per_task("worker") >= worst_case, (
+        f"worker 池子 {_pool_per_task('worker')} < 最壞並發 {worst_case} "
+        f"(abandoned sweep 的 {ABANDON_CONCURRENCY} 條 + 其他 {WorkerSettings.max_jobs - 1} 支 cron)"
     )
 
 

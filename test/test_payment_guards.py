@@ -110,6 +110,33 @@ def test_the_legitimate_configurations_still_boot(override) -> None:
     assert _settings(**override) is not None
 
 
+# ─ 兩道訂單超時的關係:開始付款不能縮短持有時間
+
+@pytest.mark.parametrize(
+    "pending, abandon",
+    [
+        pytest.param(10, 10, id="equal"),
+        pytest.param(10, 5, id="abandon-shorter"),
+    ],
+)
+def test_abandon_timeout_must_exceed_pending_timeout(pending: int, abandon: int) -> None:
+    """T2 ≤ T1 要在啟動時炸。
+
+    兩道超時同錨 created_at:T1 收「還沒按付款」的訂單,T2 收「按了付款但放棄」的
+    訂單。T2 ≤ T1 的後果是按下付款的人**更早**被踢,而且沒有任何錯誤訊號 —— 只有
+    「我明明在付款怎麼票沒了」的客訴。
+    """
+    with pytest.raises(ValidationError, match="must exceed"):
+        _settings(PENDING_TIMEOUT_MINUTES=pending, PAYMENT_ABANDON_TIMEOUT_MINUTES=abandon)
+
+
+def test_default_timeouts_boot_and_leave_room_to_pay() -> None:
+    """預設值要能啟動,而且 T2 − T1 就是付款者最少能有的填表時間 —— 這裡把它釘成
+    一個看得見的數字,改預設值的人會被迫重新想一次那 5 分鐘夠不夠。"""
+    s = _settings()
+    assert s.PAYMENT_ABANDON_TIMEOUT_MINUTES - s.PENDING_TIMEOUT_MINUTES == 5
+
+
 # ─ 驗簽這件事「真的有發生」
 
 def test_an_empty_secret_accepts_a_forged_event() -> None:

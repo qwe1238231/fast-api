@@ -120,6 +120,7 @@ async def reserve(redis, *, event_id, quantity):
 ```
 
 - 逾時(預設 10 分鐘未付款):由背景 worker 轉 `EXPIRED` 並**釋放庫存**回 Redis。
+- 已建 PaymentIntent 但沒付完:第二道逾時(預設 15 分鐘,同樣從下單起算)先對 Stripe cancel intent,確知 `canceled` 才轉 `EXPIRED`;Stripe 回 `succeeded` 則留給 webhook。刷卡被拒(`payment_failed`)不作廢訂單,可換卡重試。
 - `CANCELLED` / `EXPIRED` 都會把票還回庫存計數。
 
 ### 3. 下單非同步化 + 冪等性

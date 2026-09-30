@@ -60,7 +60,9 @@ locals {
   ]
 
   # worker 的池子。它是單例,但 ARQ 會**同時**跑多個 cron(app/worker.py 的
-  # `max_jobs = 4` 明確定住了幾個),每個 job 開 1~2 條連線 → 3+3 = 6 有餘裕。
+  # `max_jobs = 4` 明確定住了幾個)。多數 job 開 1 條連線;例外是 abandoned-payment
+  # sweep,它同時開 ABANDON_CONCURRENCY = 3 條 → 最壞 3 + 3 = 6,剛好是這裡的 3+3。
+  # 動任一邊都要一起動,test_deploy_pipeline 的預算測試會擋。
   # 這個 task def 也是部署時跑 `alembic upgrade` 用的那個,而 alembic 只用一條連線。
   worker_pool_env = [
     { name = "DB_POOL_SIZE", value = "3" },

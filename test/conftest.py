@@ -108,10 +108,15 @@ async def client():
     # (登入端點寫稽核事件需要它),用完關掉避免連線洩漏。
     app.state.redis = create_redis_client(get_settings().REDIS_URL)
     # webhook/payment endpoints resolve get_stripe -> app.state.stripe; lifespan
-    # doesn't run under ASGITransport, so stub it with a mock (refunds recorded).
+    # doesn't run under ASGITransport, so stub it with a mock (refunds and intent
+    # cancels recorded). 只有這兩個方法是 AsyncMock:MagicMock 的屬性不可 await,
+    # 所以任何**沒列在這裡**的 Stripe 呼叫會在測試裡以 TypeError 現形,而不是靜靜通過。
     app.state.stripe = MagicMock()
     app.state.stripe.v1.refunds.create_async = AsyncMock(
         return_value=MagicMock(id="re_test", status="succeeded")
+    )
+    app.state.stripe.v1.payment_intents.cancel_async = AsyncMock(
+        return_value=MagicMock(status="canceled")
     )
     try:
         async with AsyncClient(

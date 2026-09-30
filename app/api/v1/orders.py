@@ -5,6 +5,7 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Header, status, HTTPException, Query
+from stripe import StripeClient
 
 from app.api.deps import CurrentUser, DbSession, Redis, Stripe
 from app.models.order import Order, OrderStatus
@@ -17,7 +18,7 @@ from app.crud.order import get_order_by_id, get_order_by_idempotency_key, list_o
 from app.schemas.payment import PaymentIntentResponse
 from app.schemas.seating import SeatedOrderDetail
 from app.services.zones import describe_order_seats
-from app.services.stripe_client import create_payment_intent
+from app.services.stripe_client import cancel_payment_intent, create_payment_intent
 from app.services.waiting_room import refund_admission, verify_admission
 
 
@@ -214,12 +215,24 @@ async def cancel_order(
     current_user: CurrentUser,
     db: DbSession,
     redis: Redis,
+    stripe: Stripe,
 ) -> None:
-    """Cancel an order. Releases reserved inventory."""
+    """Cancel an order. Releases reserved inventory and voids any live PaymentIntent.
+
+    順序:CAS → commit → 還座位 → 對 Stripe cancel intent。兩個 post-commit 動作都是
+    best-effort、失敗只 log 不 500 —— 取消在 commit 那一刻**已經生效**,回錯只會讓
+    客戶端重試一個已經成功的操作。
+
+    **為什麼這裡不像 T2 cron 那樣「先問 Stripe、確知 canceled 才動本地」**:cron 的
+    決定是我們替使用者做的,必須讓路給已經進來的付款;這裡是使用者自己按的取消。
+    若付款恰好同一瞬間落地,`succeeded` webhook 會看到 CANCELLED 而走退款 —— 那正是
+    使用者要的結果。反過來 Stripe-first 會在那個競態下回 409,把使用者鎖進一張他剛
+    想退的票(CONFIRMED 沒有退款路徑),還把 Stripe 的可用性拉進取消這條路。
+    """
     order = await get_order_by_id(db, order_id)
     if order is None or order.user_id != current_user.id:
         raise OrderNotFound (order_id=order_id)
-    
+
     if not await cancel_order_service(db, order):
         await db.refresh(order)
         raise InvalidOrderTransition(
@@ -241,6 +254,58 @@ async def cancel_order(
                 "event_id": order.event_id,
             },
             exc_info=True,
+        )
+    if order.payment_provider_id is not None:
+        await _void_payment_intent(stripe, order)
+
+
+async def _void_payment_intent(stripe: StripeClient, order: Order) -> None:
+    """post-commit:讓已取消訂單的 PaymentIntent 也死掉,免得 client_secret 還能付。
+
+    以前這裡什麼都沒做:使用者按了取消,intent 在 Stripe 那邊還是 requires_payment_method,
+    前端(或任何拿到 client_secret 的人)之後仍然付得進去 —— 然後才靠 webhook 退款。
+
+    失敗**不是錯誤**:intent 活著的後果是「之後若真的付了,webhook 走退款」,那條路存在
+    且全自動,所以是 WARNING 不是 alert()。Stripe 回 succeeded 代表錢已經進來、webhook
+    在路上,同一條退款路徑會處理;這裡只把狀態記下來,不做第二件事。
+    """
+    try:
+        intent_status = await cancel_payment_intent(
+            stripe,
+            payment_intent_id=order.payment_provider_id,
+            reason="requested_by_customer",
+        )
+    except Exception:
+        logger.warning(
+            "order cancelled but its PaymentIntent could not be voided — a later "
+            "charge on it will be refunded by the succeeded webhook",
+            extra={
+                "event": "cancel_void_intent_failed",
+                "order_id": order.id,
+                "payment_intent_id": order.payment_provider_id,
+            },
+            exc_info=True,
+        )
+        return
+    if intent_status == "canceled":
+        logger.info(
+            "voided the cancelled order's PaymentIntent",
+            extra={
+                "event": "cancel_intent_voided",
+                "order_id": order.id,
+                "payment_intent_id": order.payment_provider_id,
+            },
+        )
+    else:
+        logger.info(
+            "cancelled order's PaymentIntent is not voidable; if it completes, "
+            "the succeeded webhook refunds it",
+            extra={
+                "event": "cancel_intent_not_voidable",
+                "order_id": order.id,
+                "payment_intent_id": order.payment_provider_id,
+                "intent_status": intent_status,
+            },
         )
 
 @router.post("/{order_id}/payment-intent", response_model=PaymentIntentResponse)

@@ -1,12 +1,39 @@
 name: tests
 on:
   push:
-    branches: [main, feat/*]
+    # `dev` 一定要在這裡。流程是 feat → dev → main,而「先推 dev、確認沒問題再進
+    # main」這句話如果 dev 上根本不會跑任何 workflow,它就是空的 —— 而它曾經就是空的:
+    # 直接 push dev 什麼都不會觸發,唯一的驗證發生在 feat push 或開 PR 的時候。
+    # 規則用「推」來描述,觸發條件就必須跟著「推」走,不然遲早又會有人以為驗過了。
+    branches: [feat/*, dev]
   pull_request:
+  # `main` 刻意**不**在清單裡,理由跟 dev 正好相反:deploy.yml 用 `uses:` 叫這支,
+  # 所以 main 上的測試是**部署管線的第一關**而不是一條平行的工作流。留著的話 main
+  # 上每次推送會跑兩次同樣的測試,而且真正危險的是舊寫法 —— 兩支工作流各自被 push
+  # 觸發、平行跑,於是「測試還在跑」跟「已經部署完了」可以同時成立。
+  workflow_call:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # env 放在 **job 層級**,不是每個步驟各自複製一份。這正是這次 CI 壞掉的根因:
+    # 71bdd9b 加了 STRIPE_WEBHOOK_SECRET 的 fail-closed 驗證(空密鑰是「已知密鑰」,
+    # 任何人都能偽造 Stripe webhook),也同步改了 infra 注入它 —— 但這裡四個步驟各帶
+    # 一份 env,漏掉就是漏掉。結果 alembic 那幾步從 08-06 起每次都在 Settings() 驗證
+    # 失敗,而 pytest 照常綠(conftest 自己 setdefault DEBUG=True),把故障蓋掉了。
+    #
+    # DEBUG **刻意不設**:conftest 用 setdefault 把它設成 True 給測試(模擬付款需要),
+    # 在這裡設死會讓那個 setdefault 失效。alembic 那幾步沒有 DEBUG 就是 False ——
+    # 而那正是要驗的 production 形狀,所以密鑰給一個真的假值,不是靠 DEBUG 繞過守衛。
+    env:
+      DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
+      SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
+      STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
+      STRIPE_WEBHOOK_SECRET: whsec_dummy_value_for_ci
+      PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
+      PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
+      REDIS_URL: redis://localhost:6379/0
 
     services:
       postgres:
@@ -58,20 +85,100 @@ jobs:
         run: pip install ticket_secrets/target/wheels/*.whl
       
       - name: Run alembic migrations
-        env:
-          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
-          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
-          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
-          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
-          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
         run: alembic upgrade head
 
+      # 測試是走 metadata.create_all 建表的,完全不經過 migration —— 所以「model 改了
+      # 但沒補 migration」這一類漂移,整套測試一個都抓不到,會一路綠到部署當下才炸。
+      # `alembic check` 拿剛剛 upgrade 出來的 schema 跟 model metadata 對照,有差就退非零。
+      #
+      # 一定要在 pytest **之前**:pytest 的 create_all 會把缺的表直接補進同一個資料庫,
+      # 補完之後再檢查就永遠是乾淨的 —— 那正是這一步要抓的東西被蓋掉。
+      - name: Check migrations match the models
+        run: alembic check
+
+      # `alembic check` 比對欄位、索引、約束,但**看不到 sequence 的型別**。
+      # 那正好是加寬主鍵時最容易漏的一步:ALTER TABLE ... TYPE BIGINT 不會動到
+      # 它所擁有的 sequence,所以欄位變成 bigint 而序列仍在 21 億封頂 —— 一支
+      # 顯示成功、實際上什麼都沒修好的 migration,而且要到真的滿了才會發現。
+      #
+      # 這一步同樣進不了 pytest:測試是 metadata.create_all 建的,SQLAlchemy 一定
+      # 會配對正確的序列型別,所以在那裡永遠是綠的。只有跑過 migration 的資料庫
+      # 才看得見這種漂移。
+      - name: Check sequences match their columns
+        run: |
+          drift=$(psql "postgresql://justinhu@localhost:5432/testdb" -tA -c "
+            SELECT s.seqrelid::regclass || ': sequence is ' ||
+                   format_type(s.seqtypid, NULL) || ' but ' ||
+                   a.attrelid::regclass || '.' || a.attname || ' is ' ||
+                   format_type(a.atttypid, a.atttypmod)
+            FROM pg_sequence s
+            JOIN pg_depend d ON d.objid = s.seqrelid AND d.deptype = 'a'
+            JOIN pg_attribute a
+              ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+            WHERE s.seqtypid <> a.atttypid;")
+          if [ -n "$drift" ]; then
+            echo "序列型別與欄位型別不一致 —— 加寬主鍵時漏了 ALTER SEQUENCE:"
+            echo "$drift"
+            exit 1
+          fi
+
+      # `alembic check` 的第二個盲點:它比對欄位、約束、外鍵的 ON DELETE,但**不比對
+      # 索引定義的細節,也不比對 reloptions**。實測確認至少漏掉 postgresql_include 與
+      # per-table 的 autovacuum 調校 —— 兩者拿掉之後 alembic check 照樣說乾淨。
+      # 而 orders 的 autovacuum 設定正是「差一個參數就讓覆蓋索引失效」的那種東西。
+      #
+      # 這種漂移最陰險的地方是它不會讓任何測試變紅:pytest 走 metadata.create_all,
+      # 看到的永遠是 model 那一份,而正式環境跑的是 migration 那一份 —— 於是本機量到
+      # 的查詢計畫跟線上跑的不是同一個東西。
+      #
+      # 做法是拿 Postgres 自己的 pg_get_indexdef 當共同語言,兩份 schema 各問一次逐字
+      # 比對(細節見 app/scripts/check_schema_drift.py)。必須在 pytest **之前** ——
+      # 理由跟 alembic check 同一條:create_all 會把缺的東西補進同一個資料庫。
+      - name: Check index definitions and storage params match the models
+        run: python -m app.scripts.check_schema_drift
+
       - name: Run pytest
-        env:
-          DATABASE_URL: postgresql+asyncpg://justinhu@localhost:5432/testdb
-          SECRET_KEY: testsecretkey_at_least_32_chars_long_for_ci_testing
-          STRIPE_SECRET_KEY: sk_test_dummy_value_for_ci
-          PII_KEK_BASE64: BaDqSnulhxOcrKHiwHVYXwSxxPV8DbGAat5nyyAcrZs=
-          PII_LOOKUP_KEY_BASE64: qYgBE4SWNySzWDaXFwE9bUhltuTvHHULx7TPDuTGeFk=
-          REDIS_URL: redis://localhost:6379/0
         run: pytest test/ -v --cov-fail-under=76
+
+  # 基礎設施的合法性。**獨立成一個 job,跟上面那個平行跑** —— 它不需要 postgres、
+  # redis、也不需要 Rust toolchain,而那三樣正好是上面最慢的部分。平行跑等於這一關
+  # 幾乎不佔任何額外時間,所以不必為了省時間而犧牲它。
+  #
+  # 在這之前,`.tf` 的語法錯誤、型別錯誤、引用一個不存在的資源,回饋點都是
+  # `terraform apply` —— 而 apply 只發生在部署當下、對著真的 AWS。
+  # test/test_deploy_pipeline.py 那些結構斷言掃的是**文字**(「這個屬性有沒有被設」),
+  # 掃不出 HCL 本身合不合法,兩者互補而不重疊。
+  #
+  # deploy.yml 用 `uses:` 呼叫這整支工作流,而呼叫端要等**所有** job 都綠才算過,
+  # 所以多這一個 job 不會讓部署的閘門變鬆。
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 釘死版本,理由跟 task def 釘 SHA 一樣:CI 跟本機跑的必須是同一個東西。
+      # versions.tf 只寫 >= 1.6,那是「這份設定能在哪些版本上跑」,不是「CI 該用哪個」。
+      # terraform_wrapper: false —— 預設的包裝會改寫 stdout,讓輸出難讀。
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.7"
+          terraform_wrapper: false
+
+      # 排版差異會在 review 裡把真正的改動淹掉。-recursive 一併涵蓋 bootstrap/。
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      # validate 要有 provider schema 才能檢查屬性名與型別,所以得先 init。
+      # -backend=false:這一關**不需要任何 AWS 憑證**,也不該碰 state —— 而那正是它
+      # 能安全地跑在 pull_request 上的原因。init 會照 .terraform.lock.hcl 取 provider,
+      # 所以順帶也驗證了那個 lock 檔還是可用的。
+      #
+      # bootstrap/ 是**另一個 root module**(自己的 state、自己的 lock),在 infra/
+      # 底下跑的 validate 完全看不到它 —— 所以要分開跑一次。
+      - name: terraform validate
+        run: |
+          for dir in infra infra/bootstrap; do
+            echo "── $dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+          done

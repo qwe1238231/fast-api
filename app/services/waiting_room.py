@@ -24,6 +24,7 @@ from app.core.config import get_settings
 from app.core.exceptions import AdmissionDenied
 from app.models.event import Event
 from app.services.inventory import get_available
+from app.services.queue_events import publish_global_poke
 
 
 def _draw_key(event_id: int) -> str:
@@ -57,15 +58,35 @@ async def set_admission_paused(redis: Redis, paused: bool, *, ttl_seconds: int =
         await redis.set(_paused_key(), "1", ex=ttl_seconds)
     else:
         await redis.delete(_paused_key())
+    await publish_global_poke(redis)   # nudge every waiting SSE connection to re-read status()
+
+
+def effective_window(
+    sale_starts_at: datetime,
+    queue_opens_at: datetime | None,
+    queue_closes_at: datetime | None,
+) -> tuple[datetime, datetime]:
+    """登記窗的實際邊界:顯式欄位優先,NULL 的那側用 sale_starts_at 減去設定的
+    lead / buffer 推導(行為 A)。
+
+    抽成純函式(而不是只有吃 Event 的版本)是給 event_admin 的 PATCH 驗證用的:
+    兩個 fallback 各自獨立計算,所以「opens 設在預設 closes 之後、closes 留 NULL」
+    能組出倒過來的有效窗,而**兩個欄位各自都合法** —— DB 的 ck_events_queue_window
+    只在兩欄都非 NULL 時有先後可言,這個缺口只能由「用同一條公式驗合併後的值」補。
+    驗證跟執行共用這一個函式,兩邊才不會漂移。
+    """
+    s = get_settings()
+    opens = queue_opens_at or sale_starts_at - timedelta(seconds=s.QUEUE_LEAD_TIME_SECONDS)
+    closes = queue_closes_at or sale_starts_at - timedelta(seconds=s.QUEUE_ADMISSION_BUFFER_SECONDS)
+    return opens, closes
 
 
 def window(event: Event) -> tuple[datetime, datetime]:
     """(opens_at, closes_at) for registration. Explicit columns win; otherwise
     fall back to sale_starts_at minus the configured lead / buffer (behaviour A)."""
-    s = get_settings()
-    opens = event.queue_opens_at or event.sale_starts_at - timedelta(seconds=s.QUEUE_LEAD_TIME_SECONDS)
-    closes = event.queue_closes_at or event.sale_starts_at - timedelta(seconds=s.QUEUE_ADMISSION_BUFFER_SECONDS)
-    return opens, closes
+    return effective_window(
+        event.sale_starts_at, event.queue_opens_at, event.queue_closes_at
+    )
 
 
 async def _ensure_salt(redis: Redis, event_id: int) -> str:
@@ -131,11 +152,61 @@ async def status(redis: Redis, *, event_id: int, user_id: int) -> QueueState:
     return QueueState(admitted=False, people_ahead=rank - admitted_count)
 
 
-async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: int) -> None:
+async def admit_deadline(redis: Redis, *, event_id: int, user_id: int) -> float | None:
+    """Wall-clock epoch seconds at which this user's rank crosses the admission
+    cutoff — or None if they're not registered / admission isn't scheduled yet.
+
+    Both inputs are frozen once the registration window closes (no new
+    registrations can change the rank; the rate is config), so the SSE stream
+    computes this ONCE and sleeps precisely until it instead of polling for it.
+
+    Derivation from _admitted_count / status():
+        admitted  <=>  rank < int(elapsed * RATE)
+                  <=>  elapsed >= (rank + 1) / RATE
+        =>  admit_at = admit_start + (rank + 1) / RATE
+    """
+    start = await redis.get(_admit_start_key(event_id))
+    if start is None:
+        return None
+    rank = await redis.zrank(_draw_key(event_id), str(user_id))
+    if rank is None:
+        return None
+    rate = get_settings().QUEUE_ADMISSION_RATE
+    return float(start) + (rank + 1) / rate
+
+
+def _used_key(jti: str) -> str:
+    """Single-use marker for one admission token."""
+    return f"admission_used:{jti}"
+
+
+async def refund_admission(redis: Redis, jti: str) -> None:
+    """把單次入場券還回去。**只在確定沒有任何訂單意圖成立時**呼叫。
+
+    為什麼需要這個:SETNX 必須發生在扣庫存之前 —— 否則同一張 token 的兩個並發
+    請求都會通過檢查,一張入場券換到兩張票。但這樣一來,凡是下單失敗(售完、
+    配不出座位、活動不在販售窗、帶錯 zone)都會連帶燒掉入場券,使用者得回去
+    重新排隊才能改個張數再試。
+
+    售完是終局的所以以前看不出問題,但「配不出這個張數」本質上是可重試的
+    (改成 2 張就成立),而在讀-算-CAS 的配位架構下重試更是常態路徑。所以失敗
+    必須把券還回去。
+
+    冪等:DEL 不存在的 key 是 no-op。
+    """
+    await redis.delete(_used_key(jti))
+
+
+async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: int) -> str:
     """Raise AdmissionDenied unless `token` is a valid, in-scope, unused admission pass.
 
     Checks signature/expiry (jwt), type, that it was issued for this event and this
     user, and that it hasn't been used before (single-use via SETNX on the jti).
+
+    回傳 jti,讓呼叫端能在訂單最終沒有成立時用 `refund_admission` 還回去。
+    SETNX 留在這裡而不是搬到下單成功之後,是為了保住單次性的原子性:改成
+    「先 EXISTS 檢查、成功後才 SETNX」會開一個窗口讓同一張 token 的兩個並發
+    請求都通過。
     """
     settings = get_settings()
     try:
@@ -151,6 +222,7 @@ async def verify_admission(redis: Redis, token: str, *, user_id: int, event_id: 
 
     jti = payload.get("jti")
     ttl = max(1, int(payload["exp"] - datetime.now(timezone.utc).timestamp()))
-    first_use = await redis.set(f"admission_used:{jti}", "1", nx=True, ex=ttl)
+    first_use = await redis.set(_used_key(jti), "1", nx=True, ex=ttl)
     if not first_use:
         raise AdmissionDenied("admission token already used")
+    return jti

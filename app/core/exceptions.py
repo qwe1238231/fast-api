@@ -7,6 +7,35 @@ Translated to HTTP responses by handlers in app/api/exception_handlers.py.
 class DomainError(Exception):
     """Base for all business-logic errors."""
 
+
+class ConcurrentModification(DomainError):
+    """樂觀鎖擋下的寫入:讀出來之後、寫回去之前,有人先改過這一列。
+
+    這不是「錯誤」而是競態 —— 同一份 payload 重送不會過(它帶的版本已經舊了),
+    但重新載入、把改動套到新版本上再送一次就會過。回 409 而不是 5xx 的理由就在
+    這裡:狀態衝突,不是伺服器壞了。
+
+    current_version 可能是 None:兩道關卡(見 app/db/optimistic.py)只有前面那道
+    在比對時知道對方的版本;flush 撞上的那道只知道 rowcount=0,而為了回報再讀一次
+    也未必讀得到當下的值(它可能又被改了)。前端一律重新載入即可。
+    """
+    def __init__(
+            self,
+            *,
+            resource: str,
+            resource_id: int,
+            expected_version: int | None = None,
+            current_version: int | None = None,
+    ):
+        self.resource = resource
+        self.resource_id = resource_id
+        self.expected_version = expected_version
+        self.current_version = current_version
+        super().__init__(
+            f"{resource} {resource_id} was modified by someone else; reload and retry"
+        )
+
+
 class EventError(DomainError):
     """Base for Event-related errors."""
 
@@ -24,6 +53,119 @@ class EventCancelled(EventError):
     def __init__(self, event_id: int):
         self.event_id = event_id
         super().__init__(f"Event {event_id} is cancelled")
+
+class InvalidEventUpdate(EventError):
+    """後台編輯的內容本身不成立(不是併發衝突,重送幾次都一樣)。
+
+    reason 會原樣回給呼叫端:這是後台端點,管理員需要知道到底哪裡不對,
+    而不是一句「更新失敗」。
+    """
+    def __init__(self, event_id: int, reason: str):
+        self.event_id = event_id
+        self.reason = reason
+        super().__init__(f"Cannot update event {event_id}: {reason}")
+
+class ZoneRequired(EventError):
+    """有座位圖的場次必須指定要買哪一區 —— 票價與配位都以 zone 為單位。"""
+    def __init__(self, event_id: int):
+        self.event_id = event_id
+        super().__init__(f"Event {event_id} is seated; zone_id is required")
+
+class ZoneNotForEvent(EventError):
+    """這個 zone 不能用於這個場次。
+
+    涵蓋四種情況,對外一律同一個錯誤:zone 不存在、屬於別的場館、這個場次沒設
+    該區票價、或這個場次根本沒有座位圖。**別場館的 zone 是安全問題** —— 少了
+    這道檢查,使用者可以帶另一個場館的便宜 zone_id 來買這場,而且 webhook 的
+    金額驗證抓不到(total_price_cents 是照那個便宜價算的,前後一致)。
+    """
+    def __init__(self, event_id: int, zone_id: int, reason: str = "not sellable"):
+        self.event_id = event_id
+        self.zone_id = zone_id
+        self.reason = reason
+        super().__init__(f"Zone {zone_id} is not sellable for event {event_id}: {reason}")
+
+class ZoneNotFound(EventError):
+    """後台按 id 找不到這個 zone。
+
+    跟 ZoneNotForEvent 是兩件事:那個是「這個 zone 不能賣給這個場次」(對外只回
+    泛用訊息,免得被拿來探測場館結構),這個是後台的 404。
+    """
+    def __init__(self, zone_id: int):
+        self.zone_id = zone_id
+        super().__init__(f"Zone {zone_id} not found")
+
+class ZoneNameTaken(EventError):
+    """同一個場館裡已經有同名的區(uq_zones_venue_name)。
+
+    不先 SELECT 檢查再寫:那是 TOCTOU —— 兩個管理員同時改成同一個名字,兩邊的
+    預檢都會過。唯一索引才是真正的權威,所以改成攔截它丟出來的 IntegrityError。
+    """
+    def __init__(self, venue_id: int, name: str):
+        self.venue_id = venue_id
+        self.name = name
+        super().__init__(f"Venue {venue_id} already has a zone named {name!r}")
+
+class VenueNotFound(EventError):
+    def __init__(self, venue_id: int):
+        self.venue_id = venue_id
+        super().__init__(f"Venue {venue_id} not found")
+
+
+class ZonePricesInvalid(EventError):
+    """zone_prices 的 key 不等於該場館的 zone 集合。
+
+    多的(不屬於這個場館)是**安全問題**:少了這道檢查,建立時就能把別場館的 zone
+    綁進來、之後拿它的便宜票價下單。少的則會讓場次永遠賣不完(見
+    ZonePricesIncomplete),所以兩邊都要在建立時就擋 —— 而不是等到 publish。
+    """
+    def __init__(self, venue_id: int, missing: list[int], unknown: list[int]):
+        self.venue_id = venue_id
+        self.missing = missing
+        self.unknown = unknown
+        super().__init__(
+            f"zone_prices for venue {venue_id} is wrong: "
+            f"missing={missing} unknown={unknown}"
+        )
+
+
+class ZonePricesIncomplete(EventError):
+    """座位場次有 zone 沒設票價。
+
+    後果不是「那一區賣不掉」而已 —— `total_seats` 包含它的容量(SeatMapMismatch
+    強制的),但 `list_zone_availability` 不會列出它、下單也會被 ZoneNotForEvent
+    拒絕。於是那些席位永遠賣不掉、`event:available` 的下限永遠 > 0,等候室的
+    sold_out 因此**永不觸發**,使用者一直排隊等一批買不到的票。
+
+    而漂移偵測**不會叫**:expected = total_seats − SUM(quantity) 跟 actual 完全
+    一致,系統內部自洽,只是賣不完。沒有警報的錯誤最貴,所以在 publish 擋。
+    """
+    def __init__(self, event_id: int, zone_ids: list[int]):
+        self.event_id = event_id
+        self.zone_ids = zone_ids
+        super().__init__(
+            f"Event {event_id}: zones {zone_ids} have no price — every zone of a seated "
+            f"event must be priced, or its seats can never be sold"
+        )
+
+
+class SeatMapMismatch(EventError):
+    """`events.total_seats` 與座位圖的實際容量不符。
+
+    座位場次的 total_seats 是衍生值(Σ seat_blocks.capacity),但沒有任何資料庫約束
+    能表達跨表的這個關係,所以在 publish 擋。不自動修正而是拒絕發佈:庫存上限被
+    悄悄改掉比發佈失敗嚴重得多,而且填錯的那個數字會讓 detect_inventory_drift
+    永久誤報(它用 total_seats − SUM(quantity) 算期望值)—— 變成狼來了。
+    """
+    def __init__(self, event_id: int, total_seats: int, capacity: int):
+        self.event_id = event_id
+        self.total_seats = total_seats
+        self.capacity = capacity
+        super().__init__(
+            f"Event {event_id}: total_seats={total_seats} but the seat map holds "
+            f"{capacity} seats — fix total_seats before publishing"
+        )
+
 
 class OrderError(DomainError):
     """Base for Order-related errors."""
@@ -70,6 +212,119 @@ class InsufficientInventory(InventoryError):
         self.requested = requested
         self.available = available
         super().__init__(f"Event {event_id}: requested {requested}, only {available} available")
+
+class PurchaseLimitExceeded(InventoryError):
+    """這個人在這場次已經買到上限了 —— **不等於賣完,也不是暫時性的**。
+
+    三個錯誤必須分得開,因為客戶端該做的事完全不同:
+      - InsufficientInventory → 沒票了,別重試
+      - SeatContention        → 暫時性,原樣重送
+      - PurchaseLimitExceeded → 重送幾次都一樣,但**改小張數可能會過**
+
+    所以 `remaining` 要帶出去(可能是 0):前端才能顯示「你還可以買 1 張」而不是
+    一句「超過限購」讓人反覆重送。
+    """
+
+    def __init__(self, *, event_id: int, user_id: int, requested: int,
+                 already: int, limit: int):
+        self.event_id = event_id
+        self.user_id = user_id
+        self.requested = requested
+        self.already = already
+        self.limit = limit
+        self.remaining = max(0, limit - already)
+        super().__init__(
+            f"Event {event_id}: limit is {limit} per person; you already hold "
+            f"{already} and requested {requested}"
+        )
+
+
+class NoSeatsAvailable(InventoryError):
+    """這個張數在當下的空段分佈裡配不出來 —— **不等於賣完**。
+
+    `feasible` 帶著「現在配得出來的張數」,呼叫端才能給出可行的替代方案。明明看得到
+    空位卻被告知售完是客服災難的來源,所以這個錯誤必須跟 InsufficientInventory 分開。
+
+    注意不能簡化成「最大連號長度」:只剩一段 5 連號時 4 張是配不出來的(會留下孤兒),
+    回報 max_contiguous=5 然後拒絕 4 張正是誤導。
+    """
+    def __init__(self, *, event_id: int, zone_id: int, quantity: int, feasible: list[int]):
+        self.event_id = event_id
+        self.zone_id = zone_id
+        self.quantity = quantity
+        self.feasible = feasible
+        super().__init__(
+            f"Zone {zone_id} cannot seat {quantity} together; feasible: {feasible}"
+        )
+
+
+class SeatContention(InventoryError):
+    """配位的 CAS 連續撞太多次 —— 暫時性的,重送即可。
+
+    正常流量下出現就是訊號:讀-算-CAS 的時間窗 T 變長了(Redis 飽和、網路變慢),
+    而同時看到同一份快照的請求數 N = QPS × T 跟著上升。該做的是查 T,不是調高重試。
+    """
+    def __init__(self, *, event_id: int, zone_id: int, attempts: int):
+        self.event_id = event_id
+        self.zone_id = zone_id
+        self.attempts = attempts
+        super().__init__(f"Zone {zone_id}: seat allocation contended after {attempts} attempts")
+
+
+class SeatPlacementOutOfRun(InventoryError):
+    """配位算出的區間不在它宣稱的空段裡 —— 這是**我們的 bug**,不是競爭。
+
+    以前這個情況回 RETRY,於是重試 5 次之後變成 SeatContention(503 + Retry-After)
+    —— 一個程式錯誤被偽裝成暫時性壅塞,而 503 會讓客戶端一直重送同一個壞請求。
+    分開之後它是 500 並發出告警,但仍然是 DomainError,所以單次入場券會被退還
+    (使用者不該為我們的 bug 重新排隊)。
+    """
+    def __init__(self, *, event_id: int, zone_id: int, block_id: int, start: int, length: int):
+        self.event_id = event_id
+        self.zone_id = zone_id
+        self.block_id = block_id
+        self.start = start
+        self.length = length
+        super().__init__(
+            f"Placement block {block_id} [{start}, {start + length}) is not inside the "
+            f"run it was derived from (event {event_id} zone {zone_id}) — allocator bug"
+        )
+
+
+class SeatReleaseOverlap(InventoryError):
+    """要歸還的區間跟既有空段相交 —— 呼叫端拿錯了區間。
+
+    這不是競爭而是 bug,而且是最危險的一種:硬寫下去會產生兩段互相重疊的空段,
+    於是同一批座位被賣第二次。而 `runs`/`ends` 一致性檢查**抓不到**它(重疊的 runs
+    推導出的 ends 剛好就是實際的 ends),只有跟 DB 比對的 complement 檢查看得見,
+    而那條需要 stream 排空。所以必須在寫入前擋。
+    """
+    def __init__(
+        self, *, event_id: int, zone_id: int, block_id: int,
+        start: int, length: int, reason: str = "intersects a free run",
+    ):
+        self.event_id = event_id
+        self.zone_id = zone_id
+        self.block_id = block_id
+        self.start = start
+        self.length = length
+        self.reason = reason
+        super().__init__(
+            f"Release of block {block_id} [{start}, {start + length}) in zone {zone_id} "
+            f"rejected ({reason}) — the caller has the wrong interval"
+        )
+
+
+class SeatsNotAssigned(OrderError):
+    """這筆訂單還沒有可以公開的座號。
+
+    確認之前刻意不公開:那是 pending hold 能被 compaction 滑動的唯一前提 ——
+    使用者看過的座號就不能再偷偷改。
+    """
+    def __init__(self, order_id: int):
+        self.order_id = order_id
+        super().__init__(f"Order {order_id} has no seats to disclose yet")
+
 
 class AdmissionDenied(DomainError):
     """Order attempted without a valid waiting-room admission token."""

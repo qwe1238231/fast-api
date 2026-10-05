@@ -4,6 +4,14 @@
 *.tfstate.*
 crash.log
 
+# 存檔的 plan(`terraform plan -out=tfplan`)**跟 state 一樣敏感**,而且很容易漏掉:
+# 它是個 zip,所以 `grep whsec_ tfplan` 什麼都找不到 —— 看起來像個無害的二進位檔。
+# 解開之後裡面有 Stripe 金鑰、PII KEK、以及帶主密碼的 DATABASE_URL 全都是明文
+# (2026-08-18 實測確認)。而 `-out=tfplan` 是我們刻意推薦的做法(先審再 apply
+# 同一份計畫),所以這個檔案會**經常**出現在工作目錄裡。
+tfplan
+*.tfplan
+
 # tfvars may hold secrets; commit a *.tfvars.example instead.
 # (.gitignore has NO inline comments — the # must be on its own line, or the
 #  whole rest of the line becomes part of the pattern and matches nothing.)

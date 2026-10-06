@@ -354,6 +354,34 @@ async def test_queue_registration_closed(client, db):
 
 
 @pytest.mark.asyncio
+async def test_queue_rejects_events_that_are_not_published(client, db):
+    """draft 場次的登記窗若剛好是開的,以前排得進去 —— 但放行只排定給 published,
+    所以永遠等不到,而且沒有任何錯誤。現在跟下單一樣回 EventNotOnSale:409 帶
+    event_id,跟「queue not open yet」那種只有 detail 的 409 分得開。cancelled 同理。"""
+    from app.models.event import Event, EventStatus
+
+    headers = await _make_admin_and_login(client, db)
+    event_id = (
+        await client.post("/v1/events/", json=_payload_sale_in(300), headers=headers)
+    ).json()["id"]
+
+    # 還是 draft,而窗是開的(sale 在 5 分鐘後 → 預設 opens 是 5 分鐘前)
+    r = await client.post(f"/v1/events/{event_id}/queue", headers=headers)
+    assert r.status_code == 409
+    assert r.json()["event_id"] == event_id
+
+    await client.post(f"/v1/events/{event_id}/publish", headers=headers)
+    assert (await client.post(f"/v1/events/{event_id}/queue", headers=headers)).status_code == 200
+
+    event = await db.get(Event, event_id)
+    event.status = EventStatus.CANCELLED
+    await db.commit()
+    r = await client.post(f"/v1/events/{event_id}/queue", headers=headers)
+    assert r.status_code == 409
+    assert r.json()["event_id"] == event_id
+
+
+@pytest.mark.asyncio
 async def test_queue_sold_out_stops_admission(client, db, redis):
     event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
     await client.post(f"/v1/events/{event_id}/queue", headers=headers)   # register (rank 0)

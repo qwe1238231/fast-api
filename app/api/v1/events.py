@@ -10,7 +10,7 @@ from app.api.deps import (
     enforce_ip_rate_limit,
 )
 from app.core.config import get_settings
-from app.core.exceptions import EventNotFound
+from app.core.exceptions import EventNotFound, EventNotOnSale
 from app.core.security import create_admission_token
 from app.crud.event import get_event, list_published_events
 from app.db.optimistic import stale_data_as_conflict
@@ -19,7 +19,7 @@ from app.services.event_admin import (
 )
 from app.services.audit import emit_event as emit_audit_event
 from app.services.event_cache import invalidate_event_meta
-from app.models.event import Event
+from app.models.event import Event, EventStatus
 from app.models.seating import EventZonePrice
 from app.schemas.event import (
     EventCreate, EventResponse, EventUpdate, QueueStatusResponse,
@@ -250,6 +250,12 @@ async def join_queue(
     event = await get_event(db, event_id=event_id)
     if event is None:
         raise EventNotFound(event_id=event_id)
+    # 沒發佈(draft / cancelled)的場次不收登記。以前這裡只看時間窗:draft 場次的窗
+    # 若剛好是開的,人排得進去,但放行只排定給 published(waiting_room._admit_start),
+    # 於是永遠等不到 —— 而且沒有任何錯誤,只有「為什麼沒人被放進來」。跟下單路徑
+    # 用同一個例外(services/orders.py 的 EventNotOnSale),使用者看到的是同一種 409。
+    if event.status is not EventStatus.PUBLISHED:
+        raise EventNotOnSale(event_id=event_id)
     now = datetime.now(timezone.utc)
     opens, closes = window(event)
     if now < opens:

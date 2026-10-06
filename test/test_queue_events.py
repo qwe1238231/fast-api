@@ -8,8 +8,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.core.config import get_settings
+from app.models.event import EventStatus
 from app.services import queue_events as qe
 from app.services import waiting_room as wr
+from app.services.event_cache import invalidate_event_meta
 from app.services.inventory import release, reserve, _key
 
 
@@ -31,20 +33,26 @@ def _poke_spy(monkeypatch) -> list[int]:
 async def test_admit_deadline_matches_admission_formula(redis, published_event):
     eid = published_event.id
     await redis.zadd(wr._draw_key(eid), {"1": 0.0, "2": 1.0})   # user 1 rank 0, user 2 rank 1
-    await redis.set(wr._admit_start_key(eid), 1000.0)
+    # 放行起點 = 登記窗的實效關閉時間,從 event meta 推導 —— 不再是一把獨立的 key。
+    start = wr.window(published_event)[1].timestamp()
     rate = get_settings().QUEUE_ADMISSION_RATE
 
-    assert await wr.admit_deadline(redis, event_id=eid, user_id=1) == pytest.approx(1000.0 + 1 / rate)
-    assert await wr.admit_deadline(redis, event_id=eid, user_id=2) == pytest.approx(1000.0 + 2 / rate)
+    assert await wr.admit_deadline(redis, event_id=eid, user_id=1) == pytest.approx(start + 1 / rate)
+    assert await wr.admit_deadline(redis, event_id=eid, user_id=2) == pytest.approx(start + 2 / rate)
 
 
 @pytest.mark.asyncio
-async def test_admit_deadline_none_when_unscheduled_or_unregistered(redis, published_event):
+async def test_admit_deadline_none_when_unscheduled_or_unregistered(redis, published_event, db):
     eid = published_event.id
     await redis.zadd(wr._draw_key(eid), {"1": 0.0})
-    assert await wr.admit_deadline(redis, event_id=eid, user_id=1) is None   # no admit_start yet
-    await redis.set(wr._admit_start_key(eid), 1000.0)
     assert await wr.admit_deadline(redis, event_id=eid, user_id=999) is None  # not registered
+
+    # 沒發佈的場次沒有放行時刻:meta 讀得到,但 status 不是 published,抽籤不該開。
+    published_event.status = EventStatus.DRAFT
+    await db.commit()
+    await invalidate_event_meta(redis, event_id=eid)
+    assert await wr.admit_deadline(redis, event_id=eid, user_id=1) is None
+    assert await wr.admit_deadline(redis, event_id=eid + 1_000_000, user_id=1) is None   # no such event
 
 
 # ---------- in-process fan-out: register / wake / coalesce / unregister ----------

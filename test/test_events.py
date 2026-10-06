@@ -248,6 +248,23 @@ async def _publish_event(client, db, payload) -> tuple[int, dict]:
     return event_id, headers
 
 
+async def _close_registration(client, event_id: int, headers: dict, *, seconds_ago: float) -> None:
+    """把登記窗的關閉時間搬到 seconds_ago 秒前 → 放行從那一刻起算,RATE × 秒數個人
+    已經被放進去。
+
+    走 PATCH 而不是直接改 Redis:放行時刻是 event meta 的推導值,沒有獨立的 key 可改
+    (見 waiting_room._admit_start)。這也正是 schema 審查第 24 條的修法 —— 管理員改
+    時間,等候室就跟著動。"""
+    version = (await client.get(f"/v1/events/{event_id}")).json()["version"]
+    closes = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    r = await client.patch(
+        f"/v1/events/{event_id}",
+        json={"version": version, "queue_closes_at": closes.isoformat()},
+        headers=headers,
+    )
+    assert r.status_code == 200, r.text
+
+
 @pytest.mark.asyncio
 async def test_queue_register_and_position(client, db):
     # sale in 5 min → fallback window is OPEN now (opens sale-10m past, closes sale-30s future)
@@ -263,28 +280,26 @@ async def test_queue_register_and_position(client, db):
 
 
 @pytest.mark.asyncio
-async def test_queue_admits_after_window_closes(client, db, redis):
+async def test_queue_admits_after_window_closes(client, db):
     event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
     await client.post(f"/v1/events/{event_id}/queue", headers=headers)   # rank 0
 
-    # simulate the window having closed 10s ago → RATE*10 admitted, rank 0 is in
-    past = (datetime.now(timezone.utc) - timedelta(seconds=10)).timestamp()
-    await redis.set(wr._admit_start_key(event_id), past)
+    # the window closed 10s ago → RATE*10 admitted, rank 0 is in
+    await _close_registration(client, event_id, headers, seconds_ago=10)
 
     s = await client.get(f"/v1/events/{event_id}/queue/status", headers=headers)
     assert s.json()["admitted"] is True
 
 
 @pytest.mark.asyncio
-async def test_queue_stream_pushes_admission(client, db, redis):
+async def test_queue_stream_pushes_admission(client, db):
     """The SSE stream emits the admission (+ token) then closes — the push
     alternative to polling /queue/status."""
     import json
 
     event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
     await client.post(f"/v1/events/{event_id}/queue", headers=headers)          # rank 0
-    past = (datetime.now(timezone.utc) - timedelta(seconds=10)).timestamp()
-    await redis.set(wr._admit_start_key(event_id), past)                        # rank 0 admitted
+    await _close_registration(client, event_id, headers, seconds_ago=10)        # rank 0 admitted
 
     async with client.stream("GET", f"/v1/events/{event_id}/queue/stream", headers=headers) as resp:
         assert resp.status_code == 200
@@ -301,15 +316,14 @@ async def test_queue_stream_pushes_admission(client, db, redis):
 
 
 @pytest.mark.asyncio
-async def test_queue_stream_authenticates_via_query_token(client, db, redis):
+async def test_queue_stream_authenticates_via_query_token(client, db):
     """A browser's native EventSource can't send an Authorization header, so the
     stream also accepts the JWT as ?access_token=."""
     import json
 
     event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
     await client.post(f"/v1/events/{event_id}/queue", headers=headers)          # rank 0
-    past = (datetime.now(timezone.utc) - timedelta(seconds=10)).timestamp()
-    await redis.set(wr._admit_start_key(event_id), past)                        # rank 0 admitted
+    await _close_registration(client, event_id, headers, seconds_ago=10)        # rank 0 admitted
 
     token = headers["Authorization"].removeprefix("Bearer ")
     # NO Authorization header — the token rides in the query string
@@ -345,8 +359,7 @@ async def test_queue_sold_out_stops_admission(client, db, redis):
     await client.post(f"/v1/events/{event_id}/queue", headers=headers)   # register (rank 0)
 
     # window closed long ago (would normally admit) BUT inventory exhausted
-    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).timestamp()
-    await redis.set(wr._admit_start_key(event_id), past)
+    await _close_registration(client, event_id, headers, seconds_ago=60)
     await redis.set(f"event:{event_id}:available", 0)
 
     s = (await client.get(f"/v1/events/{event_id}/queue/status", headers=headers)).json()
@@ -360,8 +373,7 @@ async def test_queue_admission_paused_by_circuit_breaker(client, db, redis):
     event_id, headers = await _publish_event(client, db, _payload_sale_in(300))
     await client.post(f"/v1/events/{event_id}/queue", headers=headers)   # register (rank 0)
 
-    past = (datetime.now(timezone.utc) - timedelta(seconds=60)).timestamp()
-    await redis.set(wr._admit_start_key(event_id), past)                 # would admit...
+    await _close_registration(client, event_id, headers, seconds_ago=60)  # would admit...
     await wr.set_admission_paused(redis, True)                           # ...but breaker is open
 
     s = (await client.get(f"/v1/events/{event_id}/queue/status", headers=headers)).json()

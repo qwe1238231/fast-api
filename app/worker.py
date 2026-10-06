@@ -53,7 +53,7 @@ from app.services.seat_runs import (
 )
 from app.services.waiting_room import (
     set_admission_paused,
-    _admit_start_key, _draw_key, _salt_key,
+    _draw_key, _salt_key,
 )
 
 logger = logging.getLogger(__name__)
@@ -1588,14 +1588,14 @@ async def purge_finished_event_keys(
         ).all()
 
         for event_id, zone_id in rows:
-            # 用 waiting_room 自己的 helper 而不是重打字串:上一版漏掉了
-            # queue:{e}:admit_start,而漏掉的原因正是憑印象打 key 格式。
+            # 用 waiting_room 自己的 helper 而不是重打字串:曾經漏掉一把 queue key
+            # (當時的 admit_start,現已改為從 meta 推導、不再落 key),而漏掉的原因
+            # 正是憑印象打 key 格式。
             keys += [
                 _event_available_key(event_id),
                 _purchased_key(event_id),
                 _salt_key(event_id),
                 _draw_key(event_id),
-                _admit_start_key(event_id),
             ]
             if zone_id is not None:
                 keys += [

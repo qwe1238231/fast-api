@@ -72,6 +72,8 @@ async def publish_event(
             await rebuild_zone_runs(
                 db, redis, event_id=event.id, zone_id=zone_id, force=True
             )
-    await setup_waiting_room(redis, event)          # fix salt + admission-start for the queue
+    await setup_waiting_room(redis, event)          # fix the lottery salt
+    # 這一行同時也是「排定放行」:放行時刻從 meta 推導(waiting_room._admit_start),
+    # 清掉舊的 draft meta,下一次讀就是 published 的窗。
     await invalidate_event_meta(redis, event_id=event.id)
     return event

@@ -18,6 +18,8 @@ resource "aws_secretsmanager_secret_version" "app" {
   secret_string = jsonencode({
     SECRET_KEY            = var.app_secret_key
     PII_KEK_BASE64        = var.pii_kek_base64
+    PII_KEK_VERSION       = tostring(var.pii_kek_version)
+    PII_KEK_RETIRED       = var.pii_kek_retired
     PII_LOOKUP_KEY_BASE64 = var.pii_lookup_key_base64
     STRIPE_SECRET_KEY     = var.stripe_secret_key
     STRIPE_WEBHOOK_SECRET = var.stripe_webhook_secret

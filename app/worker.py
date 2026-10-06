@@ -44,6 +44,8 @@ from app.models.audit_log import DEFAULT_PARTITION, AuditLog, partition_name
 from app.models.outbox import SEAT_RELEASE, OutboxEntry
 from app.services.audit import AUDIT_STREAM_KEY, AUDIT_STREAM_MAX_LEN
 from app.models.event import Event, EventStatus
+from app.models.buyer_info import BuyerInfo
+from app.services.pii import PiiKeyVersionUnknown, active_kek_version, rewrap_dek
 from app.services.inventory import (
     compute_expected_available, compute_expected_quotas,
     oldest_intent_age_seconds, read_available, read_purchase_quotas,
@@ -1601,6 +1603,72 @@ EVENT_KEY_RETENTION_DAYS = 7
 EVENT_KEY_PURGE_WINDOW_DAYS = 30
 
 
+PII_REWRAP_BATCH = 500
+PII_REWRAP_MAX_BATCHES = 20
+
+
+@cron_job
+async def rewrap_pii_keks(
+    ctx: dict, *, batch: int = PII_REWRAP_BATCH, max_batches: int = PII_REWRAP_MAX_BATCHES
+) -> int:
+    """Cron job:把還掛在退役 KEK 上的 buyer_info 列重包到現役版本。回傳改了幾列。
+
+    輪替的背景那一半(前景是改三個設定 + 滾動部署,見 infra/RUNBOOK.md 情境 E):每列只動
+    dek_encrypted 與 kek_version,密文不碰。平常 SELECT 一次就結束(沒有舊版的列),只有
+    輪替後那幾輪才真的有事做。
+
+    **刻意不在部署當下跑、也不一次做完**:滾動期間舊 task 還只認舊版,它們讀到已經換成
+    新版的列會失敗。15 分鐘一輪、每輪 20 批 × 500 列的上限讓它在滾動結束後才真正追上,
+    而且每批自己一個交易、FOR UPDATE SKIP LOCKED,跟線上的讀寫互不卡。
+
+    列上的版本不在 keyring 裡(退役鑰匙被太早清掉)→ 那幾列跳過、整輪結束時發一次
+    alert(needs_human),其餘的列照常處理。把鑰匙放回 PII_KEK_RETIRED,下一輪就接手。
+    """
+    active = active_kek_version()
+    done = 0
+    unknown: set[int] = set()
+    for _ in range(max_batches):
+        async with AsyncSessionLocal() as db:
+            stmt = (
+                select(BuyerInfo)
+                .where(BuyerInfo.kek_version != active)
+                .limit(batch)
+                .with_for_update(skip_locked=True)
+            )
+            if unknown:
+                stmt = stmt.where(BuyerInfo.kek_version.not_in(unknown))
+            rows = (await db.scalars(stmt)).all()
+            if not rows:
+                break
+            changed = 0
+            for row in rows:
+                try:
+                    row.national_id_dek_encrypted, row.kek_version = rewrap_dek(
+                        row.national_id_dek_encrypted, kek_version=row.kek_version
+                    )
+                    changed += 1
+                except PiiKeyVersionUnknown as exc:
+                    unknown.add(exc.version)
+            await db.commit()
+            done += changed
+            if not changed:
+                break                      # 這一批全是解不開的版本,再撈也是同一批
+    if unknown:
+        alert(
+            logger,
+            "buyer_info rows are wrapped with KEK versions this process does not hold",
+            event="pii_kek_version_unknown",
+            kek_versions=sorted(unknown),
+            active_version=active,
+        )
+    if done:
+        logger.info(
+            "rewrapped buyer_info DEKs onto the active KEK",
+            extra={"event": "pii_rewrapped", "rows": done, "kek_version": active},
+        )
+    return done
+
+
 @cron_job
 async def purge_finished_event_keys(
     ctx: dict,
@@ -1884,6 +1952,9 @@ class WorkerSettings:
         cron(detect_inventory_drift, minute=set(range(0, 60, 5))),
         cron(detect_seat_structure_drift, minute=set(range(0, 60, 5))),
         cron(purge_finished_event_keys, hour={3}, minute={30}),
+        # KEK 輪替的背景那一半;平常一次 SELECT 就結束。15 分鐘一輪是給滾動部署留空檔,
+        # 理由在函式 docstring。
+        cron(rewrap_pii_keks, minute={5, 20, 35, 50}),
 
     ]
 

@@ -48,6 +48,7 @@ async def get_my_buyer_info(
     national_id = decrypt_pii(
         info.national_id_ciphertext,
         info.national_id_dek_encrypted,
+        kek_version=info.kek_version,      # 這一列是哪一版 KEK 包的,鑰匙按它挑
     )
     
     return BuyerInfoResponse(

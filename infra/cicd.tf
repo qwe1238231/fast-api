@@ -87,18 +87,29 @@ data "aws_iam_policy_document" "cicd" {
     resources = ["${aws_cloudwatch_log_group.app.arn}:*"]
   }
   # 帶 migration 的部署要先拍一張還原點快照(deploy.yml 的 "Snapshot the database
-  # before migrating")。**沒有 AddTagsToResource** 是刻意的:CI 那邊不帶 --tags,
-  # 快照的標籤由實例的 copy_tags_to_snapshot 帶過來 —— 這個專案已經被「plan 綠、
-  # apply 因為缺 Tag 權限而炸」咬過一次。
+  # before migrating")。
   #
-  # 只給 Create/Describe,**不給 Delete**:清理舊快照是人的決定(它們是還原點),
+  # AddTagsToResource **必須給**,即使 CI 不帶 --tags:實例開著 copy_tags_to_snapshot,
+  # CreateDBSnapshot 會自己對新快照打標籤,那一步以呼叫者的身分做。這裡原本寫著
+  # 「沒有 AddTagsToResource 是刻意的」—— 2026-10-06 全新環境的第一次 CD 就死在這裡
+  # (CloudTrail:AccessDenied rds:AddTagsToResource on snapshot:...-premigration-84be447f),
+  # 而且 plan / validate 全綠。限定在 premigration 快照的 ARN 上,不是整個帳號。
+  #
+  # DescribeDBInstances 是給 `aws rds wait db-instance-available` 用的:剛建好 / 剛還原的
+  # 實例在做第一次自動備份(backing-up)時 CreateDBSnapshot 也會被拒,CI 要先等它。
+  #
+  # 只給 Create/Describe/Tag,**不給 Delete**:清理舊快照是人的決定(它們是還原點),
   # 而一個能刪快照的 CI 憑證會讓「備份」這件事失去意義。
   statement {
-    actions = ["rds:CreateDBSnapshot", "rds:DescribeDBSnapshots"]
+    actions = ["rds:CreateDBSnapshot", "rds:DescribeDBSnapshots", "rds:DescribeDBInstances"]
     resources = [
       aws_db_instance.main.arn,
       "arn:aws:rds:${var.region}:${data.aws_caller_identity.current.account_id}:snapshot:${var.project}-db-premigration-*",
     ]
+  }
+  statement {
+    actions   = ["rds:AddTagsToResource"]
+    resources = ["arn:aws:rds:${var.region}:${data.aws_caller_identity.current.account_id}:snapshot:${var.project}-db-premigration-*"]
   }
   # 部署後的煙霧測試要先問出 ALB 的 DNS 名稱才打得到 /health/deps。
   # DescribeLoadBalancers 不支援資源層級的授權(只能 "*"),但它是純唯讀。

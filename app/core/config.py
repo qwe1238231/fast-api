@@ -216,6 +216,20 @@ class Settings(BaseSettings):
     QUEUE_ADMISSION_RATE: int = 500             # users admitted per second (the gatekeeper throttle)
     QUEUE_ADMISSION_TOKEN_TTL_SECONDS: int = 120  # admitted buyers must complete within this window
     QUEUE_JOIN_LIMIT_PER_MINUTE: int = 30         # anti-hammer cap on queue-join per user per event
+    ORDER_SUBMIT_LIMIT_PER_MINUTE: int = 10
+    """POST /orders 的每帳號每分鐘上限。
+
+    擋的是一條具體可利用的迴圈:下單失敗會把入場券還回去(那是對的 —— 改張數重試
+    不該重新排隊),但端點本身沒有限流的話,「送 → 被拒 → 退券 → 再送」可以在券的
+    120 秒 TTL 內無限次打最貴的路徑(座位場次整段 read-compute-CAS)。人改兩三次
+    張數就夠了:10 對人很寬,對腳本很緊。
+
+    按帳號不按 IP:端點本來就要登入,而搶票現場的 NAT 後面是一整群真人。
+
+    壓測注意:loadtest/order_flow.js 的 bypass 模式會循環重用帳號,每帳號每分鐘
+    超過這個數就回 429 把 http_req_failed 門檻弄紅。跑它要 RATE_LIMIT_ENABLED=False
+    或把 N_USERS 加大 —— 說明在那支腳本的開頭。
+    """
     # Circuit breaker: pause admission when the downstream order pipeline is unhealthy.
     ADMISSION_PAUSE_NEW_DEAD_LETTERS: int = 100
     """一次檢查(每分鐘)之內**新增**幾筆死信就暫停放行。

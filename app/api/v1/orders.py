@@ -18,6 +18,7 @@ from app.crud.order import get_order_by_id, get_order_by_idempotency_key, list_o
 from app.schemas.payment import PaymentIntentResponse
 from app.schemas.seating import SeatedOrderDetail
 from app.services.zones import describe_order_seats
+from app.services.rate_limit import enforce_rate_limit
 from app.services.stripe_client import cancel_payment_intent, create_payment_intent
 from app.services.waiting_room import refund_admission, verify_admission
 
@@ -44,7 +45,21 @@ async def create_endpoint(
     Requires a valid waiting-room admission token for this event (checked before
     any reserve work, so non-admitted requests are bounced cheaply). Returns 202
     immediately — the order row is written asynchronously by the worker.
+
+    Per-user rate limit first (ORDER_SUBMIT_LIMIT_PER_MINUTE): the refund-on-failure
+    below is correct, but without a cap it turns one admission token into an
+    unbounded number of expensive attempts within the token's TTL.
     """
+    # 限流在 verify_admission **之前**:被擋下的請求不碰入場券(不消耗,所以也沒有
+    # 退券的問題),而且一次 Redis INCR 就結束 —— 它是整條路徑最便宜的一步,擋在最
+    # 前面才省得到東西。放進下面的 try 也行得通(RateLimited 是 DomainError,會退券),
+    # 但那樣每次 429 都先 SETNX 再 DEL,白做兩次 Redis 往返。
+    await enforce_rate_limit(
+        redis,
+        f"order:{current_user.id}",
+        limit=get_settings().ORDER_SUBMIT_LIMIT_PER_MINUTE,
+        window_seconds=60,
+    )
     # Bypass is guarded in Settings (only honoured under DEBUG); in prod this
     # branch is dead and every order goes through admission verification.
     jti: str | None = None

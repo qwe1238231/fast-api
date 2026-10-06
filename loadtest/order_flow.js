@@ -31,6 +31,12 @@ const soldOut = new Counter('orders_sold_out');    // 409 且真的沒票
 // 所以同一個人第 5 筆起就會撞到每人限購 —— 全部記進 orders_sold_out 的話,壓測的
 // 主要指標(賣完了幾筆)會被安靜地灌水,而且看起來完全正常。
 // 這個計數器不是 0 就代表:帳號數不夠,要調大 seed.py 的 N_USERS。
+//
+// 同一個帳號被重用還會撞第二道牆:POST /orders 有每帳號每分鐘的限流
+// (ORDER_SUBMIT_LIMIT_PER_MINUTE,預設 10),第 11 筆起回 429 —— 不在 expectedStatuses
+// 裡,會直接算進 http_req_failed 讓門檻紅掉(刻意的:它不該被安靜吞掉)。跑這支
+// 要嘛 N_USERS 大到每帳號每分鐘不超過 10 筆,要嘛 .env 設 RATE_LIMIT_ENABLED=False
+// (跟 LOADTEST_BYPASS_ADMISSION 一樣是 DEBUG 下的壓測開關,跑完記得還原)。
 const overLimit = new Counter('orders_over_limit');
 
 const MODE = __ENV.MODE || 'knee';

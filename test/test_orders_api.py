@@ -6,6 +6,7 @@ from sqlalchemy import select
 from app.core.security import create_admission_token
 from app.models.user import User
 from app.services.inventory import get_available
+from app.services.rate_limit import clear as clear_rate_limit
 
 
 async def auth_headers(client, username="alice"):
@@ -167,6 +168,38 @@ async def test_order_rejects_replayed_token(client, db, published_event):
                            headers={**common, "Idempotency-Key": str(uuid4())})
     assert r1.status_code == 202
     assert r2.status_code == 403                               # single-use: same token reused
+
+
+@pytest.mark.asyncio
+async def test_order_submit_is_rate_limited_per_user(
+    client, db, published_event, redis, monkeypatch, rate_limiting
+):
+    """一張入場券以前可以換無限次昂貴請求:下單失敗會退券(那是對的),但端點沒有
+    任何限流,於是「送 → 被拒 → 退券 → 再送」可以在券的 120 秒 TTL 內無限迴圈,
+    最貴的是座位場次整段 read-compute-CAS。
+
+    限流掛在 verify_admission **之前**:429 不消耗券也不退券,「被消耗 ⟺ 訂單意圖
+    已受理」的不變式不受影響 —— 第二段就是在驗這件事。"""
+    monkeypatch.setattr(rate_limiting, "ORDER_SUBMIT_LIMIT_PER_MINUTE", 2)
+    bearer, uid = await _authed(client, db)
+
+    codes: list[int] = []
+    headers = {}
+    for _ in range(3):
+        headers = _buy_headers(bearer, uid, published_event.id)    # 每次一張新券
+        r = await client.post(
+            "/v1/orders/", json={"event_id": published_event.id, "quantity": 1}, headers=headers
+        )
+        codes.append(r.status_code)
+    assert codes == [202, 202, 429]
+
+    # 被 429 擋下的那張券沒被碰過:放開限流後,同一張券、同一個 Idempotency-Key
+    # 原樣再送就是 202。若限流放在 verify_admission 之後,這裡會是 403(券已用過)。
+    await clear_rate_limit(redis, f"order:{uid}")
+    retry = await client.post(
+        "/v1/orders/", json={"event_id": published_event.id, "quantity": 1}, headers=headers
+    )
+    assert retry.status_code == 202, retry.text
 
 
 # --- admission token 的退還 ----------------------------------------------

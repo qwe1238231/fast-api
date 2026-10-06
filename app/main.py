@@ -15,6 +15,7 @@ from app.api.middleware import (
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.core.redis import create_redis_client
+from app.core.tracing import configure_tracing
 from app.services.queue_events import run_subscriber
 from app.services.stripe_client import create_stripe_client
 from app.api.v1.router import api_router
@@ -25,6 +26,7 @@ from app.api.exception_handlers import register_exception_handlers
 #: 一樣,而我們想知道的是「哪一個依賴壞了」。
 _DEPS_PROBE_TIMEOUT_SECONDS = 2.0
 
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import REGISTRY
 from app.core.queue_metrics import QueueDepthCollector
@@ -35,6 +37,7 @@ async def lifespan(app: FastAPI):
     # 第一件事:uvicorn 已經設好它自己的 logging 才把控制權交到這裡,所以現在覆蓋
     # 才有效(在 import 時做會被它蓋掉)。之後所有輸出都是 JSON 且自動帶 trace_id。
     configure_logging()
+    configure_tracing()          # provider + SQLAlchemy/redis/httpx instrumentors;FastAPI 的在下面
     settings = get_settings()
     app.state.redis = create_redis_client(settings.REDIS_URL)
     app.state.stripe, app.state.stripe_http = create_stripe_client(settings.STRIPE_SECRET_KEY)
@@ -101,6 +104,16 @@ app.add_middleware(
 )
 configure_cors(app, get_settings().cors_allow_origins)
 app.add_middleware(TraceIdMiddleware)
+# OTel 的 server span **不在**上面這張表裡:instrumentor 改寫 build_middleware_stack,把
+# 它包在整個 stack(含 ServerErrorMiddleware)外面,所以 user_middleware 的順序不變、
+# 順序測試也不用動,而 TraceIdMiddleware 跑的時候 server span 已經是 current —— 它拿
+# 那個 id 當 log 的 trace_id(見 core/tracing.py 決定 1)。
+# exclude_spans:不要每個 ASGI send/receive 都開一個子 span —— SSE 一條連線 300 秒會
+# 吐出幾十個,瀑布圖只剩雜訊;server span 本身已經涵蓋整段。health/metrics 不追蹤,
+# 理由同 access log 的排除清單。
+FastAPIInstrumentor.instrument_app(
+    app, excluded_urls="health,metrics", exclude_spans=["receive", "send"]
+)
 REGISTRY.register(QueueDepthCollector())   # order_stream_backlog / order_dead_letter_depth on /metrics
 app.include_router(api_router, prefix="/v1")
 

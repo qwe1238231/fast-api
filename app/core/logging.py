@@ -42,6 +42,8 @@ def new_trace_id() -> str:
     """產生一個新的追蹤 id。
 
     自己產、不接受客戶端指定 —— 理由見 `api/middleware.py` 的 `TraceIdMiddleware`。
+    HTTP 請求進來時 middleware 優先用 OTel server span 的 trace id(core/tracing.py),
+    這個只是沒有 span 時的退路;兩者同為 32 位 hex。
     """
     return uuid4().hex
 

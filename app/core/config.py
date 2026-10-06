@@ -146,6 +146,13 @@ class Settings(BaseSettings):
     寫死的常數 —— 但**打錯字要當場炸**(見下面的 validator),不然 `LOG_LEVEL=INFOO`
     會讓 dictConfig 拋在啟動途中,而錯誤訊息跟「log 設定」看起來毫無關係。"""
 
+    OTEL_EXPORTER_OTLP_ENDPOINT: str | None = None
+    """OTLP/HTTP collector 的位址(例 http://otel-collector:4318)。None = 不匯出 span,
+    但 tracer provider 照設 —— trace id 與 log 的接軌、跨 process 的傳播在本機與測試
+    一樣是活的,只是沒有人收。用標準變數名是為了讓 collector 生態一看就懂;**但值由
+    Settings 交給 exporter**,不靠 SDK 自己讀環境變數 —— .env 裡的值 SDK 看不到。
+    見 core/tracing.py。"""
+
     AUDIT_LOG_RETENTION_DAYS: int = 90
 
     MAX_TICKETS_PER_USER_PER_EVENT: int = 4

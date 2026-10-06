@@ -7,6 +7,9 @@
 靜態,而下單是最熱的路徑。附帶的好處是「這個 zone 能賣給這個場次嗎」變成一次
 dict 查找 —— 見 pricing.load_zone_prices 的白名單語意。
 
+等候室的放行時刻也從這裡推導(waiting_room._admit_start):登記窗的三個輸入都在 meta
+裡,所以 PATCH 改時間 → invalidate_event_meta → 放行跟著動,不需要第二條失效路徑。
+
 **Stampede 防護是兩層,各擋一半:**
 
 1. process 內:`SingleFlight` —— 同一個 event_id 的併發 miss 只有一個 leader 去重算,
@@ -83,6 +86,13 @@ class EventMeta:
     zone_prices: dict[int, int] = field(default_factory=dict)
     """zone_id → 單價(分)。key 存在 == 該區屬於本場館且已設價,可以賣。"""
 
+    queue_opens_at: datetime | None = None
+    queue_closes_at: datetime | None = None
+    """等候室登記窗的顯式邊界;NULL 的那側由 sale_starts_at 推導(見
+    waiting_room.effective_window)。放進 meta 是因為**放行時刻從這裡算**
+    (waiting_room._admit_start):它以前是 publish 時 SET 進 Redis 的快照,PATCH 改了
+    時間它不會跟著動;改成推導值之後,這份快取既有的失效路徑就是它的失效路徑。"""
+
 
 #: process 內的合併點。模組層級單例:一個 process 一個事件迴圈,對應一份登記表。
 _flight: SingleFlight[int, EventMeta | None] = SingleFlight()
@@ -96,6 +106,14 @@ def _lock_key(event_id: int) -> str:
     return f"lock:{_key(event_id)}"
 
 
+def _iso(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _from_iso(raw: str | None) -> datetime | None:
+    return datetime.fromisoformat(raw) if raw is not None else None
+
+
 def _encode(event: Event, zone_prices: dict[int, int]) -> str:
     return json.dumps({
         "status": event.status.value,
@@ -104,6 +122,8 @@ def _encode(event: Event, zone_prices: dict[int, int]) -> str:
         "price_cents": event.price_cents,
         "venue_id": event.venue_id,
         "zone_prices": zone_prices,
+        "queue_opens_at": _iso(event.queue_opens_at),
+        "queue_closes_at": _iso(event.queue_closes_at),
     })
 
 
@@ -119,6 +139,9 @@ def _decode(event_id: int, raw: str) -> EventMeta:
         # JSON 的物件 key 一定是字串,轉回 int 否則每次查找都 miss ——
         # 那會讓每一個 zone 都變成「不可賣」,而且沒有任何錯誤訊息。
         zone_prices={int(k): v for k, v in d.get("zone_prices", {}).items()},
+        # 舊格式的快取項沒有這兩個 key(部署交界的 60 秒內):get → None → 走預設推導。
+        queue_opens_at=_from_iso(d.get("queue_opens_at")),
+        queue_closes_at=_from_iso(d.get("queue_closes_at")),
     )
 
 
@@ -219,6 +242,8 @@ async def _load_and_fill(redis: Redis, event_id: int) -> EventMeta | None:
         price_cents=event.price_cents,
         venue_id=event.venue_id,
         zone_prices=zone_prices,
+        queue_opens_at=event.queue_opens_at,
+        queue_closes_at=event.queue_closes_at,
     )
 
 

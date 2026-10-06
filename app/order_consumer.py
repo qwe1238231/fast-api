@@ -13,6 +13,7 @@ import signal
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 from app.core.redis import create_redis_client
+from app.core.tracing import configure_tracing
 from app.worker import (
     ensure_consumer_group,
     run_order_consumer_loop,
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 async def main() -> None:
     configure_logging(component="ticket-consumer")
+    configure_tracing(component="ticket-consumer")
     redis = create_redis_client(get_settings().REDIS_URL)
     await ensure_consumer_group(redis, ORDER_STREAM_KEY, ORDER_CONSUMER_GROUP)
 

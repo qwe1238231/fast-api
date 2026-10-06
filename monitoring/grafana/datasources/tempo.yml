@@ -1,0 +1,13 @@
+# Grafana 的 Tempo datasource,由 provisioning 自動建立 —— 開 Explore 選 Tempo 就能查 trace。
+# 只掛 datasources/ 這一個子目錄,不蓋掉整個 provisioning/(dashboards、alerting 那些
+# 子目錄沒有的話 Grafana 會一直抱怨)。Prometheus 的 datasource 不在這裡:它早就在
+# grafana_data volume 裡手動建好了,provisioning 一個同名的會互撞。
+apiVersion: 1
+
+datasources:
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: true

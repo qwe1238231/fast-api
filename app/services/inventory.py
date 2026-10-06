@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from app.core.config import get_settings
 from app.core.exceptions import InsufficientInventory ,EventNotFound,InventoryNotReconcilable
 from app.core.logging import current_trace_id
+from app.core.tracing import current_traceparent
 from app.models.event import Event
 from app.models.order import Order, OrderStatus
 from app.services.idempotency import _key as _claim_key
@@ -137,6 +138,7 @@ async def oldest_intent_age_seconds(redis: Redis, *, now: float | None = None) -
 # ARGV[1]=quantity  ARGV[2]=claim TTL seconds  ARGV[3]=user_id
 # ARGV[4]=event_id  ARGV[5]=total_price_cents  ARGV[6]=idempotency_key
 # ARGV[7]=zone_id ('' = 無座位圖的場次)  ARGV[8]=每人限購張數  ARGV[9]=trace_id
+# ARGV[10]=traceparent(OTel 的 W3C 字串;'' = 沒有有效 span)
 # Returns (a list on the Python side):
 #   {'DUP'}                            -> this idempotency_key was already processed
 #   {'SOLD_OUT', remaining}            -> not enough stock
@@ -180,6 +182,8 @@ redis.call('HINCRBY', KEYS[4], ARGV[3], qty)
 --    trace_id 是**跨 process 的手動搬運**:contextvar 只活在 API 的進程裡,
 --    消費者拿不到,所以它必須跟著訊息本身走(等同 HTTP 的 traceparent header)。
 --    有了它,「下單 → 落帳 → reclaim → 死信」在 log 裡是同一個 id 串起來的一條線。
+--    traceparent 是同一件事在 span 那一側的載體:consumer 用它把落帳的 span 接回
+--    下單那個請求的 server span 底下,瀑布圖才會是一棵樹而不是兩棵。
 local stream_id = redis.call('XADD', KEYS[3], '*',
     'user_id', ARGV[3],
     'event_id', ARGV[4],
@@ -187,7 +191,8 @@ local stream_id = redis.call('XADD', KEYS[3], '*',
     'total_price_cents', ARGV[5],
     'idempotency_key', ARGV[6],
     'zone_id', ARGV[7],
-    'trace_id', ARGV[9])
+    'trace_id', ARGV[9],
+    'traceparent', ARGV[10])
 
 -- 6) Write the claim (with TTL) so the next request with the same key is blocked at step 1.
 redis.call('SET', KEYS[2], 'PENDING', 'EX', tonumber(ARGV[2]))
@@ -456,6 +461,7 @@ async def reserve_and_enqueue(
             # 沒有綁定 context 時是空字串(worker 直接呼叫、測試),消費者那邊
             # 會退回 "-";不要傳 None,Redis 的欄位值只能是字串。
             current_trace_id() or "",       # ARGV[9]
+            current_traceparent(),          # ARGV[10]('' = 沒有有效 span)
         ],
         client=redis,                       # current client (app or test)
     )

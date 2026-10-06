@@ -28,6 +28,8 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://justinhu@db:5432/testdb
       REDIS_URL: redis://redis:6379/0
+      # span 送到 collector(見 monitoring/otel-collector.yml);沒設就不匯出,provider 照設。
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     depends_on:
       db:
         condition: service_healthy
@@ -60,6 +62,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://justinhu@db:5432/testdb
       REDIS_URL: redis://redis:6379/0
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     depends_on:
       db:
         condition: service_healthy
@@ -78,6 +81,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://justinhu@db:5432/testdb
       REDIS_URL: redis://redis:6379/0
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
     depends_on:
       db:
         condition: service_healthy
@@ -98,6 +102,29 @@ services:
       - '--storage.tsdb.retention.time=30d'
     restart: unless-stopped
 
+  # ── 追蹤:app → otel-collector → tempo → grafana(Explore 選 Tempo)────────────
+  # collector 是刻意多的一跳:正式環境這個位置是 ADOT sidecar,app 的設定兩邊一樣。
+  otel-collector:
+    image: otel/opentelemetry-collector:0.115.0
+    volumes:
+      - ./monitoring/otel-collector.yml:/etc/otelcol/config.yaml:ro
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports:
+      - "4318:4318"        # OTLP/HTTP,給本機直接跑(非容器)的 app 用
+    depends_on:
+      - tempo
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    volumes:
+      - ./monitoring/tempo.yml:/etc/tempo.yml:ro
+      - tempo_data:/var/tempo
+    command: ["-config.file=/etc/tempo.yml"]
+    ports:
+      - "3200:3200"        # 查詢 API(Grafana 走內網,這個是給 curl 驗證用)
+    restart: unless-stopped
+
   grafana:
     image: grafana/grafana:latest
     ports:
@@ -107,15 +134,18 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "false"
     volumes:
       - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
     restart: unless-stopped
     depends_on:
       - prometheus
+      - tempo
 
 volumes:
   postgres_data:
   redis_data:
   prometheus_data:
   grafana_data:
+  tempo_data:
 
   
       

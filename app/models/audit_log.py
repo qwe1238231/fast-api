@@ -51,11 +51,17 @@ class AuditLog(Base):
         # 與 purge),它現在純粹是每一筆 INSERT 的額外成本。等真的有查詢端再依實際
         # pattern 建複合索引,而不是先猜。
         #
+        # created_at 的索引同樣不留(9e4d2a7c1f58 刪):唯一按時間切的讀者是
+        # purge_old_audit_logs,而它走 DROP 分區 —— 分區裁剪本身就是那個索引,而且
+        # 是 O(1) 的。單欄 btree 在這張寫入最重的表上每一個分區各維護一份,換來的是
+        # 沒有人下的「某個月內再按時間縮範圍」查詢。等有那種讀者再建。
+        # 注意分區表的索引不能 CONCURRENTLY:建與刪都要在 audit_logs 上拿
+        # ACCESS EXCLUSIVE,所以那支 migration 設了 lock_timeout。
+        #
         # actor_user_id 的索引則保留 —— 它不是為了查詢,是為了 fk_audit_logs_actor
         # _user_id 的 ON DELETE SET NULL:刪一個 user 時 Postgres 要找出所有指向他的
         # 列,沒有索引就是掃過**每一個分區**。
         Index("ix_audit_logs_actor_user_id", "actor_user_id"),
-        Index("ix_audit_logs_created_at", "created_at"),
         {"postgresql_partition_by": "RANGE (created_at)"},
     )
 

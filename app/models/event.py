@@ -15,6 +15,12 @@ class EventStatus(str, Enum):
 class Event(Base):
     __tablename__ = "events"
     __table_args__ = (
+        # 這張表沒有任何查詢用的索引,刻意的。公開列表 list_published_events 是
+        # `WHERE status = 'published' ORDER BY sale_starts_at`,events 只有幾百列,
+        # 這種大小 planner 選 seq scan + sort 是對的;單場的讀取走 PK 與 event_cache。
+        # 等場次數上到幾萬列、而且這條查詢真的出現在慢查詢裡,再建
+        # `(sale_starts_at) WHERE status = 'published'` 的 partial —— 不要先猜。
+        #
         # total_seats is the ceiling the whole oversell / inventory-reconcile logic
         # trusts; a 0/negative from an admin typo would poison it. Guard at the DB.
         CheckConstraint("total_seats > 0", name="ck_events_total_seats_pos"),
@@ -52,8 +58,13 @@ class Event(Base):
     # 非座位場次沒有 venue_id,這個字串是它們唯一的場地資訊 —— 下架等於逼所有
     # 場次建 venue 列,那是功能決策不是 schema 清理。座位場次以 venue_id 為準,
     # 字串僅供顯示,兩者不同步時以 venue_id 那條鏈為權威。
+    #
+    # 不加 index(原本的 ix_events_venue_id 由 9e4d2a7c1f58 刪):沒有任何查詢按
+    # venue_id 過濾(只有 SELECT 它),venues 不刪所以 FK 的 RI 反查不會發生,而
+    # events 只有幾百列 —— 這種大小 planner 本來就選 seq scan。它是建表時順手加的,
+    # 從來沒有讀者;留著只會讓下一個人以為它有。
     venue_id: Mapped[int | None] = mapped_column(
-        ForeignKey("venues.id"), nullable=True, index=True
+        ForeignKey("venues.id"), nullable=True
     )
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

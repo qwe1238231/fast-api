@@ -1070,6 +1070,33 @@ def test_the_restore_lever_and_its_escape_hatch_stay_in_sync() -> None:
     )
 
 
+def test_the_snapshot_step_waits_for_the_instance_to_be_available(deploy) -> None:
+    """快照那一步在全新環境上有兩種只有真機才看得到的死法,2026-10-06 第一次部署踩到
+    其中一種,症狀只有 deploy 紅了 —— 服務靠 :latest 映像自己活起來,app 是新碼、
+    schema 是空的:
+
+      1. `copy_tags_to_snapshot = true` 讓 CreateDBSnapshot 隱含呼叫 AddTagsToResource,
+         就算 CLI 不帶 --tags 也要那條權限(CloudTrail:AccessDenied rds:AddTagsToResource)。
+      2. 剛建好 / 剛還原的實例在做第一次自動備份(backing-up)時 CreateDBSnapshot 會被拒。
+         這次差五分鐘沒撞上,但下次會。
+
+    所以 CI role 要有 AddTagsToResource(限定 premigration 快照),快照之前要先等
+    available,而 waiter 用的 DescribeDBInstances 也要在政策裡。"""
+    step = _steps(deploy)[_step_index(deploy, "Snapshot the database")]
+    run = step["run"]
+    wait_at = run.find("rds wait db-instance-available")
+    create_at = run.find("rds create-db-snapshot")
+    assert wait_at != -1, "快照之前要 `aws rds wait db-instance-available`"
+    assert wait_at < create_at, "等 available 必須在 create-db-snapshot 之前"
+    policy = _code(CICD_TF)
+    assert "rds:DescribeDBInstances" in policy, (
+        "waiter 走 DescribeDBInstances,CI role 沒有這條就會在等待時被拒"
+    )
+    assert "rds:AddTagsToResource" in policy, (
+        "copy_tags_to_snapshot 讓 CreateDBSnapshot 需要 AddTagsToResource —— 缺了就是 AccessDenied"
+    )
+
+
 def test_a_migration_deploy_takes_a_restore_point_before_migrating(deploy) -> None:
     """快照那一步必須**排在 migration 之前**。
 
@@ -1095,14 +1122,23 @@ def test_ci_can_create_snapshots_but_not_delete_them() -> None:
     清理舊快照是人的決定(它們就是還原點)。一個能刪快照的 CI 憑證會讓「有備份」這件事
     退化成「有備份,除非哪次部署腳本寫錯」。
 
-    也不能有 `rds:AddTagsToResource` —— CI 那邊刻意不帶 `--tags`,快照的標籤由實例的
-    `copy_tags_to_snapshot` 帶過來。這是上次 autoscaling 那個「plan 綠、apply 因為缺
-    Tag 權限而炸」的教訓。
+    `rds:AddTagsToResource` **要有,但只能限定在 premigration 快照的 ARN 上**。這條測試
+    原本斷言「不能有」:以為 CI 不帶 `--tags` 就用不到。錯了 —— 實例開著
+    `copy_tags_to_snapshot`,CreateDBSnapshot 會以呼叫者的身分對新快照打標籤,2026-10-06
+    全新環境的第一次 CD 就是這樣 AccessDenied 的(plan / validate 全綠)。原本那個
+    「plan 綠、apply 才炸」的教訓反而在這裡重演了一次,方向相反。
     """
-    assert "rds:CreateDBSnapshot" in CICD_TF
-    assert "rds:DescribeDBSnapshots" in CICD_TF
-    for forbidden in ("rds:DeleteDBSnapshot", "rds:DeleteDBInstance", "rds:AddTagsToResource"):
-        assert forbidden not in CICD_TF, f"CD 不該有 {forbidden}"
+    policy = _code(CICD_TF)
+    assert "rds:CreateDBSnapshot" in policy
+    assert "rds:DescribeDBSnapshots" in policy
+    for forbidden in ("rds:DeleteDBSnapshot", "rds:DeleteDBInstance"):
+        assert forbidden not in policy, f"CD 不該有 {forbidden}"
+
+    tag_statements = [s for s in policy.split("statement {") if "rds:AddTagsToResource" in s]
+    assert len(tag_statements) == 1, "AddTagsToResource 要在一條自己的 statement 裡,才限得住範圍"
+    assert '"*"' not in tag_statements[0] and "premigration-*" in tag_statements[0], (
+        "AddTagsToResource 只能對 premigration 快照,不能是整個帳號"
+    )
 
 
 def test_the_worker_pool_covers_its_declared_job_concurrency() -> None:

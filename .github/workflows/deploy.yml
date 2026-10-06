@@ -125,14 +125,22 @@ jobs:
             exit 0
           fi
 
+          # 剛建好(或剛從快照還原)的實例會先做一次自動備份,狀態是 backing-up,這時
+          # CreateDBSnapshot 會被拒(InvalidDBInstanceState)。2026-10-06 的全新環境差五分鐘
+          # 沒撞上這個,撞上的是下面那個 tag 權限 —— 兩個都是「deploy 紅了,服務卻靠
+          # :latest 映像自己活起來,app 是新碼、schema 是空的」。等它 available 再拍;
+          # 常態下這一步是零秒。需要 rds:DescribeDBInstances(cicd.tf)。
+          aws rds wait db-instance-available --db-instance-identifier "$CLUSTER-db"
+
           snap="$CLUSTER-db-premigration-${GITHUB_SHA:0:8}"
           # 已存在就沿用(重跑同一個 SHA 的部署不該失敗)。
           if aws rds describe-db-snapshots --db-snapshot-identifier "$snap" >/dev/null 2>&1; then
             echo "snapshot $snap already exists — reusing it"
           else
-            # 刻意**不帶** --tags:那會需要 rds:AddTagsToResource,而這個專案已經被
-            # 「plan 綠、apply 因為缺 Tag 權限而炸」咬過一次(見 variables.tf 的
-            # enable_consumer_autoscaling)。實例的 tag 會由 copy_tags_to_snapshot 帶過來。
+            # 不帶 --tags,但 CI role **仍然要有** rds:AddTagsToResource:實例開著
+            # copy_tags_to_snapshot,CreateDBSnapshot 會以呼叫者的身分對新快照打標籤。
+            # 這裡原本以為不帶 --tags 就不需要那條權限 —— 2026-10-06 全新環境的第一次
+            # CD 就是這樣被 AccessDenied 的,plan / validate 都看不到(cicd.tf)。
             aws rds create-db-snapshot \
               --db-instance-identifier "$CLUSTER-db" \
               --db-snapshot-identifier "$snap" >/dev/null

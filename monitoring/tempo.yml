@@ -1,0 +1,25 @@
+# 本地的 Tempo(trace 儲存 + 查詢),Grafana 的 Tempo datasource 指向它的 3200。
+# 單機、本地磁碟、48 小時保留 —— 這是開發用的,不是正式環境的形狀(那邊是 X-Ray)。
+server:
+  http_listen_port: 3200
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/blocks
+    wal:
+      path: /var/tempo/wal
+
+compactor:
+  compaction:
+    block_retention: 48h

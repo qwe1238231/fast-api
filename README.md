@@ -48,7 +48,7 @@
 | 認證 | **PyJWT**(HS256 access token)+ 自製 refresh token 輪替 + 自製 Redis 固定視窗限流 |
 | 金流 | **Stripe**(PaymentIntent + webhook 簽章驗證 + 事件去重) |
 | 資料驗證 | **Pydantic v2** / pydantic-settings(fail-closed 啟動驗證) |
-| 可觀測性 | JSON 結構化日誌 + trace id、**Prometheus** + **Grafana**(本地)、**CloudWatch**(AWS) |
+| 可觀測性 | JSON 結構化日誌 + trace id、**OpenTelemetry** 分散式追蹤(→ Tempo,本地)、**Prometheus** + **Grafana**(本地)、**CloudWatch**(AWS) |
 | 壓測 | **k6**(open-model arrival-rate、thresholds、A/B 模式) |
 | 容器 | **Docker** 多階段建置(Rust builder → Python builder → 非 root runtime) |
 | 基礎設施 | **Terraform**:ECS Fargate + RDS + ElastiCache + ALB + Secrets Manager(AWS Seoul) |
@@ -80,6 +80,7 @@
                                             └────────────────┘ └──────────────────────────┘
 
   可觀測性:/metrics → Prometheus → Grafana(本地);JSON log → CloudWatch metric filter → alarm(AWS)
+              OTel span → otel-collector → Tempo → Grafana Explore(本地;正式環境改接 ADOT sidecar)
 ```
 
 **分層原則**:`core/` 不依賴 FastAPI;`api/` 負責所有框架轉接(`Depends`、`HTTPException`、middleware);`services/` 放業務規則(狀態機、庫存、配位、付款);`crud/` 只做純資料存取。
@@ -213,6 +214,7 @@ API(emit_event)──XADD──▶ Redis Stream "audit:events"(~1ms)
 - **Middleware 順序由測試釘死**(外→內):`TraceId` → `CORS` → `BodySizeLimit` → `RequestTimeout` → Prometheus → router。
 - **trace id 一律由伺服器產生**,不信任 client 帶來的;ALB 的 `X-Amzn-Trace-Id` 只在 `TRUSTED_PROXY_COUNT > 0` 時以附加欄位記錄。trace id 跟著 `XADD` 進 Stream,worker 消費時重新綁定,一筆訂單從請求到落地可以串起來。
 - **JSON 結構化日誌**:欄位由 `contextvars` 綁定,CloudWatch metric filter 直接比對 `event` 欄位(如 `inventory_drift`),不是 grep 文字。
+- **OpenTelemetry 追蹤**(`core/tracing.py`):FastAPI / SQLAlchemy / redis / httpx 自動 instrument,log 的 trace id 就是 span 的 trace id,從瀑布圖可直接跳到那筆請求的 log。入站 `traceparent` 一律不接續(propagator 只注入不提取);`XADD` 多帶 `traceparent`,consumer 落帳的 span 接在下單請求的 server span 底下;每次 cron 執行是一個 root span。沒設 `OTEL_EXPORTER_OTLP_ENDPOINT` 就不匯出。
 - **請求護欄**:body 上限 1 MiB 回 413;逾時只管到 `http.response.start` 回 504,所以 SSE 不會被切;連線層帶 `idle_in_transaction_session_timeout` 與 `lock_timeout`,`statement_timeout` 只給 API task,worker 要跑長 cron 與 migration。
 - **兩種健康檢查**:`/health` 只證明 process 活著,給 ALB 用,免得共用 DB 一抖就讓每個 target 一起被判死;`/health/deps` 真的 `SELECT 1` + `PING`,回 200 或 503,給值班人與部署 smoke test 用。
 - **指標**:HTTP 指標之外,API 行程在 scrape 時讀 `XLEN` 匯出 `order_stream_backlog` 與 `order_dead_letter_depth`;座位 CAS 與快取 flight 各有自己的 counter。
@@ -398,7 +400,7 @@ docker compose up -d --build
 docker compose exec api alembic upgrade head
 ```
 
-會起 7 個容器:`api`(:8000,4 workers)、`worker`(arq)、`order-consumer`、`db`(:5432)、`redis`(:6380)、`prometheus`(:9090)、`grafana`(:3000)。
+會起 9 個容器:`api`(:8000,4 workers)、`worker`(arq)、`order-consumer`、`db`(:5432)、`redis`(:6380)、`prometheus`(:9090)、`grafana`(:3000)、`otel-collector`(:4318)、`tempo`(:3200)。
 
 ```bash
 curl -i localhost:8000/health/deps   # 200 {"status":"ok"} → DB 與 Redis 都通
@@ -500,6 +502,7 @@ k6 run loadtest/cache_stampede.js                 # 冷 key 同時打一波;量�
 ## 監控
 
 - 本地:`/metrics` → Prometheus(`monitoring/prometheus.yml`)→ Grafana;告警規則在 [`monitoring/alerts.yml`](monitoring/alerts.yml)(座位 CAS 視窗、重試率、耗盡)。
+- 本地追蹤:span → `otel-collector`(`monitoring/otel-collector.yml`)→ Tempo(`monitoring/tempo.yml`,48h)→ Grafana **Explore** 選 Tempo datasource(provisioning 自動建),用回應的 `X-Request-Id` 當 trace id 查。
 - AWS:JSON log → CloudWatch metric filter → alarm;worker 以 gauge 回報積壓、死信、`sale_imminent`。
 - 應用層 `alert(...)` 是結構化 log 事件,不是另一條管線;所有「需要人」的情況(outbox 死信、drift、退款失敗、資源不存在)都走這裡。
 

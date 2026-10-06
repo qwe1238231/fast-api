@@ -1,0 +1,31 @@
+# 本地的 OpenTelemetry collector:app 把 span 送到這裡(OTLP/HTTP 4318),它轉送給 Tempo。
+#
+# 為什麼不讓 app 直接送 Tempo(它也收 OTLP):collector 這一跳是**跟正式環境對齊的形狀**。
+# ECS 上這個位置會是 ADOT sidecar(一樣是 collector),app 那邊的設定
+# (OTEL_EXPORTER_OTLP_ENDPOINT 指向 localhost:4318)兩邊一字不差;之後要 tail sampling、
+# 加 resource attribute、分流到別的後端,都在這一層做,app 不用動。
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # 攢一批再送,跟 SDK 端的 BatchSpanProcessor 是同一個理由:尖峰時每秒幾千個 span,
+  # 一個一個送是在用 HTTP 往返數打自己。
+  batch: {}
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true          # compose 內網,沒有憑證
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]

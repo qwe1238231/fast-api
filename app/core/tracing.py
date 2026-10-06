@@ -44,6 +44,7 @@ from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 from opentelemetry.propagators.textmap import (
     CarrierT, Getter, Setter, TextMapPropagator, default_getter, default_setter,
 )
+from opentelemetry.sdk.extension.aws.trace import AwsXRayIdGenerator
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -168,6 +169,12 @@ def configure_tracing(*, component: str | None = None) -> None:
         resource=Resource.create({SERVICE_NAME: name}),
         # root 由 _NoOrphanClientRoots 決定(CLIENT root 丟掉、其他全收),子 span 跟父節點。
         sampler=ParentBased(root=_NoOrphanClientRoots()),
+        # trace id 用 X-Ray 的形狀:前 8 個 hex 是 epoch 秒、後 24 個隨機。X-Ray **拒收**
+        # 純隨機的 id,而且是 collector 那一側整批丟掉、只在它自己的 log 裡抱怨 —— 本地
+        # Tempo 不在乎,所以這個坑只有上 AWS 才踩得到。到處都用這個形狀是刻意的:仍是
+        # 32 位 hex、仍有 96 bits 隨機,log 的 trace_id 與本地 Tempo 完全不受影響,而
+        # 「本地跟正式環境的 id 長得一樣」少一個只在正式環境才現形的差異。
+        id_generator=AwsXRayIdGenerator(),
     )
     endpoint = settings.OTEL_EXPORTER_OTLP_ENDPOINT
     if endpoint:

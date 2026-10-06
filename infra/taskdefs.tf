@@ -6,10 +6,30 @@
 locals {
   image = "${data.aws_ecr_repository.app.repository_url}:latest"
 
-  # Non-sensitive env: Redis has no password here, so plain value is fine.
-  redis_env = {
-    name  = "REDIS_URL"
-    value = "redis://${aws_elasticache_replication_group.main.primary_endpoint_address}:6379/0"
+  # REDIS_URL **不在這裡**:自從 Redis 開了 auth token(elasticache.tf,盤點 D1)它就是
+  # 秘密,住在 secrets.tf 的 JSON 裡、經 app_secrets 注入。
+
+  # OTel span 送到同 task 的 ADOT sidecar(下面的 otel_sidecar)。awsvpc 模式下同 task 的
+  # 容器共用網路命名空間,所以是 localhost —— 跟本地 compose 指向 otel-collector:4318
+  # 是同一個設定、不同的位址,app 程式碼一行都不用改。
+  otel_env = {
+    name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
+    value = "http://localhost:4318"
+  }
+
+  # ADOT = AWS 包裝的 OpenTelemetry collector,以 sidecar 跟 app 跑在同一個 task:收 OTLP、
+  # 送 X-Ray。用映像內建的 ecs-xray.yaml(只做 trace,不碰 metrics —— metrics 已經走
+  # Prometheus / PutMetricData 那條)。essential=false:collector 死了 app 要繼續賣票,
+  # 只是沒有 trace。X-Ray 的寫入權限在 iam.tf 的 task role。
+  otel_sidecar = {
+    name      = "otel-collector"
+    image     = "public.ecr.aws/aws-observability/aws-otel-collector:v0.50.0"
+    essential = false
+    command   = ["--config=/etc/ecs/ecs-xray.yaml"]
+    environment = [
+      { name = "AWS_REGION", value = var.region },
+    ]
+    logConfiguration = { logDriver = "awslogs", options = local.log_options.otel }
   }
 
   # 這裡的每個請求都經過恰好一層我們自己的代理(ALB),所以 X-Forwarded-For 最右邊
@@ -98,15 +118,17 @@ locals {
   # `update-service`,那是一次**全新的部署**,順手把開機時失敗的那個蓋掉了。
   # 也就是說「CD 端到端測過」證明的是 CD 能用,不是 `terraform apply` 能把環境帶起來。
   app_secrets = [
-    for k in ["SECRET_KEY", "PII_KEK_BASE64", "PII_KEK_VERSION", "PII_KEK_RETIRED", "PII_LOOKUP_KEY_BASE64", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "DATABASE_URL"] : {
+    for k in ["SECRET_KEY", "PII_KEK_BASE64", "PII_KEK_VERSION", "PII_KEK_RETIRED", "PII_LOOKUP_KEY_BASE64", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "DATABASE_URL", "REDIS_URL"] : {
       name      = k
       valueFrom = "${aws_secretsmanager_secret.app.arn}:${k}::"
     }
   ]
 
-  # Shared Fargate sizing (smallest valid combo — dev).
-  task_cpu    = 256 # 0.25 vCPU
-  task_memory = 512 # MB
+  # Shared Fargate sizing (dev). 0.25 vCPU 是最小的;記憶體從 512 加到 1024,因為 task 裡
+  # 現在是兩個容器:app 加 ADOT sidecar(collector 常駐約 100 MB)。512 擠得下但 OOM 會
+  # 以「task 莫名重啟」現形,為了省每小時不到一分錢去賭那個不值得。
+  task_cpu    = 256  # 0.25 vCPU
+  task_memory = 1024 # MB
 }
 
 # Reusable log config — one per stream prefix.
@@ -115,6 +137,7 @@ locals {
     api      = { "awslogs-group" = aws_cloudwatch_log_group.app.name, "awslogs-region" = var.region, "awslogs-stream-prefix" = "api" }
     consumer = { "awslogs-group" = aws_cloudwatch_log_group.app.name, "awslogs-region" = var.region, "awslogs-stream-prefix" = "consumer" }
     worker   = { "awslogs-group" = aws_cloudwatch_log_group.app.name, "awslogs-region" = var.region, "awslogs-stream-prefix" = "worker" }
+    otel     = { "awslogs-group" = aws_cloudwatch_log_group.app.name, "awslogs-region" = var.region, "awslogs-stream-prefix" = "otel" }
   }
 }
 
@@ -139,10 +162,10 @@ resource "aws_ecs_task_definition" "api" {
     essential    = true
     portMappings = [{ containerPort = 8000, protocol = "tcp" }] # only the API exposes a port
     environment = concat(local.api_pool_env, [
-      local.redis_env,
       local.proxy_env,
       local.component_env.api,
       local.api_statement_timeout_env,
+      local.otel_env,
       # CORS_ALLOW_ORIGINS 刻意**不在這裡** —— 還沒有前端,而正確的值就是「關著」
       # (空字串 = 不掛 CORS middleware)。前端上線時在這裡加一行明確的來源清單;
       # 不要為了「先能動」填 `*`,那在 credentialed 請求下根本不會動(且啟動會被
@@ -151,7 +174,7 @@ resource "aws_ecs_task_definition" "api" {
     secrets = local.app_secrets
     # command omitted → uses the image's default CMD (uvicorn app.main:app ... :8000)
     logConfiguration = { logDriver = "awslogs", options = local.log_options.api }
-  }])
+  }, local.otel_sidecar])
 
   # 秘密要**有值**才能跑,不只是存在 —— 理由與實測時間軸見 local.app_secrets 上方。
   depends_on = [aws_secretsmanager_secret_version.app]
@@ -179,10 +202,10 @@ resource "aws_ecs_task_definition" "consumer" {
     image            = local.image
     essential        = true
     command          = ["python", "-m", "app.order_consumer"] # override CMD; no port
-    environment      = concat([local.redis_env, local.component_env.consumer], local.consumer_pool_env)
+    environment      = concat([local.component_env.consumer, local.otel_env], local.consumer_pool_env)
     secrets          = local.app_secrets
     logConfiguration = { logDriver = "awslogs", options = local.log_options.consumer }
-  }])
+  }, local.otel_sidecar])
 
   # 秘密要**有值**才能跑,不只是存在 —— 理由與實測時間軸見 local.app_secrets 上方。
   depends_on = [aws_secretsmanager_secret_version.app]
@@ -215,14 +238,14 @@ resource "aws_ecs_task_definition" "worker" {
     #  - PIPELINE_METRIC_NAMESPACE: keeps the project-scoped namespace out of app
     #    code (must match the IAM condition + the alarm namespace).
     environment = concat(local.worker_pool_env, [
-      local.redis_env,
       local.component_env.worker,
+      local.otel_env,
       { name = "AWS_REGION", value = var.region },
       { name = "PIPELINE_METRIC_NAMESPACE", value = "${var.project}/pipeline" },
     ])
     secrets          = local.app_secrets
     logConfiguration = { logDriver = "awslogs", options = local.log_options.worker }
-  }])
+  }, local.otel_sidecar])
 
   # 秘密要**有值**才能跑,不只是存在 —— 理由與實測時間軸見 local.app_secrets 上方。
   depends_on = [aws_secretsmanager_secret_version.app]

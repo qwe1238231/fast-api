@@ -27,9 +27,15 @@ def upgrade() -> None:
     op.create_check_constraint("ck_events_total_seats_pos", "events", "total_seats > 0")
     op.create_check_constraint("ck_events_price_nonneg", "events", "price_cents >= 0")
 
-    # Redundant: ix_orders_active (event_id, status) already serves every event_id
-    # filter via its leftmost prefix, so this standalone index was pure write
-    # amplification on the hot INSERT path.
+    # Drop the standalone event_id index: pure write amplification on the hot INSERT
+    # path. NOTE (corrected 2026-10-06): the rationale originally written here --
+    # "ix_orders_active's leftmost prefix serves every event_id filter" -- was wrong.
+    # ix_orders_active is PARTIAL (WHERE status IN held), so it only serves queries
+    # that also carry that status predicate. The decision still holds because
+    # (1) every app reader on event_id does carry it, and (2) the only path that
+    # cannot use a partial index is the RI reverse lookup on DELETE of events /
+    # event_zone_prices, which never runs. See the event_id comment in
+    # app/models/order.py for the current reasoning.
     op.drop_index(op.f("ix_orders_event_id"), table_name="orders")
 
 

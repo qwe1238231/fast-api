@@ -23,8 +23,15 @@ class BuyerInfo(Base):
     national_id_dek_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False,)
 
     # BYTEA,不是 str —— pii.lookup_hash() 回的是 raw digest。標註寫 str 的話
-    # type checker 對這個欄位就失效了,而它是查詢鍵:拿 str 去比對 bytea 不會
-    # 靜默失敗,是 asyncpg 直接丟型別錯誤,但那要跑到才知道。
+    # type checker 對這個欄位就失效了:拿 str 去寫 bytea 不會靜默失敗,是 asyncpg
+    # 直接丟型別錯誤,但那要跑到才知道。
+    #
+    # unique 的角色是**守門,不是查詢加速**:全 repo 沒有任何 SELECT 按這一欄過濾
+    # (services/buyer_info.py 只寫入),它存在的唯一理由是「一張身分證只能綁一個
+    # 帳號」—— 第二個人拿同一張證來註冊,INSERT 撞唯一索引,IntegrityError 被 service
+    # 翻成 NationalIdAlreadyRegistered。檢查放在 DB 而不是應用層,因為「先 SELECT 再
+    # INSERT」擋不住兩個請求同時通過 SELECT 的那條縫;唯一索引是唯一不會漏的地方。
+    # unique=True + index=True 在 SQLAlchemy 只建一個 UNIQUE INDEX,不是兩個。
     national_id_lookup_hash: Mapped[bytes] = mapped_column(LargeBinary, nullable=False, unique=True, index=True,)
 
     created_at: Mapped[datetime] = mapped_column(

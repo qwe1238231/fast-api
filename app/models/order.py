@@ -168,7 +168,16 @@ class Order(Base):
         ForeignKey("users.id", ondelete="RESTRICT", name="fk_orders_user_id"),
         nullable=False,
     )  # covered by ix_orders_user_created
-    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)  # covered by ix_orders_active (event_id, status)
+    # 不加單欄 index(7ae1b044057f 刪掉 ix_orders_event_id)。理由**不是**「ix_orders_active
+    # 的前綴覆蓋所有 event_id 過濾」—— 那條是 partial(WHERE status IN held 三種),
+    # 只能服務同樣帶 held status 條件的查詢。真正的理由是兩件事同時成立:
+    #   1. 所有按 event_id 讀 orders 的地方(inventory.py 的對帳與 drift 偵測)都帶
+    #      status IN held,全部落在 partial 的範圍內;
+    #   2. 用不到 partial 的只有 RI 反查 —— 刪 events 列或 event_zone_prices 列時
+    #      Postgres 要掃 orders 找指著它的列 —— 而這兩張表不刪,那條路徑不會跑。
+    # 哪天要加「列出某場次**全部**訂單、含 expired/cancelled」的後台查詢,這個決策
+    # 就要重看:那種查詢今天是 seq scan。
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id"), nullable=False)
     # 買的是哪一區。分區票價下這是必要的來源資訊,但金額本身仍以
     # total_price_cents 的快照為準(所以之後改價動不到已成立的訂單,
     # webhook 的金額驗證也不必重算)。nullable:無座位圖的場次留空。

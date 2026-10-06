@@ -31,14 +31,15 @@ async def subject(db) -> User:
     db.add(user)
     await db.flush()
 
-    ciphertext, dek = encrypt_pii("A123456789")
+    envelope = encrypt_pii("A123456789")
     db.add(
         BuyerInfo(
             user_id=user.id,
             real_name="王小明",
-            national_id_ciphertext=ciphertext,
-            national_id_dek_encrypted=dek,
+            national_id_ciphertext=envelope.ciphertext,
+            national_id_dek_encrypted=envelope.dek_encrypted,
             national_id_lookup_hash=lookup_hash("A123456789"),
+            kek_version=envelope.kek_version,
         )
     )
 
@@ -158,12 +159,14 @@ async def test_deleting_a_user_without_orders_cascades_pii_and_sessions(db) -> N
     user = User(username="沒買過票", hashed_password=get_password_hash("secret123"))
     db.add(user)
     await db.flush()
-    ciphertext, dek = encrypt_pii("B234567890")
+    envelope = encrypt_pii("B234567890")
     db.add_all([
         BuyerInfo(
             user_id=user.id, real_name="李小華",
-            national_id_ciphertext=ciphertext, national_id_dek_encrypted=dek,
+            national_id_ciphertext=envelope.ciphertext,
+            national_id_dek_encrypted=envelope.dek_encrypted,
             national_id_lookup_hash=lookup_hash("B234567890"),
+            kek_version=envelope.kek_version,
         ),
         RefreshToken(
             user_id=user.id, token_hash="g" * 64,

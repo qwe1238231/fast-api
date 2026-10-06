@@ -50,6 +50,18 @@ class OutboxEntry(Base):
             "id",
             postgresql_where=text("processed_at IS NULL"),
         ),
+        # purge_processed_outbox 的 `processed_at < cutoff` **刻意沒有索引**:上面那條
+        # partial 是 IS NULL,它用不到,每次 purge 都是 seq scan。跟 refresh_tokens 的
+        # purge 同一個形狀,但那邊建了索引、這邊不建,差別在上界:
+        #   - 這張表有界 —— processed 列 7 天就清,未處理的列是債、常態接近零,所以
+        #     穩態體積 = 7 天內過期/取消的**座位**訂單,不是全部訂單;refresh_tokens
+        #     沒有這種上界,跟登入次數一起長。
+        #   - purge 一天只跑一次(03:15)。掃一張有界的小表省下的幾十 ms,換不回每筆
+        #     processed_at NULL→NOT NULL 時多一次索引插入。
+        # 兩個會翻盤的條件:purge 改成每小時跑,或 OUTBOX_RETENTION_DAYS 拉到 90。
+        # 到那時候加 `(processed_at) WHERE processed_at IS NOT NULL` 的 partial,鏡像
+        # refresh_tokens 的 revoked_at;HOT 不會再多損失 —— processed_at 本來就是上面
+        # 那條 partial 的 predicate 欄位,更新它已經打斷 HOT,多的只是那一次索引插入。
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)

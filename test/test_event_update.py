@@ -261,6 +261,75 @@ async def test_a_price_change_invalidates_the_cached_meta(client, admin, event, 
     assert after.price_cents == 2000
 
 
+async def test_moving_the_queue_window_after_publish_moves_admission(client, admin, db):
+    """schema 審查第 24 條:publish 之後 PATCH 開賣/登記時間,等候室的放行時刻要跟著動。
+
+    以前放行時刻是 publish 當下 SET 進 Redis 的快照,PATCH 只改 DB 與登記端點 ——
+    管理員把開賣延後,等候室照舊時間放人,而且沒有任何錯誤。現在它從 event meta
+    推導,PATCH 既有的 invalidate_event_meta 就是失效路徑。
+    """
+    now = datetime.now(timezone.utc)
+    event = Event(
+        name="延後開賣", venue="Test Arena",
+        starts_at=now + timedelta(days=30), ends_at=now + timedelta(days=30, hours=3),
+        sale_starts_at=now + timedelta(minutes=5), sale_ends_at=now + timedelta(days=1),
+        total_seats=100, price_cents=1500, status=EventStatus.DRAFT,
+    )
+    db.add(event)
+    await db.commit()
+    event_id = event.id
+    assert (await client.post(f"/v1/events/{event_id}/publish", headers=admin)).status_code == 200
+
+    # 登記窗現在是開的(預設 sale−10m … sale−30s):排進去,放行還沒開始。
+    joined = (await client.post(f"/v1/events/{event_id}/queue", headers=admin)).json()
+    assert joined["admitted"] is False
+
+    # 把登記窗的關閉時間搬到 10 秒前 → 放行已開始 10 秒,rank 0 要在裡面。
+    version = (await client.get(f"/v1/events/{event_id}")).json()["version"]
+    resp = await client.patch(
+        f"/v1/events/{event_id}",
+        json={"version": version, "queue_closes_at": (now - timedelta(seconds=10)).isoformat()},
+        headers=admin,
+    )
+    assert resp.status_code == 200
+    status = (await client.get(f"/v1/events/{event_id}/queue/status", headers=admin)).json()
+    assert status["admitted"] is True
+
+    # 反方向也要跟:搬回未來,放行就該停 —— 位置保留(people_ahead 0),不是被踢掉。
+    resp = await client.patch(
+        f"/v1/events/{event_id}",
+        json={"version": version + 1, "queue_closes_at": (now + timedelta(minutes=4)).isoformat()},
+        headers=admin,
+    )
+    assert resp.status_code == 200
+    status = (await client.get(f"/v1/events/{event_id}/queue/status", headers=admin)).json()
+    assert (status["admitted"], status["people_ahead"]) == (False, 0)
+
+
+async def test_a_window_change_pokes_the_live_streams(client, admin, event, monkeypatch):
+    """SSE 連線算好「睡到放行那一刻」就睡了;放行時刻被 PATCH 搬走時要叫醒它重算,
+    不然最壞要等 20 秒心跳。跟放行無關的欄位(改名)不 poke。"""
+    pokes: list[int] = []
+
+    async def spy(_redis, event_id):
+        pokes.append(event_id)
+
+    monkeypatch.setattr("app.api.v1.events.publish_event_poke", spy)
+
+    resp = await client.patch(
+        f"/v1/events/{event.id}", json={"version": 1, "name": "跟放行無關"}, headers=admin
+    )
+    assert resp.status_code == 200 and pokes == []
+
+    later = event.sale_starts_at + timedelta(hours=1)
+    resp = await client.patch(
+        f"/v1/events/{event.id}",
+        json={"version": 2, "sale_starts_at": later.isoformat()},
+        headers=admin,
+    )
+    assert resp.status_code == 200 and pokes == [event.id]
+
+
 async def test_a_naive_datetime_is_rejected_with_422_not_500(client, admin, event):
     """schema 層要求 AwareDatetime:無時區的 ISO 字串直接 422。
 

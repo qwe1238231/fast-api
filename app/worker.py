@@ -23,7 +23,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind
+
 from app.core.logging import alert, configure_logging, log_context, new_trace_id
+from app.core.tracing import (
+    configure_tracing, current_trace_id as otel_trace_id, extract_trace_context,
+)
 from app.core.redis import create_redis_client
 from app.db.session import AsyncSessionLocal
 from app.models.order import Order, OrderStatus
@@ -38,6 +44,8 @@ from app.models.audit_log import DEFAULT_PARTITION, AuditLog, partition_name
 from app.models.outbox import SEAT_RELEASE, OutboxEntry
 from app.services.audit import AUDIT_STREAM_KEY, AUDIT_STREAM_MAX_LEN
 from app.models.event import Event, EventStatus
+from app.models.buyer_info import BuyerInfo
+from app.services.pii import PiiKeyVersionUnknown, active_kek_version, rewrap_dek
 from app.services.inventory import (
     compute_expected_available, compute_expected_quotas,
     oldest_intent_age_seconds, read_available, read_purchase_quotas,
@@ -53,10 +61,11 @@ from app.services.seat_runs import (
 )
 from app.services.waiting_room import (
     set_admission_paused,
-    _admit_start_key, _draw_key, _salt_key,
+    _draw_key, _salt_key,
 )
 
 logger = logging.getLogger(__name__)
+_tracer = trace.get_tracer(__name__)
 
 _settings = get_settings()
 
@@ -67,11 +76,16 @@ _R = TypeVar("_R")
 def cron_job(
     func: Callable[_P, Awaitable[_R]],
 ) -> Callable[_P, Awaitable[_R]]:
-    """把一次 cron 執行的所有 log 綁在同一個 `job` + `run_id` 底下。
+    """把一次 cron 執行的所有 log 綁在同一個 `job` + `run_id` 底下,並開一個 root span。
 
     cron **沒有入口請求可以繼承 id**,所以得自己生一個。少了它,
     `detect_seat_structure_drift` 一輪吐出來的幾十行 ALERT 會跟上一輪的混在一起,
     分不出哪些屬於同一次檢查 —— 而「這次比上次多了什麼」正是要看的東西。
+
+    span 是同一件事在時間軸那一側:一次 cron 執行是一棵樹的根,底下每句 SQL、每個
+    Redis 指令自動掛上去。log 的 trace_id 綁成這個 span 的 trace id(跟 HTTP 那邊
+    同一條規則),所以 cron 的 log 也能從瀑布圖跳過去。run_id 照舊,它是 arq 的 job id,
+    用來對 arq 自己那行「job 失敗」。
 
     刻意**不**記「開始/結束」:arq 自己就會記每個 job 的耗時,再記一次只是把同一件事
     寫兩遍。這裡要的是 context,不是多一行。
@@ -81,7 +95,11 @@ def cron_job(
     async def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
         ctx = args[0] if args else {}
         run_id = (ctx.get("job_id") if isinstance(ctx, dict) else None) or new_trace_id()
-        with log_context(job=func.__name__, run_id=run_id):
+        # 兩個 with 的順序有意義:span 先開,log_context 的 trace_id 才讀得到它。
+        with (
+            _tracer.start_as_current_span(f"cron {func.__name__}"),
+            log_context(job=func.__name__, run_id=run_id, trace_id=otel_trace_id() or run_id),
+        ):
             try:
                 return await func(*args, **kwargs)
             except Exception:
@@ -91,6 +109,27 @@ def cron_job(
                 raise
 
     return wrapper
+
+
+def _intent_span(entry_id: str, fields: dict):
+    """每一筆 order intent 一個 CONSUMER span。
+
+    有 traceparent(API 那邊注入進 stream 欄位的)就接在那個請求的 server span 底下 ——
+    於是「下單 → 落帳 → reclaim → 死信」在瀑布圖上是同一棵樹,跟 log 用 trace_id 串起來
+    的是同一條線。沒有(升級前的舊 intent)就掛在當前 context(cron span 或 consumer
+    loop)底下。底下 _persist_intent 的每句 SQL 自動變成它的子節點。
+    """
+    return _tracer.start_as_current_span(
+        "order intent process",
+        context=extract_trace_context(fields),
+        kind=SpanKind.CONSUMER,
+        attributes={
+            "messaging.system": "redis",
+            "messaging.destination.name": ORDER_STREAM_KEY,
+            "messaging.message.id": entry_id,
+            "messaging.operation.type": "process",
+        },
+    )
 
 
 PENDING_TIMEOUT_MINUTES = _settings.PENDING_TIMEOUT_MINUTES
@@ -619,6 +658,7 @@ async def startup(ctx: dict) -> None:
     # arq 已經設好自己的 logging 才會呼叫這裡,所以現在覆蓋才有效(理由同 API 的
     # lifespan)。component 讓 worker 的行在 CloudWatch 上跟 api/consumer 分得開。
     configure_logging(component="ticket-worker")
+    configure_tracing(component="ticket-worker")
     settings = get_settings()
     ctx["redis_client"] = create_redis_client(settings.REDIS_URL)
     # 在途付款的超時 cron 要對 Stripe 主動 cancel intent。跟 api 的 lifespan 同一個
@@ -996,10 +1036,17 @@ async def _consume_batch(redis, *, consumer: str = ORDER_CONSUMER_NAME, block: i
         # 處理,漏掉 reset 的話上一筆的 trace_id 會冒充成下一筆的(尤其是升級前就
         # 躺在 stream 裡、沒有這個欄位的舊 intent)。那種 bug 的症狀是「log 看起來
         # 完全合理但指向錯的訂單」。
-        with log_context(
-            trace_id=fields.get("trace_id") or "-",
-            idempotency_key=fields.get("idempotency_key"),
-            stream_id=entry_id,
+        #
+        # span 也在這裡接回(traceparent 欄位)。log 的 trace_id 優先用訊息帶來的那個:
+        # 有 traceparent 時它跟 span 的 trace id 是同一個值;舊 intent 沒有 traceparent
+        # 時仍沿用訊息的 trace_id,log 那條線不因為 span 是新開的而斷掉。
+        with (
+            _intent_span(entry_id, fields),
+            log_context(
+                trace_id=fields.get("trace_id") or otel_trace_id() or "-",
+                idempotency_key=fields.get("idempotency_key"),
+                stream_id=entry_id,
+            ),
         ):
             try:
                 outcome = await _persist_intent(fields)
@@ -1161,12 +1208,15 @@ async def reclaim_stale_order_intents(
         _, fields = claimed[0]
 
         # 跟 _consume_batch 同一個接回動作 —— 重試與死信也要落在原本那條線上,
-        # 否則「這筆訂單後來怎麼了」在 log 裡就斷在第一次失敗。
-        with log_context(
-            trace_id=fields.get("trace_id") or "-",
-            idempotency_key=fields.get("idempotency_key"),
-            stream_id=entry_id,
-            times_delivered=times_delivered,
+        # 否則「這筆訂單後來怎麼了」在 log 裡就斷在第一次失敗;span 同理。
+        with (
+            _intent_span(entry_id, fields),
+            log_context(
+                trace_id=fields.get("trace_id") or otel_trace_id() or "-",
+                idempotency_key=fields.get("idempotency_key"),
+                stream_id=entry_id,
+                times_delivered=times_delivered,
+            ),
         ):
             if times_delivered >= max_deliveries:
                 await _dead_letter_intent(redis, entry_id, fields)
@@ -1553,6 +1603,72 @@ EVENT_KEY_RETENTION_DAYS = 7
 EVENT_KEY_PURGE_WINDOW_DAYS = 30
 
 
+PII_REWRAP_BATCH = 500
+PII_REWRAP_MAX_BATCHES = 20
+
+
+@cron_job
+async def rewrap_pii_keks(
+    ctx: dict, *, batch: int = PII_REWRAP_BATCH, max_batches: int = PII_REWRAP_MAX_BATCHES
+) -> int:
+    """Cron job:把還掛在退役 KEK 上的 buyer_info 列重包到現役版本。回傳改了幾列。
+
+    輪替的背景那一半(前景是改三個設定 + 滾動部署,見 infra/RUNBOOK.md 情境 E):每列只動
+    dek_encrypted 與 kek_version,密文不碰。平常 SELECT 一次就結束(沒有舊版的列),只有
+    輪替後那幾輪才真的有事做。
+
+    **刻意不在部署當下跑、也不一次做完**:滾動期間舊 task 還只認舊版,它們讀到已經換成
+    新版的列會失敗。15 分鐘一輪、每輪 20 批 × 500 列的上限讓它在滾動結束後才真正追上,
+    而且每批自己一個交易、FOR UPDATE SKIP LOCKED,跟線上的讀寫互不卡。
+
+    列上的版本不在 keyring 裡(退役鑰匙被太早清掉)→ 那幾列跳過、整輪結束時發一次
+    alert(needs_human),其餘的列照常處理。把鑰匙放回 PII_KEK_RETIRED,下一輪就接手。
+    """
+    active = active_kek_version()
+    done = 0
+    unknown: set[int] = set()
+    for _ in range(max_batches):
+        async with AsyncSessionLocal() as db:
+            stmt = (
+                select(BuyerInfo)
+                .where(BuyerInfo.kek_version != active)
+                .limit(batch)
+                .with_for_update(skip_locked=True)
+            )
+            if unknown:
+                stmt = stmt.where(BuyerInfo.kek_version.not_in(unknown))
+            rows = (await db.scalars(stmt)).all()
+            if not rows:
+                break
+            changed = 0
+            for row in rows:
+                try:
+                    row.national_id_dek_encrypted, row.kek_version = rewrap_dek(
+                        row.national_id_dek_encrypted, kek_version=row.kek_version
+                    )
+                    changed += 1
+                except PiiKeyVersionUnknown as exc:
+                    unknown.add(exc.version)
+            await db.commit()
+            done += changed
+            if not changed:
+                break                      # 這一批全是解不開的版本,再撈也是同一批
+    if unknown:
+        alert(
+            logger,
+            "buyer_info rows are wrapped with KEK versions this process does not hold",
+            event="pii_kek_version_unknown",
+            kek_versions=sorted(unknown),
+            active_version=active,
+        )
+    if done:
+        logger.info(
+            "rewrapped buyer_info DEKs onto the active KEK",
+            extra={"event": "pii_rewrapped", "rows": done, "kek_version": active},
+        )
+    return done
+
+
 @cron_job
 async def purge_finished_event_keys(
     ctx: dict,
@@ -1588,14 +1704,14 @@ async def purge_finished_event_keys(
         ).all()
 
         for event_id, zone_id in rows:
-            # 用 waiting_room 自己的 helper 而不是重打字串:上一版漏掉了
-            # queue:{e}:admit_start,而漏掉的原因正是憑印象打 key 格式。
+            # 用 waiting_room 自己的 helper 而不是重打字串:曾經漏掉一把 queue key
+            # (當時的 admit_start,現已改為從 meta 推導、不再落 key),而漏掉的原因
+            # 正是憑印象打 key 格式。
             keys += [
                 _event_available_key(event_id),
                 _purchased_key(event_id),
                 _salt_key(event_id),
                 _draw_key(event_id),
-                _admit_start_key(event_id),
             ]
             if zone_id is not None:
                 keys += [
@@ -1836,6 +1952,9 @@ class WorkerSettings:
         cron(detect_inventory_drift, minute=set(range(0, 60, 5))),
         cron(detect_seat_structure_drift, minute=set(range(0, 60, 5))),
         cron(purge_finished_event_keys, hour={3}, minute={30}),
+        # KEK 輪替的背景那一半;平常一次 SELECT 就結束。15 分鐘一輪是給滾動部署留空檔,
+        # 理由在函式 docstring。
+        cron(rewrap_pii_keks, minute={5, 20, 35, 50}),
 
     ]
 

@@ -10,7 +10,7 @@ from app.api.deps import (
     enforce_ip_rate_limit,
 )
 from app.core.config import get_settings
-from app.core.exceptions import EventNotFound
+from app.core.exceptions import EventNotFound, EventNotOnSale
 from app.core.security import create_admission_token
 from app.crud.event import get_event, list_published_events
 from app.db.optimistic import stale_data_as_conflict
@@ -19,7 +19,7 @@ from app.services.event_admin import (
 )
 from app.services.audit import emit_event as emit_audit_event
 from app.services.event_cache import invalidate_event_meta
-from app.models.event import Event
+from app.models.event import Event, EventStatus
 from app.models.seating import EventZonePrice
 from app.schemas.event import (
     EventCreate, EventResponse, EventUpdate, QueueStatusResponse,
@@ -29,9 +29,12 @@ from app.schemas.seating import (
 )
 from app.services.zones import list_zone_availability
 from app.services.publish_event import publish_event
-from app.services.queue_events import register as sse_register, unregister as sse_unregister
+from app.services.queue_events import (
+    publish_event_poke, register as sse_register, unregister as sse_unregister,
+)
 from app.services.waiting_room import (
-    window, register as queue_register, status as queue_status, QueueState, admit_deadline,
+    WINDOW_FIELDS, window, register as queue_register, status as queue_status,
+    QueueState, admit_deadline,
 )
 from app.services.rate_limit import enforce_rate_limit
 
@@ -69,6 +72,9 @@ async def update_event_endpoint(
     順序看起來完全正常,不會有任何錯誤。price_cents 與售票窗都在 EventMeta 裡,
     不清的話最多 60 秒內還會按舊價賣。
 
+    等候室的放行時刻也是 EventMeta 的推導值(waiting_room._admit_start),所以同一次
+    清快取就讓它跟著新時間走;之後的 poke 只是叫醒睡到舊時刻的 SSE 連線立刻重算。
+
     稽核同樣是 post-commit:記的是「已經發生的事」。被 409 擋下的那些沒有改變任何
     東西,不進稽核 —— 想知道有沒有人一直撞版本衝突,那是日誌與監控的問題。
     """
@@ -85,6 +91,10 @@ async def update_event_endpoint(
     ):
         await db.commit()
     await invalidate_event_meta(redis, event_id=event_id)
+    if WINDOW_FIELDS & changes.keys():
+        # 放行時刻已經隨上一行的清快取改了;這裡只是讓正在 SSE 上睡到舊時刻的連線
+        # 立刻重算,不 poke 也會在 20 秒心跳自己追上。best-effort,跟其他 poke 一樣。
+        await publish_event_poke(redis, event_id)
     await emit_audit_event(
         redis,
         event_type="event.updated",
@@ -240,6 +250,12 @@ async def join_queue(
     event = await get_event(db, event_id=event_id)
     if event is None:
         raise EventNotFound(event_id=event_id)
+    # 沒發佈(draft / cancelled)的場次不收登記。以前這裡只看時間窗:draft 場次的窗
+    # 若剛好是開的,人排得進去,但放行只排定給 published(waiting_room._admit_start),
+    # 於是永遠等不到 —— 而且沒有任何錯誤,只有「為什麼沒人被放進來」。跟下單路徑
+    # 用同一個例外(services/orders.py 的 EventNotOnSale),使用者看到的是同一種 409。
+    if event.status is not EventStatus.PUBLISHED:
+        raise EventNotOnSale(event_id=event_id)
     now = datetime.now(timezone.utc)
     opens, closes = window(event)
     if now < opens:
@@ -257,7 +273,9 @@ async def queue_status_endpoint(
         current_user: CurrentUser,
         redis: Redis,
 ) -> QueueStatusResponse:
-    """Poll your waiting-room position / admission. Redis-only (no DB on the hot poll path)."""
+    """Poll your waiting-room position / admission. Redis on the hot poll path; the
+    only DB touch is an event-meta cache miss (at most once a minute per process —
+    see waiting_room._admit_start)."""
     state = await queue_status(redis, event_id=event_id, user_id=current_user.id)
     return _queue_response(state, user_id=current_user.id, event_id=event_id)
 

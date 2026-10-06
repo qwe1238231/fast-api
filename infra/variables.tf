@@ -117,6 +117,21 @@ variable "pii_lookup_key_base64" {
   sensitive   = true
 }
 
+# KEK rotation (RUNBOOK 情境 E): bump the version and move the old key into `retired`
+# in the SAME apply, then let the worker's rewrap_pii_keks drain old rows.
+variable "pii_kek_version" {
+  description = "Version number of the active PII KEK (PII_KEK_VERSION)."
+  type        = number
+  default     = 1
+}
+
+variable "pii_kek_retired" {
+  description = "Retired PII KEKs still needed to read old rows: JSON object version -> base64 (PII_KEK_RETIRED). Decrypt-only."
+  type        = string
+  default     = "{}"
+  sensitive   = true
+}
+
 variable "stripe_secret_key" {
   description = "Stripe secret API key (STRIPE_SECRET_KEY)."
   type        = string

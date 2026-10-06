@@ -64,6 +64,13 @@ locals {
   }
 }
 
+# ElastiCache 的 auth token:16–128 個可印 ASCII,不能有 / " @。只用英數最省事,
+# 32 字元的熵足夠。跟 RDS 的 random_password.db 同一個手法。
+resource "random_password" "redis" {
+  length  = 32
+  special = false
+}
+
 resource "aws_elasticache_replication_group" "main" {
   replication_group_id = "${var.project}-redis"
   description          = "ticket inventory + order stream (source of truth, not a cache)"
@@ -86,6 +93,17 @@ resource "aws_elasticache_replication_group" "main" {
   port                 = 6379
   subnet_group_name    = aws_elasticache_subnet_group.main.name
   security_group_ids   = [aws_security_group.redis.id]
+
+  # 盤點 D1:以前是明文連線、沒有密碼。「在 VPC 內網所以安全」是個假設 —— 同 VPC 裡任何
+  # 能跑程式的東西都讀得到,而這裡放的是入場券標記與訂單意圖。TLS 擋竊聽,auth token 擋
+  # 「連得到就能用」。兩者都是**建立時**的屬性(at_rest 完全不能事後改;transit 可以但
+  # 要走 migration 模式),所以一次開齊。代價:每條連線多一次 TLS 交握,對 SSE 這種長
+  # 連線沒差;app 端 REDIS_URL 變成 rediss:// 帶密碼 —— 因此它不再是「非敏感環境變數」,
+  # 搬進 Secrets Manager(secrets.tf),taskdefs.tf 的 environment 不再有它。
+  transit_encryption_enabled = true
+  at_rest_encryption_enabled = true
+  auth_token                 = random_password.redis.result
+  auth_token_update_strategy = "ROTATE"
 
   # 每日快照。它**不是**給故障切換用的(那是副本的工作),是給「有人跑錯腳本把
   # keyspace 清了」這種事用的 —— 那種情況副本會忠實地把刪除複寫過去。

@@ -33,6 +33,16 @@ from app.core.config import get_settings
 from sqlalchemy import text
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _tracing():
+    """跟 app 一樣設好 tracer provider(沒有 exporter,見 core/tracing.py 決定 3):
+    trace id 與 log 的接軌、SQLAlchemy / redis / httpx 的自動 instrumentation 在整套
+    測試裡都是活的 —— 壞了會在這裡現形,而不是上線才發現。lifespan 在 ASGITransport
+    下不會跑,所以要自己呼叫。"""
+    from app.core.tracing import configure_tracing
+    configure_tracing(component="ticket-test")
+
+
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def _setup_schema():
     async with engine.begin() as conn:

@@ -22,17 +22,14 @@ from redis.asyncio import Redis
 
 from app.core.config import get_settings
 from app.core.exceptions import AdmissionDenied
-from app.models.event import Event
+from app.models.event import Event, EventStatus
+from app.services.event_cache import get_event_meta
 from app.services.inventory import get_available
 from app.services.queue_events import publish_global_poke
 
 
 def _draw_key(event_id: int) -> str:
     return f"queue:{event_id}:draw"
-
-
-def _admit_start_key(event_id: int) -> str:
-    return f"queue:{event_id}:admit_start"   # epoch seconds when admission begins (window close)
 
 
 def _salt_key(event_id: int) -> str:
@@ -59,6 +56,13 @@ async def set_admission_paused(redis: Redis, paused: bool, *, ttl_seconds: int =
     else:
         await redis.delete(_paused_key())
     await publish_global_poke(redis)   # nudge every waiting SSE connection to re-read status()
+
+
+#: effective_window 的三個輸入。PATCH 改了任一個,放行時刻就變 —— events.py 的端點
+#: 用這個集合決定要不要 poke 正在睡的 SSE 連線。
+WINDOW_FIELDS: frozenset[str] = frozenset(
+    {"sale_starts_at", "queue_opens_at", "queue_closes_at"}
+)
 
 
 def effective_window(
@@ -108,20 +112,44 @@ async def register(redis: Redis, *, event: Event, user_id: int) -> None:
 
 
 async def setup(redis: Redis, event: Event) -> None:
-    """Prepare the waiting room (call at publish): fix the secret salt and record
-    when admission begins (the registration window's close time)."""
+    """Prepare the waiting room (call at publish): fix the secret salt.
+
+    放行時刻**不在這裡寫**:它是 event meta 的推導值(見 _admit_start),publish 清掉
+    meta 快取就等於排定了。以前這裡會 SET 一把 queue:{e}:admit_start —— 那是一份沒有
+    失效路徑的快照,PATCH 改時間它不會動。"""
     await _ensure_salt(redis, event.id)
-    _, closes = window(event)
-    await redis.set(_admit_start_key(event.id), closes.timestamp())
+
+
+async def _admit_start(redis: Redis, event_id: int) -> float | None:
+    """放行開始的時刻(epoch 秒)= 登記窗的實效關閉時間;None = 尚未排定。
+
+    從 EventMeta 快取推導,**不另外存一份快照**。以前 publish 時把這個值 SET 進
+    queue:{e}:admit_start;之後 PATCH 改了 sale_starts_at / queue_closes_at,DB 與
+    登記端點(讀 DB)都跟著動,放行卻還看舊快照 —— 管理員把開賣延後一小時,等候室
+    照舊時間放人,而且沒有任何錯誤。快照沒有失效路徑;meta 有(PATCH 的
+    invalidate_event_meta,加 60 秒 TTL 自癒),所以直接用它。
+
+    只有 published 的場次才排定放行:draft 的 meta 也讀得到,但抽籤不該開。
+    快取 miss 時這裡會打一次 DB(每 process 每分鐘至多一次,見 event_cache 的
+    stampede 防護)—— 這是 status() 從「純 Redis」變成「Redis、miss 才 DB」的唯一來源。
+    """
+    meta = await get_event_meta(redis, event_id=event_id)
+    if meta is None or meta.status is not EventStatus.PUBLISHED:
+        return None
+    _, closes = effective_window(
+        meta.sale_starts_at, meta.queue_opens_at, meta.queue_closes_at
+    )
+    return closes.timestamp()
 
 
 async def _admitted_count(redis: Redis, event_id: int) -> int:
     """Admitted-so-far = RATE * seconds since the window closed, capped at the
-    number registered. A pure function of the clock — no counter to advance."""
-    start = await redis.get(_admit_start_key(event_id))
+    number registered. A pure function of the clock and the event's window —
+    no counter to advance."""
+    start = await _admit_start(redis, event_id)
     if start is None:
         return 0
-    elapsed = datetime.now(timezone.utc).timestamp() - float(start)
+    elapsed = datetime.now(timezone.utc).timestamp() - start
     if elapsed <= 0:
         return 0
     total = await redis.zcard(_draw_key(event_id))
@@ -156,23 +184,24 @@ async def admit_deadline(redis: Redis, *, event_id: int, user_id: int) -> float 
     """Wall-clock epoch seconds at which this user's rank crosses the admission
     cutoff — or None if they're not registered / admission isn't scheduled yet.
 
-    Both inputs are frozen once the registration window closes (no new
-    registrations can change the rank; the rate is config), so the SSE stream
-    computes this ONCE and sleeps precisely until it instead of polling for it.
+    The rank freezes once the registration window closes and the rate is config,
+    so the SSE stream sleeps precisely until this instead of polling for it. The
+    start itself can still move (an admin PATCHes the window) — the stream
+    recomputes on every wake, and the PATCH pokes it so the wake is immediate.
 
     Derivation from _admitted_count / status():
         admitted  <=>  rank < int(elapsed * RATE)
                   <=>  elapsed >= (rank + 1) / RATE
         =>  admit_at = admit_start + (rank + 1) / RATE
     """
-    start = await redis.get(_admit_start_key(event_id))
+    start = await _admit_start(redis, event_id)
     if start is None:
         return None
     rank = await redis.zrank(_draw_key(event_id), str(user_id))
     if rank is None:
         return None
     rate = get_settings().QUEUE_ADMISSION_RATE
-    return float(start) + (rank + 1) / rate
+    return start + (rank + 1) / rate
 
 
 def _used_key(jti: str) -> str:

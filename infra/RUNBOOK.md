@@ -427,6 +427,52 @@ aws rds describe-events --source-identifier justin-test-db --source-type db-inst
 
 ---
 
+## 情境 E — 輪替 PII KEK(線上,不停機)
+
+buyer_info 的身分證是信封加密:每列一把 DEK,DEK 用 KEK 包住。每列記著自己是第幾版 KEK
+包的(`kek_version`),所以換鑰匙只動包裝那一層,明文的密文不碰。**三個設定、一次部署、
+一個背景工作。**
+
+### 1. 產新鑰匙,改三個設定(同一次 apply)
+
+```bash
+python -c "import os, base64; print(base64.b64encode(os.urandom(32)).decode())"   # 新 KEK
+```
+
+`terraform.tfvars`:
+
+- `pii_kek_retired`:把**現在的**鑰匙放進去,鍵是它的版本號,例 `{"1": "<舊 KEK base64>"}`
+- `pii_kek_version`:加一,例 `2`
+- `pii_kek_base64`:換成新鑰匙
+
+三個要同一次 apply:Settings 會拒絕「現役版本也出現在 retired」的組合,而「版本加了、
+retired 沒放舊鑰匙」會讓舊列從新 task 起來那一刻起解不開。
+
+### 2. 部署(重推服務拿到新的秘密版本,同情境 A 步驟 5)
+
+新 task:新寫入用第 2 版包;讀舊列時按列上的 `kek_version=1` 從 retired 拿鑰匙解。
+滾動期間舊 task 仍只認第 1 版,它們讀到已經換成第 2 版的列會失敗 —— **這就是 rewrap 不在
+部署當下跑的原因**:worker 的 `rewrap_pii_keks` 每 15 分鐘一輪、每輪最多 20 批 × 500 列,
+滾動結束後自然把舊列換到第 2 版。要催的話手動跑一次就好。
+
+### 3. 確認全部換完,才拿掉舊鑰匙
+
+```sql
+SELECT kek_version, count(*) FROM buyer_info GROUP BY 1;   -- 只剩現役版本才算完
+```
+
+全部換完後把 `pii_kek_retired` 清回 `{}` 再 apply 一次。在那之前舊鑰匙還握著資料,只是
+沒在用。log 若出現 `pii_kek_version_unknown`(needs_human):有列記著一個 keyring 裡沒有
+的版本,通常是 retired 被太早清掉 —— 把那版鑰匙放回去,下一輪 rewrap 會接手。
+
+lookup hash 的 HMAC 鑰匙不在這套機制裡:換它要重算每一列的 hash,需要明文,是另一種規模
+的工作。
+
+**沒在 AWS 演練過;本機 compose 可以整套走一遍**:改 `.env` 的三個值、重啟、看 worker log
+的 `pii_rewrapped`,再用上面那句 SQL 確認。
+
+---
+
 ## 還原之後一定要檢查的四件事
 
 還原只是把 Postgres 弄回來,而這個系統的狀態**橫跨 Postgres 與 Redis**。Redis 沒有

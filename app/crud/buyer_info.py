@@ -12,16 +12,19 @@ async def create_buyer_info(
         national_id_ciphertext: bytes,
         national_id_dek_encrypted: bytes,
         national_id_lookup_hash: bytes,
+        kek_version: int,
 ) -> BuyerInfo:
     """Insert a new buyer_info row. Caller must commit.
-    
-    Caller passes pre-encrypted PII (this layer doesn't know about crypto)."""
+
+    Caller passes pre-encrypted PII (this layer doesn't know about crypto), including
+    which KEK version wrapped the DEK — the row must remember that to be decryptable."""
     info = BuyerInfo(
         user_id=user_id,
         real_name=real_name,
         national_id_ciphertext=national_id_ciphertext,
         national_id_dek_encrypted=national_id_dek_encrypted,
         national_id_lookup_hash=national_id_lookup_hash,
+        kek_version=kek_version,
     )
     db.add(info)
     await db.flush()

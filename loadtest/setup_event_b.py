@@ -50,7 +50,7 @@ async def main() -> None:
             )
             db.add(event)
             await db.flush()                          # assign event.id
-            await publish_event(db, redis, event)     # stock + salt + admit_start + cache
+            await publish_event(db, redis, event)     # stock + salt + meta cache (admission start derives from it)
             await db.commit()
             event_id = event.id
     finally:

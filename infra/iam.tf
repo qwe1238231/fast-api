@@ -56,3 +56,21 @@ resource "aws_iam_role_policy" "ecs_task_metrics" {
   role   = aws_iam_role.ecs_task.id
   policy = data.aws_iam_policy_document.ecs_task_metrics.json
 }
+
+# ADOT sidecar(taskdefs.tf 的 otel_sidecar)把 span 送進 X-Ray。它跟 app 共用 task role,
+# 所以權限掛在這裡。X-Ray 的 Put* 沒有 resource-level ARN,只能 "*"。
+data "aws_iam_policy_document" "ecs_task_xray" {
+  statement {
+    actions = [
+      "xray:PutTraceSegments",
+      "xray:PutTelemetryRecords",
+    ]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "ecs_task_xray" {
+  name   = "${var.project}-ecs-task-xray"
+  role   = aws_iam_role.ecs_task.id
+  policy = data.aws_iam_policy_document.ecs_task_xray.json
+}

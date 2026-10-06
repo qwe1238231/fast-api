@@ -25,6 +25,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.api.deps import client_ip
 from app.core.config import get_settings
 from app.core.logging import log_context, new_trace_id
+from app.core.tracing import current_trace_id as otel_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,13 @@ class TraceIdMiddleware:
     好幾個人的請求混在一起,而且看起來完全合理),以及長度/字元不受控。目前也沒有
     上游服務需要延續既有的 trace —— 真的有了(內部服務互打)再來談要信任誰,那時
     信任邊界是一個要明確做的決定,不是預設。
+
+    **trace_id 優先用 OTel server span 的 trace id**(core/tracing.py):OTel 的 ASGI
+    middleware 包在整個 stack 外面(instrumentor 改寫了 build_middleware_stack,所以它
+    不在 user_middleware 裡),這裡跑的時候 server span 已經是 current,拿它的 id 當
+    log 的 trace_id,log 與 span 就是同一把 key。沒有有效 span(尚未 configure_tracing)
+    時退回 uuid4 —— 兩者同為 32 位 hex,下游看不出差別。入站的 traceparent 一律不信,
+    由 tracing.py 的 inject-only propagator 保證,不是靠這裡不去讀它。
     """
 
     def __init__(
@@ -109,7 +117,7 @@ class TraceIdMiddleware:
             await self.app(scope, receive, send)
             return
 
-        trace_id = new_trace_id()
+        trace_id = otel_trace_id() or new_trace_id()
         fields: dict[str, Any] = {"trace_id": trace_id}
         alb_trace_id = _alb_trace_id(scope)
         if alb_trace_id is not None:

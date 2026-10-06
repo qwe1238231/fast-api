@@ -18,11 +18,16 @@ resource "aws_secretsmanager_secret_version" "app" {
   secret_string = jsonencode({
     SECRET_KEY            = var.app_secret_key
     PII_KEK_BASE64        = var.pii_kek_base64
+    PII_KEK_VERSION       = tostring(var.pii_kek_version)
+    PII_KEK_RETIRED       = var.pii_kek_retired
     PII_LOOKUP_KEY_BASE64 = var.pii_lookup_key_base64
     STRIPE_SECRET_KEY     = var.stripe_secret_key
     STRIPE_WEBHOOK_SECRET = var.stripe_webhook_secret
     # Built from the RDS resource — includes the generated master password.
     DATABASE_URL = "postgresql+asyncpg://${var.db_username}:${random_password.db.result}@${aws_db_instance.main.address}:${aws_db_instance.main.port}/${aws_db_instance.main.db_name}"
+    # rediss:// + auth token(elasticache.tf,盤點 D1)。有了密碼它就是秘密,所以從
+    # taskdefs 的 environment 搬到這裡。primary endpoint 在故障切換後會指向新的 primary。
+    REDIS_URL = "rediss://:${random_password.redis.result}@${aws_elasticache_replication_group.main.primary_endpoint_address}:6379/0"
   })
 }
 

@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import DateTime, ForeignKey , String, LargeBinary
+from sqlalchemy import DateTime, ForeignKey , String, LargeBinary, SmallInteger, text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 from app.db.base import Base
@@ -21,6 +21,13 @@ class BuyerInfo(Base):
     national_id_ciphertext: Mapped[bytes] = mapped_column(LargeBinary, nullable=False,)
 
     national_id_dek_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False,)
+
+    # 這一列的 DEK 是用第幾版 KEK 包的(盤點 A3:KEK 版本化)。解密按它挑鑰匙;輪替時 worker
+    # 的 rewrap_pii_keks 把舊版的列逐批重包到現役版本 —— 只動 dek_encrypted 與這一欄,密文
+    # 不碰。server_default 1:migration 之前的列全是第 1 版,當時只有一把鑰匙。
+    kek_version: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, server_default=text("1")
+    )
 
     # BYTEA,不是 str —— pii.lookup_hash() 回的是 raw digest。標註寫 str 的話
     # type checker 對這個欄位就失效了:拿 str 去寫 bytea 不會靜默失敗,是 asyncpg

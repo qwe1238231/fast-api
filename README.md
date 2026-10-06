@@ -183,7 +183,7 @@
 
 ### 8. PII 信封加密、Rust 密碼學模組、GDPR 抹除
 
-買家實名資料採**信封加密**:每筆隨機 DEK 以 AES-256-GCM 加密明文,DEK 再用主金鑰 KEK 包一層,兩者一起存;查詢比對走 HMAC-SHA256 lookup hash,不需解密。
+買家實名資料採**信封加密**:每筆隨機 DEK 以 AES-256-GCM 加密明文,DEK 再用主金鑰 KEK 包一層,兩者一起存;查詢比對走 HMAC-SHA256 lookup hash,不需解密。KEK 有版本號(`buyer_info.kek_version`),輪替是線上的:新鑰匙設現役、舊鑰匙退役只用來解,worker 逐批把舊列的 DEK 重包到新版,密文不碰;程序在 `infra/RUNBOOK.md` 情境 E。
 
 所有原語由 Rust crate `ticket_secrets` 實作,PyO3 綁定、maturin 編成 wheel:
 

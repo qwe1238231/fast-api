@@ -42,7 +42,7 @@ async def register_buyer_info(
     if existing is not None:
         raise BuyerInfoAlreadyExists(user_id=user_id)
 
-    ciphertext, dek_encrypted = encrypt_pii(national_id)
+    envelope = encrypt_pii(national_id)
     lookup = lookup_hash(national_id)
 
     try:
@@ -50,9 +50,10 @@ async def register_buyer_info(
             db,
             user_id=user_id,
             real_name=real_name,
-            national_id_ciphertext=ciphertext,
-            national_id_dek_encrypted=dek_encrypted,
+            national_id_ciphertext=envelope.ciphertext,
+            national_id_dek_encrypted=envelope.dek_encrypted,
             national_id_lookup_hash=lookup,
+            kek_version=envelope.kek_version,
         )
     except IntegrityError as exc:
         await db.rollback()

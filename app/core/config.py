@@ -3,6 +3,7 @@ from pydantic_settings import BaseSettings,SettingsConfigDict
 from pydantic import Field, field_validator, model_validator
 from datetime import timedelta
 import base64
+import json
 
 
 class Settings(BaseSettings):
@@ -26,6 +27,21 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_REUSE_GRACE_SECONDS: int =10
     PII_KEK_BASE64: str
     PII_LOOKUP_KEY_BASE64:str
+    PII_KEK_VERSION: int = Field(default=1, ge=1)
+    """現役 KEK(PII_KEK_BASE64)是第幾版 —— 新寫入的 buyer_info 列記的就是這個數字。
+
+    每一列都記自己的 kek_version,解密按列上的版本挑鑰匙。沒有這個欄位,換 KEK 就只剩
+    「停機、把所有列重包一次」一條路;有了它,輪替是線上的:改設定、滾動部署、worker 的
+    rewrap_pii_keks 在背景把舊列逐批換到新版。程序在 infra/RUNBOOK.md 情境 E。
+    """
+    PII_KEK_RETIRED: str = "{}"
+    """已退役但還有列在用的 KEK:JSON 物件,版本號 → base64。
+
+    只用來**解開**舊列的 DEK(讀取與 rewrap),永遠不拿來包新的。全部列都換到現役版本
+    之後把該版本從這裡拿掉,舊鑰匙才算真的作廢 —— 在那之前它還握著資料,只是沒在用。
+    現役版本不得出現在這裡(model validator 擋):那會讓「現役」跟「退役」變成同一把,
+    輪替就只是換了個數字。
+    """
     STRIPE_SECRET_KEY: str
     STRIPE_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0)
     """打 Stripe 的逾時。**預設值(80 秒)必須改掉。**
@@ -267,9 +283,8 @@ class Settings(BaseSettings):
 
     model_config = SettingsConfigDict(env_file=".env",extra="ignore")
 
-    @field_validator("PII_KEK_BASE64", "PII_LOOKUP_KEY_BASE64")
-    @classmethod
-    def _key_must_be_valid_base64(cls, v: str) -> str:
+    @staticmethod
+    def _decode_32_byte_key(v: str) -> bytes:
         try:
             decoded = base64.b64decode(v)
         except Exception:
@@ -279,7 +294,56 @@ class Settings(BaseSettings):
                 f"decoded key must be 32 bytes, got {len(decoded)}"
                 "Generate one: python -c \"import os, base64; print(base64.b64encode(os.urandom(32)).decode())\""
             )
+        return decoded
+
+    @field_validator("PII_KEK_BASE64", "PII_LOOKUP_KEY_BASE64")
+    @classmethod
+    def _key_must_be_valid_base64(cls, v: str) -> str:
+        cls._decode_32_byte_key(v)
         return v
+
+    @staticmethod
+    def _parse_retired_keks(raw: str) -> dict[int, bytes]:
+        """PII_KEK_RETIRED 的 JSON → {版本: 32 bytes}。格式錯就拋 ValueError(啟動時炸,
+        不要等到第一次讀舊列才發現鑰匙是壞的)。"""
+        try:
+            parsed = json.loads(raw or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"PII_KEK_RETIRED must be a JSON object of version -> base64 key: {exc}")
+        if not isinstance(parsed, dict):
+            raise ValueError("PII_KEK_RETIRED must be a JSON object of version -> base64 key")
+        keyring: dict[int, bytes] = {}
+        for version, key in parsed.items():
+            if not str(version).isdigit() or int(version) < 1:
+                raise ValueError(f"PII_KEK_RETIRED version {version!r} must be a positive integer")
+            if not isinstance(key, str):
+                raise ValueError(f"PII_KEK_RETIRED[{version}] must be a base64 string")
+            keyring[int(version)] = Settings._decode_32_byte_key(key)
+        return keyring
+
+    @field_validator("PII_KEK_RETIRED")
+    @classmethod
+    def _retired_keks_must_be_well_formed(cls, v: str) -> str:
+        cls._parse_retired_keks(v)
+        return v
+
+    @model_validator(mode="after")
+    def _active_kek_is_not_retired(self) -> "Settings":
+        if self.PII_KEK_VERSION in self._parse_retired_keks(self.PII_KEK_RETIRED):
+            raise ValueError(
+                f"PII_KEK_VERSION {self.PII_KEK_VERSION} also appears in PII_KEK_RETIRED — "
+                "the active KEK and a retired one cannot share a version number"
+            )
+        return self
+
+    @property
+    def pii_keyring(self) -> dict[int, bytes]:
+        """{版本: KEK bytes},現役加退役。解密按列上的 kek_version 從這裡挑;包新 DEK 永遠
+        用 PII_KEK_VERSION 那一把。每次呼叫重新解析:測試用 monkeypatch 換設定時要跟著動。"""
+        return {
+            self.PII_KEK_VERSION: self._decode_32_byte_key(self.PII_KEK_BASE64),
+            **self._parse_retired_keks(self.PII_KEK_RETIRED),
+        }
 
     @field_validator("LOG_LEVEL")
     @classmethod

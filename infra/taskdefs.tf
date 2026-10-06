@@ -98,7 +98,7 @@ locals {
   # `update-service`,那是一次**全新的部署**,順手把開機時失敗的那個蓋掉了。
   # 也就是說「CD 端到端測過」證明的是 CD 能用,不是 `terraform apply` 能把環境帶起來。
   app_secrets = [
-    for k in ["SECRET_KEY", "PII_KEK_BASE64", "PII_LOOKUP_KEY_BASE64", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "DATABASE_URL"] : {
+    for k in ["SECRET_KEY", "PII_KEK_BASE64", "PII_KEK_VERSION", "PII_KEK_RETIRED", "PII_LOOKUP_KEY_BASE64", "STRIPE_SECRET_KEY", "STRIPE_WEBHOOK_SECRET", "DATABASE_URL"] : {
       name      = k
       valueFrom = "${aws_secretsmanager_secret.app.arn}:${k}::"
     }

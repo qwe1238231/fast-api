@@ -98,6 +98,18 @@ async def test_redis_commands_become_spans(redis, spans):
 
 
 @pytest.mark.asyncio
+async def test_trace_ids_are_xray_shaped(client, spans):
+    """前 8 個 hex 是 epoch 秒。X-Ray 拒收純隨機 id,而且是 ADOT collector 整批丟、只在
+    自己的 log 裡抱怨 —— 本地 Tempo 不在乎,這條測試是那個坑唯一會在本機現形的地方。"""
+    import time
+
+    r = await client.get("/v1/events/")
+    assert r.status_code == 200
+    seconds = int(r.headers[RESPONSE_HEADER][:8], 16)
+    assert abs(seconds - time.time()) < 3600, r.headers[RESPONSE_HEADER]
+
+
+@pytest.mark.asyncio
 async def test_background_io_without_a_parent_is_not_a_trace(redis, spans):
     """arq 的輪詢、consumer loop 的阻塞 XREADGROUP 這種沒有父 span 的 I/O 不該各自變成
     一條單 span 的 trace(本地 Tempo 第一次搜 worker,前五筆全是 ZRANGEBYSCORE)。

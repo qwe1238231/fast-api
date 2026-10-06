@@ -120,6 +120,8 @@ terraform destroy
 - **不開 NAT Gateway**(約 $33/月):ECS task 放 public subnet 帶 public IP,靠這樣拉映像、打 Stripe。
 - ALB 已經在(約 $20/月),目前只有 HTTP;HTTPS 等有自己的網域再加 ACM + Route 53。
 - RDS / ElastiCache 都是 `t4g.micro`。RDS **Multi-AZ 預設開**,這是 HA 不是備份,還原時才暫時關。
+- ElastiCache 開 TLS + auth token + at-rest 加密(建立時屬性,不能事後開);`REDIS_URL` 因此是秘密,走 Secrets Manager。
+- 每個 task 多一個 ADOT sidecar 把 OTel span 送 X-Ray(`ecs-xray.yaml`,只做 trace);task 記憶體因此 512 → 1024 MB。X-Ray 每月前 10 萬筆 trace 免費。
 - CloudWatch log 只留 7 天;alarm 不接 SNS,省掉通知那一層,狀態看 console。
 
 ## 只有 apply 才看得到的坑

@@ -34,6 +34,7 @@ opentelemetry-instrumentation-redis==0.66b0
 opentelemetry-instrumentation-sqlalchemy==0.66b0
 opentelemetry-proto==1.45.0
 opentelemetry-sdk==1.45.0
+opentelemetry-sdk-extension-aws==2.1.0
 opentelemetry-semantic-conventions==0.66b0
 opentelemetry-util-http==0.66b0
 packaging==26.2
